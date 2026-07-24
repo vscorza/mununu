@@ -790,8 +790,16 @@ pub fn cegar_refine_loop(
         }
     }
     // SmtAllPairs + Eager are forced when EITHER compound OR derived predicates
-    // are present (both are SMT-seam-only paths).
-    let smt_seam_required = !compound_exprs.is_empty() || !derived_predicates.is_empty();
+    // are present (both are SMT-seam-only paths) — OR the source is Craig interpolation
+    // (F.1), which can DISCOVER a compound relational/bound invariant mid-loop and install
+    // it into `lift_opts.compound_exprs`; the compound-aware lift must already be selected
+    // when that first compound lands, so we force it from the start for the Craig source.
+    let smt_seam_required = !compound_exprs.is_empty()
+        || !derived_predicates.is_empty()
+        || matches!(
+            cegar_opts.predicate_source,
+            PredicateSource::CraigInterpolation
+        );
     let effective_may = if smt_seam_required {
         crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
     } else {
@@ -910,7 +918,20 @@ pub fn cegar_refine_loop(
     // CVC5 invocation options; sub-item 3.5 will expose this via
     // the sidecar.
     let cvc5_opts = crate::adapter::cvc5::InterpolantQueryOptions::default();
-    let lift_opts = PredicateCubeLiftOptions {
+    // F.1 — the transition-aware Craig refinement (`craig_refinement_over_transition`) needs the
+    // parsed model to encode the exact transition; parse it once. On a parse error we keep going
+    // (Craig simply yields nothing → WP fallback) rather than fail the whole loop.
+    let parsed_file_for_craig: Option<crate::adapter::btor2::ast::Btor2File> = if matches!(
+        cegar_opts.predicate_source,
+        PredicateSource::CraigInterpolation
+    ) {
+        crate::adapter::btor2::parser::parse(btor2_content).ok()
+    } else {
+        None
+    };
+    // `mut` so the Craig source (F.1) can install a discovered compound relational/bound
+    // invariant into `compound_exprs` for the NEXT iteration's compound-aware re-lift.
+    let mut lift_opts = PredicateCubeLiftOptions {
         max_cube_count: cegar_opts.max_cube_count,
         // R.2.5 predicate-image MVP — enable boolean-input enumeration
         // so the lifted Clts has meaningful may-edges for the CEGAR
@@ -1340,6 +1361,11 @@ pub fn cegar_refine_loop(
             .failure_subgame
             .as_ref()
             .expect("KleeneBot implies failure_subgame is Some (R.5.0 invariant)");
+        // F.1 — a Craig-discovered COMPOUND relational/bound invariant is installed into
+        // `lift_opts.compound_exprs` (not returned as a cube dimension), so count them: the
+        // loop must NOT treat "0 new simple predicates" as source-exhaustion when a compound
+        // landed and will refine the next iteration's compound-aware re-lift.
+        let mut compounds_added_this_iter = 0usize;
         let new_predicates = match &cegar_opts.predicate_source {
             PredicateSource::Manual(callback) => callback(subgame, &current_predicates),
             PredicateSource::WeakestPrecondition => {
@@ -1351,35 +1377,55 @@ pub fn cegar_refine_loop(
                 weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
             }
             PredicateSource::CraigInterpolation => {
-                // R.5 Item 3 sub-item 3.4 (2026-06-04) — Craig
-                // interpolation via CVC5 subprocess. When CVC5 is
-                // available, ask it for an interpolant per
-                // classifying may-but-not-must transition. On any
-                // failure (subprocess error, timeout, no
-                // interpolant exists, compound shape the MVP
-                // parser doesn't decode), fall back to the WP
-                // heuristic — never silently terminate the loop.
-                // When CVC5 was unavailable at loop start, the
-                // warning was emitted there and `cvc5_bin = None`
-                // routes us straight to WP.
-                let craig_preds = if let Some(bin) = &cvc5_bin {
-                    craig_interpolation_predicates(
+                // F.1 (2026-07-24) — TRANSITION-AWARE Craig refinement FIRST. Pose the
+                // interpolation query over the EXACT transition (`craig_refinement_over_transition`)
+                // rather than the legacy propositional cube-fact query, so cvc5 can return the
+                // relational/bound invariant a branching ⊥ needs (emergent-K). A simple
+                // `reg == value` is a new cube dimension; a compound (`!=`/relational/bound) is
+                // installed into the compound-aware lift for the next iteration.
+                let (simple, compound) = match &parsed_file_for_craig {
+                    Some(file) => craig_refinement_over_transition(
                         subgame,
                         &current_predicates,
                         &lift_result.clts,
-                        bin,
-                        &cvc5_opts,
-                    )
-                } else {
-                    Vec::new()
+                        file,
+                        cvc5_opts.timeout.as_millis() as u32,
+                    ),
+                    None => (Vec::new(), Vec::new()),
                 };
-                if !craig_preds.is_empty() {
-                    craig_preds
+                for expr in compound {
+                    if lift_opts.compound_exprs.values().any(|e| e == &expr) {
+                        continue; // re-discovery, not progress
+                    }
+                    let name = format!("craig_compound_{}", lift_opts.compound_exprs.len());
+                    lift_opts.compound_exprs.insert(name, expr);
+                    compounds_added_this_iter += 1;
+                }
+                if !simple.is_empty() {
+                    simple
+                } else if compounds_added_this_iter > 0 {
+                    // A compound landed → the next iteration's compound-aware re-lift refines
+                    // the abstraction even with no new simple dimension. Continue the loop.
+                    Vec::new()
                 } else {
-                    // Per-iteration fallback. The CEGAR loop's
-                    // soundness contract (never silently
-                    // terminate) requires this safety net.
-                    weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
+                    // No transition-aware progress → the legacy propositional Craig query (F.2,
+                    // kept as a fallback pending removal), then WP — never silently terminate.
+                    let legacy = if let Some(bin) = &cvc5_bin {
+                        craig_interpolation_predicates(
+                            subgame,
+                            &current_predicates,
+                            &lift_result.clts,
+                            bin,
+                            &cvc5_opts,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    if !legacy.is_empty() {
+                        legacy
+                    } else {
+                        weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
+                    }
                 }
             }
         };
@@ -1395,7 +1441,10 @@ pub fn cegar_refine_loop(
             approximants_at_end,
         });
 
-        if added_count == 0 {
+        // F.1 — a Craig compound installed into `lift_opts.compound_exprs` is progress even with
+        // 0 new simple dimensions; only exhaust when NEITHER a simple predicate NOR a compound
+        // was added this iteration.
+        if added_count == 0 && compounds_added_this_iter == 0 {
             // Track I.1 — countertrace over the exhausted-source cube.
             let counterexample = build_counterexample_trace(
                 &lift_result.clts,
@@ -1578,6 +1627,105 @@ fn craig_interpolation_predicates(
         }
     }
     out
+}
+
+/// The predicate REGION for a cube index over the SIMPLE predicate dimensions — bit `i` of
+/// `cube` is predicate `i`'s polarity (`predicates[i] == value` when set, `!=` when clear),
+/// mirroring `predicate_cube_lift`'s indexing (see `render_cube_conjunction`). Compound
+/// dimensions occupy the HIGH bits and are OMITTED: a weaker (fewer-conjunct) source region only
+/// WEAKENS the interpolation query's A side, so any predicate it yields is still a SOUND
+/// separator — at worst less precise, never unsound.
+fn cube_index_to_region(
+    predicates: &[PredicateSpec],
+    cube: usize,
+) -> Vec<crate::adapter::btor2::predicate_expr::PredicateExpr> {
+    use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+    predicates
+        .iter()
+        .enumerate()
+        .map(|(i, p)| PredicateExpr::Cmp {
+            register: p.register.clone(),
+            op: if (cube >> i) & 1 == 1 {
+                CmpOp::Eq
+            } else {
+                CmpOp::Ne
+            },
+            value: p.value,
+        })
+        .collect()
+}
+
+/// F.1 — TRANSITION-AWARE Craig refinement (the strong primitive wired into the ⊥-refinement).
+/// For each classifying MayOnly transition `(src_cube → target_cube)` of the failure subgame,
+/// pose `A = source-region(cur) ∧ T`, `B = ¬target-region(nx)` over the EXACT transition
+/// (`synthesize_refinement_predicate`) and collect the separating predicate. Unlike
+/// [`craig_interpolation_predicates`] — a propositional, transition-FREE cube-fact query that can
+/// only ever return a differing cube bit — this reads the DATAPATH, so cvc5 can return the
+/// relational/bound invariant (`data == target`, `reg <= K`) a branching ⊥ needs (the emergent-K
+/// case). Splits results: a simple `reg == value` becomes a cube DIMENSION (`PredicateSpec`); any
+/// other shape (`!=` / relational / bound) becomes a compound EXPR the caller installs into the
+/// SmtAllPairs+Eager compound-aware lift. The primitive addresses only NAMED state cells; a
+/// property atom over a combinational output contributes a weaker region but never an unsound
+/// predicate. cvc5-absent / no-interpolant / out-of-grammar ⇒ that transition yields nothing and
+/// the caller falls back to WP.
+///
+/// ⚠️ OPEN PIECE (2026-07-24): this is a *safety spurious-edge* query (find a predicate making a
+/// step INFEASIBLE). A RECOVERABILITY ⊥ is a MUST-OBLIGATION failure — the may-edge to `good` is
+/// REAL, not spurious — so for recoverability this query decides NOTHING (empirically: it exhausts
+/// to ⊥; see `craig_refinement_wiring_is_sound_but_naive_query_does_not_yet_decide_recoverability`).
+/// The recoverability-correct query interpolates the MUST-PRECONDITION of `good` — a ∀∃/hyper-must
+/// query that cvc5's SyGuS BV interpolation cannot yet synthesize. This function is the SOUND wiring
+/// FOUNDATION; the deciding query is the CAV-paper research still to land.
+#[allow(clippy::type_complexity)]
+fn craig_refinement_over_transition(
+    subgame: &FailureSubgame,
+    current_predicates: &[PredicateSpec],
+    clts: &crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>,
+    file: &crate::adapter::btor2::ast::Btor2File,
+    timeout_ms: u32,
+) -> (
+    Vec<PredicateSpec>,
+    Vec<crate::adapter::btor2::predicate_expr::PredicateExpr>,
+) {
+    use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+    use crate::adapter::btor2::refine::{RefineOutcome, synthesize_refinement_predicate};
+    use crate::clts::StateId;
+    let mut simple: Vec<PredicateSpec> = Vec::new();
+    let mut compound: Vec<PredicateExpr> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (src_idx, t_idx, _owner) in &subgame.classifying_transitions {
+        let Some(src_id) = StateId::<crate::clts::DefaultStateIdx>::from_index(*src_idx) else {
+            continue;
+        };
+        let transitions = clts.outgoing(src_id);
+        let Some(transition) = transitions.get(*t_idx) else {
+            continue;
+        };
+        let target_idx = transition.target().index();
+        let source = cube_index_to_region(current_predicates, *src_idx);
+        let target = cube_index_to_region(current_predicates, target_idx);
+        if let RefineOutcome::Predicate(p) =
+            synthesize_refinement_predicate(file, &source, &target, timeout_ms)
+        {
+            // Dedup identical interpolants across the classifying transitions.
+            if !seen.insert(format!("{p:?}")) {
+                continue;
+            }
+            match &p {
+                PredicateExpr::Cmp {
+                    register,
+                    op: CmpOp::Eq,
+                    value,
+                } => simple.push(PredicateSpec {
+                    name: format!("craig_{register}_eq_{value}"),
+                    register: register.clone(),
+                    value: *value,
+                }),
+                _ => compound.push(p),
+            }
+        }
+    }
+    (simple, compound)
 }
 
 /// R.5 WP — emit separating predicates from the failure subgame's
@@ -2402,6 +2550,83 @@ mod tests {
             !verdicts.contains(&Trit::False),
             "an unsatisfiable ¬good cube cell must be ⊥, not a spurious definite-False \
              counterexample; got {verdicts:?}"
+        );
+    }
+
+    /// F.1 (2026-07-24) — the transition-aware Craig refinement is SOUND on a recoverability
+    /// property but the SAFETY spurious-edge query does NOT yet decide it (a documented FOUNDATION,
+    /// not a working decider). `busy` returns to idle (`busy==0`) exactly when `data == target`;
+    /// `data`/`target` increment in LOCKSTEP so `data == target` is INVARIANT (never syntactically
+    /// compared beyond the gate). `AG EF (busy==0)` genuinely HOLDS (exact oracle), yet the cube
+    /// over `{busy==0}` alone leaves ⊥. **EMPIRICAL FINDING (2026-07-24): the wired
+    /// `synthesize_refinement_predicate` query (`A = source ∧ T`, `B = ¬target` — a *safety
+    /// spurious-edge* refinement) does NOT decide this — BOTH Craig and WP exhaust to ⊥.** A
+    /// recoverability ⊥ is a MUST-OBLIGATION failure (the may-edge to `good` is REAL, not spurious),
+    /// so the safety query correctly finds no separating predicate. The recoverability-correct query
+    /// interpolates the MUST-PRECONDITION of `good` (`{cur:T→good}` vs `{cur:T→¬good}`, a ∀∃/
+    /// hyper-must query) — the OPEN piece: cvc5's SyGuS BV interpolation returns `fail` on that
+    /// shape (see the planner-plan finding). This test therefore locks the FIRM soundness property
+    /// (Craig NEVER falsifies a HOLDS) and RECORDS the non-deciding behaviour, so a future
+    /// must-precondition backend can be checked against it.
+    #[test]
+    fn craig_refinement_wiring_is_sound_but_naive_query_does_not_yet_decide_recoverability() {
+        use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference};
+        use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 3\n3 state 1 busy\n4 state 2 data\n\
+5 state 2 target\n6 one 1\n7 zero 1\n8 zero 2\n9 one 2\n10 init 1 3 6\n11 init 2 4 8\n\
+12 init 2 5 8\n13 add 2 4 9\n14 next 2 4 13\n15 add 2 5 9\n16 next 2 5 15\n17 eq 1 4 5\n\
+18 ite 1 17 7 3\n19 next 1 3 18\n";
+        let formula =
+            parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").expect("formula");
+        // Soundness anchor: the property genuinely HOLDS on the concrete design.
+        assert_eq!(
+            exact_symbolic_verdict(D, &formula).map(|v| format!("{v:?}")),
+            Ok("Holds".to_string()),
+            "the lockstep-gated recoverability genuinely HOLDS (the oracle)"
+        );
+        let initial = vec![PredicateSpec {
+            name: "busy == 0".into(),
+            register: "busy".into(),
+            value: 0,
+        }];
+        let mk_opts = |src| CegarOptions {
+            max_iterations: 8,
+            predicate_source: src,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            emit_ctxdsl: false,
+        };
+        let env = Environment::new(2);
+        let run = |src| {
+            cegar_refine_loop(
+                &formula,
+                D,
+                initial.clone(),
+                &env,
+                &AdapterOptions::default(),
+                &mk_opts(src),
+            )
+            .expect("cegar succeeds")
+        };
+        let craig = run(PredicateSource::CraigInterpolation);
+        // FIRM SOUNDNESS: a HOLDS property must NEVER be falsified — no definite-False cell.
+        let craig_verdicts: Vec<Trit> = (0..craig.final_verdict.len())
+            .map(|i| craig.final_verdict.verdict_at(i))
+            .collect();
+        assert!(
+            !craig_verdicts.contains(&Trit::False),
+            "Craig refinement must never falsify a HOLDS recoverability; got {craig_verdicts:?}"
+        );
+        // FUNCTIONAL (cvc5-gated): report whether Craig closed the ⊥ that WP cannot.
+        let wp = run(PredicateSource::WeakestPrecondition);
+        eprintln!(
+            "F.1 emergent-recoverability: craig={:?} wp={:?}",
+            craig.terminated_with, wp.terminated_with
         );
     }
 
