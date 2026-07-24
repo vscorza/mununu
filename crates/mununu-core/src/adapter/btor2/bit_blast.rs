@@ -1579,18 +1579,21 @@ pub(crate) fn detect_btor2_memories(file: &Btor2File) -> Vec<MemoryCellMeta> {
     out
 }
 
-/// F1 — metadata for a provably one-hot state register (a candidate for enum
-/// re-encoding: `W` bits → `⌈log₂K⌉` bits, a bijection on the reachable states ⇒
-/// verdict-preserving). Consumed by the (future) enum re-encode pass; the detection
-/// itself is read-only.
+/// F1 — metadata for a state register with a provably SMALL set of reachable
+/// CONSTANT values (an ENUM). A candidate for enum re-encoding: `W` bits →
+/// `⌈log₂K⌉` bits, a bijection on the reachable states ⇒ verdict-preserving.
+/// One-hot is the special case where every value has popcount ≤ 1; the detection
+/// and re-encode are value-set-agnostic (the induction below never used one-hot-ness),
+/// so a binary-encoded FSM (`{0, 3, 5}`) is compressed the same way. Consumed by
+/// [`enum_reencode`]; the detection itself is read-only.
 #[derive(Debug, Clone)]
-pub(crate) struct OneHotStateMeta {
+pub(crate) struct EnumStateMeta {
     /// BTOR2 NID of the `state` line.
     pub nid: Nid,
     /// Bit-vector width of the register — the bits an enum re-encode compresses to
     /// `⌈log₂ values.len()⌉`.
     pub width: u32,
-    /// The distinct one-hot values the register can hold (its enum domain),
+    /// The distinct constant values the register can hold (its enum domain),
     /// ascending; always includes the init value.
     pub values: Vec<u64>,
 }
@@ -1603,15 +1606,22 @@ fn init_value_of(file: &Btor2File, state_nid: Nid) -> Option<crate::adapter::bto
     })
 }
 
-/// F1 detection — state registers that are provably ONE-HOT: their `init` and every
-/// value their `next` logic can WRITE are one-hot constants (popcount ≤ 1). SOUND
-/// syntactic sufficient condition: walk only the next-state VALUE path (the `ite`
-/// then/else chain, NOT the conditions) — every value node must be a one-hot `Const`,
+/// F1 detection — state registers provably restricted to a SMALL set of CONSTANT
+/// values (an ENUM). SOUND syntactic sufficient condition, by induction on the run:
+/// `init` resolves to a constant (base case), and every value the `next` logic can
+/// WRITE is a constant or a hold. We walk only the next-state VALUE path (the `ite`
+/// then/else chain, NOT the conditions) — every value node must be a same-width `Const`,
 /// the register itself (a hold), or another `ite`. Anything else on the value path
-/// (an `add`/`or`/`shift`, or a copy of a different register) could yield a non-one-hot
-/// value, so the register is conservatively EXCLUDED. Guards may freely reference other
-/// registers (they are not on the value path). Read-only; the re-encode consumes this.
-pub(crate) fn detect_onehot_states(file: &Btor2File) -> Vec<OneHotStateMeta> {
+/// (an `add`/`or`/`shift`, or a copy of a different register) could yield an
+/// out-of-set value, so the register is conservatively EXCLUDED. Guards may freely
+/// reference other registers (they are not on the value path). Since a `next` that is
+/// a mux-tree of {constants, hold} can only ever select a value already in the set, the
+/// register stays in `values` forever ⇒ re-encoding `values → 0..K-1` is a bijection on
+/// reachable states. One-hot is the special case where every value has popcount ≤ 1; the
+/// proof and re-encode never depend on that, so binary-encoded FSMs are handled the same.
+/// Only registers where the enum re-encode actually SAVES bits (`⌈log₂K⌉ < W`) are
+/// reported. Read-only; the re-encode consumes this.
+pub(crate) fn detect_enum_states(file: &Btor2File) -> Vec<EnumStateMeta> {
     use crate::adapter::btor2::ast::Op;
     let mut out = Vec::new();
     for line in &file.lines {
@@ -1626,16 +1636,14 @@ pub(crate) fn detect_onehot_states(file: &Btor2File) -> Vec<OneHotStateMeta> {
             continue;
         }
         let state_nid = line.nid;
-        // init must be a one-hot constant (an un-init / non-constant init could power
-        // up non-one-hot — conservatively skip).
+        // init must resolve to a constant (an un-init / non-constant init could power
+        // up an out-of-set value — conservatively skip). Its popcount is irrelevant:
+        // any constant is a valid enum member.
         let Some(init_v) =
             init_value_of(file, state_nid).and_then(|op| resolve_btor2_constant(file, op.nid()))
         else {
             continue;
         };
-        if init_v.count_ones() > 1 {
-            continue;
-        }
         let Some(next) = parser::find_next_value_operand(file, state_nid) else {
             continue;
         };
@@ -1653,16 +1661,13 @@ pub(crate) fn detect_onehot_states(file: &Btor2File) -> Vec<OneHotStateMeta> {
                 break;
             };
             match &n.node {
-                // A one-hot constant leaf on the value path.
+                // A constant leaf on the value path — any value, any popcount, is a
+                // valid enum member.
                 Node::Const { sort, .. } if parser::bv_width(file, *sort) == Some(width) => {
                     let Some(v) = resolve_btor2_constant(file, nid) else {
                         ok = false;
                         break;
                     };
-                    if v.count_ones() > 1 {
-                        ok = false;
-                        break;
-                    }
                     values.insert(v);
                 }
                 // A hold (the register feeding its own next).
@@ -1677,15 +1682,20 @@ pub(crate) fn detect_onehot_states(file: &Btor2File) -> Vec<OneHotStateMeta> {
                     stack.push(args[1].nid());
                     stack.push(args[2].nid());
                 }
-                // Any other same-width value on the path ⇒ not provably one-hot.
+                // Any other same-width value on the path ⇒ not provably a fixed enum set.
                 _ => {
                     ok = false;
                     break;
                 }
             }
         }
-        if ok && values.len() >= 2 {
-            out.push(OneHotStateMeta {
+        // Only report when the re-encode SAVES bits: ⌈log₂K⌉ < W. (For one-hot this is
+        // always true; for a general enum a register with 2^W distinct values would not
+        // compress, so gate on it explicitly.)
+        let k = values.len() as u32;
+        let enc_bits = (u32::BITS - (k - 1).leading_zeros()).max(1);
+        if ok && k >= 2 && enc_bits < width {
+            out.push(EnumStateMeta {
                 nid: state_nid,
                 width,
                 values: values.into_iter().collect(),
@@ -1711,16 +1721,20 @@ fn node_refs_nid(node: &Node, target: Nid) -> bool {
     }
 }
 
-/// F1 re-encode — replace a provably one-hot register `meta` (`W` bits) with an ENUM
-/// register (`E = ⌈log₂K⌉` bits). A BIJECTION on the reachable one-hot states ⇒
-/// VERDICT-PRESERVING. Rewrites: the state's sort; its init (one-hot → index); its
-/// next-state VALUE PATH (one-hot const leaves → index consts, `ite` sorts → `E`); and
-/// every READ — `eq/neq(S, onehot v)` → `eq/neq(S, index v)`, `redor(S)` →
-/// `neq(S, index 0)` (is-non-idle). ABSTAINS (`None`) on ANY other use of `S` (slice,
-/// arithmetic, output, a compare to a non-reachable value) so a re-encode is only ever
-/// applied when provably sound. The register keeps its NID; only new sort/const nodes
-/// are added (fresh NIDs), so the result composes with re-encoding other registers.
-pub(crate) fn onehot_reencode(file: &Btor2File, meta: &OneHotStateMeta) -> Option<Btor2File> {
+/// F1 re-encode — replace an enum register `meta` (`W` bits, `K` reachable constant
+/// values) with an ENUM register (`E = ⌈log₂K⌉` bits) that maps each value `v_i → i`.
+/// A BIJECTION on the reachable states ⇒ VERDICT-PRESERVING. Value-set-agnostic: it
+/// never assumes the values are one-hot. Rewrites: the state's sort; its init
+/// (value → index); its next-state VALUE PATH (const leaves → index consts, `ite`
+/// sorts → `E`); and every READ — `eq/neq(S, v)` → `eq/neq(S, index v)`, and
+/// `redor(S)` (is-any-bit-set = `S != 0`) → `neq(S, index-of-value-0)` — which is
+/// correct for any enum whose set contains 0, and ABSTAINS when it does not (via
+/// `const_for(0)?`, since `redor` would then be a constant that is not re-expressible as
+/// an index compare). ABSTAINS (`None`) on ANY other use of `S` (slice, arithmetic,
+/// output, a compare to a value not in the set) so a re-encode is only ever applied when
+/// provably sound. The register keeps its NID; only new sort/const nodes are added (fresh
+/// NIDs), so the result composes with re-encoding other registers.
+pub(crate) fn enum_reencode(file: &Btor2File, meta: &EnumStateMeta) -> Option<Btor2File> {
     use crate::adapter::btor2::ast::{ConstValue, Op, Sort};
     let s = meta.nid;
     let k = meta.values.len() as u32;
@@ -1912,7 +1926,7 @@ pub(crate) fn onehot_reencode(file: &Btor2File, meta: &OneHotStateMeta) -> Optio
 /// b1 — metadata for a counter register the cube path can collapse to a single
 /// `cnt == threshold` bit via a **may-abstraction** (over-approximating the count,
 /// SOUND for the outer ν / AG-safety; the inner-μ must-obligation is discharged
-/// separately by b2's ranking). Unlike [`OneHotStateMeta`] this abstraction is
+/// separately by b2's ranking). Unlike [`EnumStateMeta`] this abstraction is
 /// LOSSY — it must feed the 3-valued / cube engine, never the exact oracle.
 #[derive(Debug, Clone)]
 pub(crate) struct DownCounterMeta {
@@ -6409,11 +6423,11 @@ mod tests {
     use crate::adapter::AdapterOptions;
 
     #[test]
-    fn detect_onehot_states_finds_onehot_fsm_rejects_counter() {
+    fn detect_enum_states_finds_fsm_rejects_counter() {
         use crate::adapter::btor2::parser::parse;
         // A 4-bit one-hot FSM (init 0001, next = go ? 0010 : hold) + a 4-bit counter
-        // (next = cnt + 1). Detection must find the FSM (one-hot value path) and REJECT
-        // the counter (an `add` on the value path is not provably one-hot).
+        // (next = cnt + 1). Detection must find the FSM (a constant-mux value path) and
+        // REJECT the counter (an `add` on the value path is not a fixed constant set).
         let btor = r#"
 1 sort bitvec 1
 2 sort bitvec 4
@@ -6431,23 +6445,19 @@ mod tests {
 14 next 2 10 12
 "#;
         let file = parse(btor).expect("parses");
-        let oh = detect_onehot_states(&file);
+        let oh = detect_enum_states(&file);
         assert_eq!(
             oh.len(),
             1,
-            "only the FSM is one-hot, not the counter: {oh:?}"
+            "only the FSM has a fixed constant set, not the counter: {oh:?}"
         );
         assert_eq!(oh[0].nid, 3);
         assert_eq!(oh[0].width, 4);
-        assert_eq!(
-            oh[0].values,
-            vec![1, 2],
-            "the reachable one-hot values 0001, 0010"
-        );
+        assert_eq!(oh[0].values, vec![1, 2], "the reachable values 0001, 0010");
     }
 
     #[test]
-    fn onehot_reencode_is_verdict_preserving_differential() {
+    fn enum_reencode_is_verdict_preserving_differential() {
         use crate::adapter::btor2::parser::parse;
         use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
         // A 4-bit one-hot FSM (idle 0000 → A 0001 → B 0010) with a combinational output
@@ -6470,10 +6480,10 @@ mod tests {
 14 output 13 busy
 "#;
         let orig = parse(btor).expect("parses");
-        let metas = detect_onehot_states(&orig);
+        let metas = detect_enum_states(&orig);
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].values, vec![0, 1, 2], "idle + A + B");
-        let reenc = onehot_reencode(&orig, &metas[0]).expect("re-encodable");
+        let reenc = enum_reencode(&orig, &metas[0]).expect("re-encodable");
         // fsm is now 2-bit (3 states) vs 4-bit — the compression.
         let w = reenc.lines.iter().find_map(|l| match &l.node {
             Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&reenc, *sort),
@@ -6493,6 +6503,67 @@ mod tests {
             assert_eq!(
                 vo, vr,
                 "re-encode changed the verdict for `{prop}`: {vo:?} vs {vr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_reencode_handles_non_onehot_binary_fsm_differential() {
+        use crate::adapter::btor2::parser::parse;
+        use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
+        // A 4-bit BINARY-encoded FSM: idle 0000 → (go ? 0101 : 0011). The written values
+        // 0011 (=3) and 0101 (=5) have popcount 2 — NOT one-hot, so the old one-hot-only
+        // detector rejected this register; the general enum detector accepts it (a fixed
+        // constant set {0,3,5}) and re-encodes 4 bits → 2. Output `at5 = (st == 5)`,
+        // `active = |st` (redor). Gap A's core: a non-one-hot value set compresses soundly.
+        let btor = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 state 2 st
+4 const 2 0011
+5 const 2 0101
+6 const 2 0000
+7 init 2 3 6
+8 input 1 go
+9 ite 2 8 5 4
+10 next 2 3 9
+11 eq 1 3 5
+12 output 11 at5
+13 redor 1 3
+14 output 13 active
+"#;
+        let orig = parse(btor).expect("parses");
+        let metas = detect_enum_states(&orig);
+        assert_eq!(
+            metas.len(),
+            1,
+            "the binary FSM is a fixed constant set: {metas:?}"
+        );
+        assert_eq!(
+            metas[0].values,
+            vec![0, 3, 5],
+            "reachable NON-one-hot values 0000, 0011, 0101"
+        );
+        let reenc = enum_reencode(&orig, &metas[0]).expect("re-encodable");
+        let w = reenc.lines.iter().find_map(|l| match &l.node {
+            Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&reenc, *sort),
+            _ => None,
+        });
+        assert_eq!(w, Some(2), "st re-encoded 4 bits → 2 (ceil log2 3)");
+        let reenc_str = crate::adapter::btor2::emit::emit_btor2(&reenc);
+        // DIFFERENTIAL ORACLE: identical verdicts on original (4-bit) vs re-encoded (2-bit),
+        // read through the rewritten `eq(st,5)→eq(st',2)` and `redor(st)→neq(st',0)`.
+        for prop in [
+            "mu X.((at5 == 1) || <> X)",    // EF at5    (5 reachable via go)
+            "mu X.((active == 1) || <> X)", // EF active (st leaves idle)
+            "nu Y.((at5 == 0) && [] Y)",    // AG !at5   (VIOLATED — go reaches 5)
+        ] {
+            let f = crate::mu_calculus::parser::parse(prop).expect("formula");
+            let vo = exact_symbolic_verdict(btor, &f).expect("orig verdict");
+            let vr = exact_symbolic_verdict(&reenc_str, &f).expect("reenc verdict");
+            assert_eq!(
+                vo, vr,
+                "enum re-encode changed the verdict for `{prop}`: {vo:?} vs {vr:?}"
             );
         }
     }
