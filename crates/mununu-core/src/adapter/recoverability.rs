@@ -1086,8 +1086,9 @@ impl RecoverabilityBotDiagnosis {
             ));
         }
         if parts.is_empty() {
-            "no structural obstacle localized in the recovery cone — the predicate abstraction may be \
-             closable with additional predicates"
+            "no structural obstacle localized by the best-effort cone walk — the ⊥ may be a coarse \
+             but closable abstraction (add predicates), OR a deeper config/sequence dependence this \
+             light pass does not localize"
                 .to_string()
         } else {
             parts.join("; ")
@@ -1133,6 +1134,11 @@ pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> Recoverab
                 for o in args {
                     queue.push_back(o.0.abs());
                 }
+            }
+            // A combinational OUTPUT (e.g. `cs_n`) carries the atom on an `output`/alias node —
+            // follow its driving signal so the walk reaches the underlying state + datapath.
+            Some(Node::Output { signal, .. }) => {
+                queue.push_back(signal.0.abs());
             }
             _ => {}
         }
