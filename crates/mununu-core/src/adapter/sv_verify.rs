@@ -39,6 +39,11 @@ pub struct SvLift {
     pub top: Option<String>,
     /// Run sv2v before Yosys (modern SV module-header imports, etc.).
     pub use_sv2v: bool,
+    /// Extra on-disk include-search directories (`-I<dir>`), so
+    /// `` `include "frag.vh" `` resolves against the original source tree
+    /// without the fragment being read as a standalone compilation unit.
+    /// Feeds [`YosysOptions::extra_include_dirs`]; empty by default.
+    pub include_dirs: Vec<std::path::PathBuf>,
 }
 
 impl SvLift {
@@ -48,6 +53,7 @@ impl SvLift {
             top: self.top.clone(),
             additional_sources: self.additional_sources.clone(),
             use_sv2v: self.use_sv2v,
+            extra_include_dirs: self.include_dirs.clone(),
             ..Default::default()
         };
         sv_to_btor2(&self.source, &yopts)
@@ -143,6 +149,7 @@ mod tests {
             additional_sources: Vec::new(),
             top: None,
             use_sv2v: false,
+            include_dirs: Vec::new(),
         }
     }
 
@@ -191,6 +198,7 @@ mod tests {
             ],
             top: Some("aes_cipher_control_fsm".into()),
             use_sv2v: true,
+            include_dirs: Vec::new(),
         };
         let verdict = sv_verify_recoverability(&lift, "aes_cipher_ctrl_cs == 9")
             .expect("recoverability decides on the AES cipher-control FSM");

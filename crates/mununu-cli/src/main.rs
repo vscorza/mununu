@@ -1582,6 +1582,14 @@ struct SvVerifyAutoArgs {
     /// interfaces) — essentially all real OpenTitan / Caliptra / ibex RTL.
     #[arg(long = "preprocess-sv2v")]
     preprocess_sv2v: bool,
+    /// Extra include-search directory (`-I<dir>`), repeatable. Resolves
+    /// `` `include "frag.vh" `` against the original source tree so include
+    /// fragments need NOT be passed as standalone `--source` compilation units.
+    ///
+    /// surface: CLI-only — the API/UI pass source content by name, so an
+    /// on-disk include-search directory has no analog there.
+    #[arg(long = "include-dir", value_name = "DIR")]
+    include_dirs: Vec<PathBuf>,
     /// Max CEGAR iterations per property.
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
@@ -1680,6 +1688,17 @@ struct SvLiftArgs {
     /// interfaces) — essentially all real OpenTitan / Caliptra / ibex RTL.
     #[arg(long = "preprocess-sv2v")]
     preprocess_sv2v: bool,
+    /// Extra include-search directory (`-I<dir>`), repeatable. Resolves
+    /// `` `include "frag.vh" `` against the original source tree so include
+    /// fragments need NOT be passed as standalone `--source` compilation units
+    /// (a mid-module fragment parsed in isolation fails). The per-design
+    /// source-manifest multi-file lift uses this.
+    ///
+    /// surface: CLI-only — the API/UI pass source content by name, so an
+    /// on-disk include-search directory has no analog there; their flat
+    /// name-staging of additional sources already resolves cross-file includes.
+    #[arg(long = "include-dir", value_name = "DIR")]
+    include_dirs: Vec<PathBuf>,
 }
 
 /// Arguments for `mununu sv verify` — SV-direct safety portfolio.
@@ -3158,6 +3177,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         primary_source_path: Some(args.file.display().to_string()),
         use_sv2v: args.preprocess_sv2v,
         cutpoint_signals: args.cutpoint.clone(),
+        extra_include_dirs: args.include_dirs.clone(),
         ..Default::default()
     };
     let must_edge_inference = match args.must_edge_inference {
@@ -5076,6 +5096,7 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
         additional_sources,
         top: args.top.clone(),
         use_sv2v: args.preprocess_sv2v,
+        include_dirs: args.include_dirs.clone(),
     })
 }
 

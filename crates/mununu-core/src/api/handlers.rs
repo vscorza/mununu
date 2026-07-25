@@ -871,6 +871,10 @@ pub async fn sv_verify_handler(
             .collect(),
         top: request.top,
         use_sv2v: request.use_sv2v,
+        // No API analog: the request carries source *content* by name, so an
+        // on-disk include-search dir is a local (CLI) concept; the flat
+        // name-staging of `additional_sources` already resolves includes here.
+        include_dirs: Vec::new(),
     };
     let outcome = sv_verify_safety(&lift).map_err(|message| ApiError::BadRequest {
         message,
@@ -906,6 +910,10 @@ pub async fn sv_verify_liveness_handler(
             .collect(),
         top: request.top,
         use_sv2v: request.use_sv2v,
+        // No API analog: the request carries source *content* by name, so an
+        // on-disk include-search dir is a local (CLI) concept; the flat
+        // name-staging of `additional_sources` already resolves includes here.
+        include_dirs: Vec::new(),
     };
     let (verdict, outcome) =
         sv_verify_liveness(&lift, &request.request, &request.grant).map_err(|message| {
@@ -947,6 +955,10 @@ pub async fn sv_verify_liveness_all_handler(
             .collect(),
         top: request.top,
         use_sv2v: request.use_sv2v,
+        // No API analog: the request carries source *content* by name, so an
+        // on-disk include-search dir is a local (CLI) concept; the flat
+        // name-staging of `additional_sources` already resolves includes here.
+        include_dirs: Vec::new(),
     };
     let (verdict, outcomes) =
         sv_verify_liveness_all(&lift, &request.responses).map_err(|message| {
@@ -994,6 +1006,10 @@ pub async fn sv_verify_recoverability_handler(
             .collect(),
         top: request.top,
         use_sv2v: request.use_sv2v,
+        // No API analog: the request carries source *content* by name, so an
+        // on-disk include-search dir is a local (CLI) concept; the flat
+        // name-staging of `additional_sources` already resolves includes here.
+        include_dirs: Vec::new(),
     };
     let verdict = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra)
         .map_err(|message| ApiError::BadRequest {
@@ -1023,6 +1039,10 @@ pub async fn sv_check_fsm_handler(
             .collect(),
         top: request.top,
         use_sv2v: request.use_sv2v,
+        // No API analog: the request carries source *content* by name, so an
+        // on-disk include-search dir is a local (CLI) concept; the flat
+        // name-staging of `additional_sources` already resolves includes here.
+        include_dirs: Vec::new(),
     };
     let findings =
         sv_check_fsm(&lift, request.max_width).map_err(|message| ApiError::BadRequest {

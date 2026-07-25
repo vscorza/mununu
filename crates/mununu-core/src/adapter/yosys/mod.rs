@@ -64,6 +64,25 @@ pub struct YosysOptions {
     pub top: Option<String>,
     /// Additional SV source files to compile alongside the primary input.
     pub additional_sources: Vec<(String, String)>,
+    /// Extra on-disk include-search directories, forwarded to the RTL
+    /// front-end as `-I<dir>` flags (yosys `read_verilog` / `read_slang`,
+    /// and the sv2v preprocessor). This lets a caller resolve
+    /// `` `include "frag.vh" `` directives against the *original* source
+    /// tree WITHOUT having to pass every include fragment as a compiled
+    /// `additional_sources` entry — passing a mid-module fragment as a
+    /// standalone source makes the parser compile it in isolation, which
+    /// fails (`syntax error, unexpected TOK_ELSE/TOK_ENDMODULE`). The
+    /// per-design source-manifest lift (multi-file AssertLLM2 corpus)
+    /// populates this so only real compilation units are read while
+    /// includes still resolve.
+    ///
+    /// **Default**: empty (only the staging tempdir + primary source dir
+    /// are searched, the historical behaviour). Populated from the CLI
+    /// `--include-dir` flag; no API/UI analog (those pass source *content*
+    /// by name, so an on-disk search directory is a local-filesystem-only
+    /// concept — the flat name-staging of `additional_sources` already
+    /// resolves cross-file includes on those surfaces).
+    pub extra_include_dirs: Vec<PathBuf>,
     /// Skip the Verific-taint check (for testing).
     pub skip_verific_check: bool,
     /// Optional original path of the primary SV source. Used only to
@@ -387,6 +406,8 @@ fn run_sv_flatten_btor2(
                 .unwrap_or_else(|_| PathBuf::from(p));
             abs.parent().map(Path::to_path_buf)
         }));
+        // 3. Caller-supplied include dirs (the source-manifest lift path).
+        include_dirs.extend(yopts.extra_include_dirs.iter().cloned());
         run_sv2v(&sv2v, &sources, &include_dirs, &preprocessed)?;
         // Replace the original .sv inputs with the single combined
         // Verilog-2005 file. sv2v resolves cross-file packages,
@@ -407,6 +428,7 @@ fn run_sv_flatten_btor2(
         &yopts.init_policy_overrides,
         &yopts.cutpoint_signals,
         slang_plugin.is_some(),
+        &yopts.extra_include_dirs,
     );
 
     let mut yosys_cmd = Command::new(&yosys);
@@ -1864,7 +1886,16 @@ fn build_script(
     init_policy_overrides: &InitPolicyOverrides,
     cutpoint_signals: &[String],
     use_slang: bool,
+    extra_include_dirs: &[PathBuf],
 ) -> String {
+    // Caller-supplied include-search dirs, as attached `-I<dir>` flags (the
+    // form yosys `read_verilog`/`read_slang` and sv2v all accept). Lets
+    // `\`include "frag.vh"` resolve against the original source tree without
+    // the fragment being read as a standalone compilation unit.
+    let extra_inc: String = extra_include_dirs
+        .iter()
+        .map(|d| format!(" -I{}", d.display()))
+        .collect();
     // A3 — the RTL read command. `read_slang` (yosys-slang plugin) is a full SV front-end
     // that accepts constructs `read_verilog` rejects; it reads ALL sources in ONE command
     // and `--ignore-assertions` drops embedded SVA (extracted separately by the slang
@@ -1878,19 +1909,19 @@ fn build_script(
             .join(" ");
         let top_arg = top.map(|t| format!(" --top {t}")).unwrap_or_default();
         // The staging tempdir (parent of the sources) as an include dir, so a cross-file
-        // `\`include "peer.sv"` between staged sources resolves.
+        // `\`include "peer.sv"` between staged sources resolves; plus any caller dirs.
         let inc = sources
             .first()
             .and_then(|p| p.parent())
             .map(|d| format!(" -I{}", d.display()))
             .unwrap_or_default();
         vec![format!(
-            "read_slang --ignore-assertions{top_arg}{inc} {files}"
+            "read_slang --ignore-assertions{top_arg}{inc}{extra_inc} {files}"
         )]
     } else {
         sources
             .iter()
-            .map(|p| format!("read_verilog -formal -sv {}", p.display()))
+            .map(|p| format!("read_verilog -formal -sv{extra_inc} {}", p.display()))
             .collect()
     };
     let hier = match top {
@@ -2585,6 +2616,7 @@ mod tests {
             &overrides,
             &cuts,
             false,
+            &[],
         );
         assert!(
             script.contains("cutpoint w:must_refresh w:precharge_done"),
@@ -2620,6 +2652,7 @@ mod tests {
             &overrides,
             &[],
             false,
+            &[],
         );
         // The blackbox cut is always present; there must be no explicit `cutpoint w:` pass.
         assert!(script.contains("cutpoint -blackbox"));
@@ -2648,6 +2681,7 @@ mod tests {
             &overrides,
             &[],
             true, // use_slang
+            &[],
         );
         assert!(
             script.contains("read_slang --ignore-assertions"),
@@ -2671,6 +2705,143 @@ mod tests {
                 && script.contains("dffunmap")
                 && script.contains("write_btor"),
             "downstream passes missing: {script}"
+        );
+    }
+
+    // (b) source-manifest lift — caller-supplied include dirs surface as
+    // attached `-I<dir>` flags on the read command (verified empirically to be
+    // the form yosys `read_verilog`/`read_slang` accept). Without them a
+    // `` `include "frag.vh" `` that lives outside the staging tempdir fails.
+    #[test]
+    fn build_script_read_verilog_forwards_extra_include_dirs() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/top.v")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let inc = vec![
+            PathBuf::from("/design/include"),
+            PathBuf::from("/design/rtl"),
+        ];
+        let script = build_script(
+            &sources,
+            None,
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            false,
+            &inc,
+        );
+        assert!(
+            script.contains("read_verilog -formal -sv -I/design/include -I/design/rtl /tmp/top.v"),
+            "include dirs not forwarded to read_verilog: {script}"
+        );
+    }
+
+    #[test]
+    fn build_script_read_verilog_no_include_dirs_is_unchanged() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/top.v")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let script = build_script(
+            &sources,
+            None,
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            false,
+            &[],
+        );
+        // Empty extra include dirs → no `-I` on the read command (historical form).
+        assert!(
+            script.contains("read_verilog -formal -sv /tmp/top.v"),
+            "read command changed shape with no include dirs: {script}"
+        );
+        assert!(
+            !script.contains(" -I"),
+            "no `-I` should appear when no include dirs are supplied: {script}"
+        );
+    }
+
+    // Slang frontend also forwards the caller dirs (appended after the staging
+    // tempdir include the read_slang path already adds).
+    #[test]
+    fn build_script_read_slang_forwards_extra_include_dirs() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/stage/a.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let inc = vec![PathBuf::from("/design/pkg")];
+        let script = build_script(
+            &sources,
+            None,
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            true,
+            &inc,
+        );
+        assert!(
+            script.contains("read_slang --ignore-assertions -I/stage -I/design/pkg /stage/a.sv"),
+            "caller include dir not appended on the slang path: {script}"
+        );
+    }
+
+    // (b) end-to-end — an include-only fragment (a mid-`always` statement, NOT a
+    // standalone compilation unit) resolves via `extra_include_dirs` `-I`, so the
+    // design lifts WITHOUT the fragment being passed as a compiled source (which
+    // yosys would parse in isolation → `syntax error, unexpected TOK_*`). This is
+    // the per-design source-manifest multi-file lift the AssertLLM2 corpus needs.
+    // yosys-gated (`#[ignore]`, like the other lift e2e tests); the script-level
+    // mechanism is covered by the non-ignored `build_script_*_forwards_*` tests.
+    #[test]
+    #[ignore = "requires yosys on PATH or MUNUNU_YOSYS_PATH"]
+    fn extra_include_dirs_resolves_fragment_without_standalone_compile() {
+        let tmp = TempDir::new("mununu-inc-e2e").expect("tempdir");
+        let inc = tmp.path().join("inc");
+        std::fs::create_dir_all(&inc).expect("mkdir inc");
+        std::fs::write(inc.join("counter_body.vh"), "q <= q + 8'd1;\n").expect("write frag");
+        let top = "module top(input clk, input rst, output reg [7:0] q);\n\
+                   always @(posedge clk) begin\n\
+                   if (rst) q <= 8'd0; else begin\n\
+                   `include \"counter_body.vh\"\n\
+                   end end endmodule\n";
+
+        // WITH the include dir → the `\`include` resolves and the design lifts.
+        let with_inc = YosysOptions {
+            top: Some("top".to_string()),
+            extra_include_dirs: vec![inc.clone()],
+            skip_verific_check: true,
+            ..Default::default()
+        };
+        let lifted = sv_to_btor2(top, &with_inc);
+        assert!(
+            lifted.as_ref().is_ok_and(|b| !b.is_empty()),
+            "expected a clean lift with -I<incdir>, got {lifted:?}"
+        );
+
+        // WITHOUT it (and without passing the fragment as a source) → the include
+        // cannot be resolved, so the lift fails cleanly rather than silently.
+        let no_inc = YosysOptions {
+            top: Some("top".to_string()),
+            skip_verific_check: true,
+            ..Default::default()
+        };
+        assert!(
+            sv_to_btor2(top, &no_inc).is_err(),
+            "expected the lift to fail when the include dir is absent"
         );
     }
 
