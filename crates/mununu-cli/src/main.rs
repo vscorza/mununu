@@ -404,6 +404,31 @@ enum EngineArg {
 /// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
 /// selector for `mununu btor2 cegar`. Mirrors the values of
 /// [`mununu_core::adapter::btor2::kmts_lift::MustEdgeInference`].
+/// RTL front-end for the SV → BTOR2 lift (CLI mirror of
+/// [`mununu_core::adapter::yosys::SvFrontend`]).
+#[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
+enum SvFrontendArg {
+    /// Env-driven default: `MUNUNU_YOSYS_FRONTEND=slang` → slang, else read_verilog.
+    #[default]
+    Auto,
+    /// Force yosys `read_verilog` (+ sv2v per `--preprocess-sv2v`).
+    Verilog,
+    /// Force the yosys-slang plugin (`read_slang`) — lifts modern-SV constructs
+    /// `read_verilog`/sv2v reject (`while` loops, `module M import pkg::*;`).
+    /// Requires the yosys-slang plugin (present in the `mununu-sva` image).
+    Slang,
+}
+
+impl From<SvFrontendArg> for mununu_core::adapter::yosys::SvFrontend {
+    fn from(a: SvFrontendArg) -> Self {
+        match a {
+            SvFrontendArg::Auto => Self::Auto,
+            SvFrontendArg::Verilog => Self::Verilog,
+            SvFrontendArg::Slang => Self::Slang,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
 enum MustEdgeInferenceArg {
     /// Pre-R.2.5b behaviour (default). Only MayOnly edges emitted;
@@ -1590,6 +1615,12 @@ struct SvVerifyAutoArgs {
     /// on-disk include-search directory has no analog there.
     #[arg(long = "include-dir", value_name = "DIR")]
     include_dirs: Vec<PathBuf>,
+    /// RTL front-end for the lift. `slang` forces the yosys-slang plugin
+    /// (`read_slang`), which lifts modern-SV constructs `read_verilog`/sv2v
+    /// reject (`while` loops, `module M import pkg::*;`). Requires the
+    /// yosys-slang plugin (present in the mununu-sva image).
+    #[arg(long = "frontend", value_enum, default_value_t = SvFrontendArg::Auto)]
+    frontend: SvFrontendArg,
     /// Max CEGAR iterations per property.
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
@@ -1699,6 +1730,13 @@ struct SvLiftArgs {
     /// name-staging of additional sources already resolves cross-file includes.
     #[arg(long = "include-dir", value_name = "DIR")]
     include_dirs: Vec<PathBuf>,
+    /// RTL front-end for the lift. `slang` forces the yosys-slang plugin
+    /// (`read_slang`), which lifts modern-SV constructs `read_verilog` and sv2v
+    /// reject (`while` loops, `module M import pkg::*;`). Requires the
+    /// yosys-slang plugin (present in the mununu-sva image). `auto` (default)
+    /// keeps the env-driven behaviour; `verilog` forces read_verilog.
+    #[arg(long = "frontend", value_enum, default_value_t = SvFrontendArg::Auto)]
+    frontend: SvFrontendArg,
 }
 
 /// Arguments for `mununu sv verify` — SV-direct safety portfolio.
@@ -2087,6 +2125,30 @@ fn parse_cli_controller_mode(
     } else {
         ControllerMode::Projection
     })
+}
+
+#[cfg(test)]
+mod sv_frontend_arg_tests {
+    use super::*;
+    use mununu_core::adapter::yosys::SvFrontend;
+
+    // Guards against a copy-paste swap in the CLI → core front-end mapping
+    // (e.g. Slang accidentally routed to Verilog would silently disable the
+    // whole slang-lift capability while still reporting "frontend=slang").
+    #[test]
+    fn frontend_arg_maps_to_core_variant() {
+        assert_eq!(SvFrontend::from(SvFrontendArg::Auto), SvFrontend::Auto);
+        assert_eq!(
+            SvFrontend::from(SvFrontendArg::Verilog),
+            SvFrontend::Verilog
+        );
+        assert_eq!(SvFrontend::from(SvFrontendArg::Slang), SvFrontend::Slang);
+    }
+
+    #[test]
+    fn frontend_arg_default_is_auto() {
+        assert!(matches!(SvFrontendArg::default(), SvFrontendArg::Auto));
+    }
 }
 
 #[cfg(test)]
@@ -3178,6 +3240,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         use_sv2v: args.preprocess_sv2v,
         cutpoint_signals: args.cutpoint.clone(),
         extra_include_dirs: args.include_dirs.clone(),
+        frontend: args.frontend.into(),
         ..Default::default()
     };
     let must_edge_inference = match args.must_edge_inference {
@@ -5097,6 +5160,7 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
         top: args.top.clone(),
         use_sv2v: args.preprocess_sv2v,
         include_dirs: args.include_dirs.clone(),
+        frontend: args.frontend.into(),
     })
 }
 

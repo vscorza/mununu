@@ -1082,6 +1082,11 @@ pub struct SvVerifyRequest {
     /// Run sv2v before Yosys (modern SV). Default `false`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`) for modern-SV constructs
+    /// yosys/sv2v reject (`while` loops, `import pkg::*;`). Requires the
+    /// yosys-slang plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
 }
 
 /// Request for `POST /api/v1/sv/verify-liveness` — the SV lift fields plus the
@@ -1099,6 +1104,10 @@ pub struct SvVerifyLivenessRequest {
     /// Run sv2v before Yosys. Default `false`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
     /// The request atom (`"REG op VALUE"`).
     pub request: String,
     /// The grant atom that must eventually follow on every path.
@@ -1121,6 +1130,10 @@ pub struct SvVerifyLivenessAllRequest {
     /// Run sv2v before Yosys. Default `false`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
     /// The response pairs, each `"ANTE => CONS"`. At least one required.
     pub responses: Vec<String>,
 }
@@ -1140,6 +1153,10 @@ pub struct SvVerifyRecoverabilityRequest {
     /// Run sv2v before Yosys. Default `false`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
     /// The `good` atom to recover to (`"REG op VALUE"`).
     pub target: String,
     /// Extra abstraction predicate(s) for the cube-path escalation, each
@@ -1164,6 +1181,10 @@ pub struct SvCheckFsmRequest {
     /// Run sv2v before Yosys. Default `false`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
     /// Max state-register width treated as an FSM (wider = datapath/counter, skipped).
     #[serde(default = "default_fsm_max_width")]
     pub max_width: u32,
@@ -1304,6 +1325,11 @@ pub struct SvVerifyAutoRequest {
     /// Run sv2v before Yosys (modern SV). Mirrors `--preprocess-sv2v`.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`) for modern-SV constructs
+    /// yosys/sv2v reject. Mirrors `--frontend slang`. Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
     /// Max CEGAR iterations per property (default 16).
     #[serde(default)]
     pub max_iterations: Option<usize>,

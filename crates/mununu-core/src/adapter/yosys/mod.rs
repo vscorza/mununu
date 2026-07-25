@@ -57,6 +57,28 @@ use std::time::Duration;
 /// trips on the fixtures the feature actually targets.
 const PER_MODULE_YOSYS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// RTL front-end selection for the SV → BTOR2 lift.
+///
+/// - `Auto` (default) — the historical behaviour: yosys `read_verilog` (with
+///   optional sv2v), unless `MUNUNU_YOSYS_FRONTEND=slang` is set in the env and
+///   the plugin is present, in which case slang is used.
+/// - `Verilog` — force yosys `read_verilog` (+ sv2v per `use_sv2v`), ignoring the
+///   env override.
+/// - `Slang` — force the yosys-slang plugin (`read_slang`), a full SystemVerilog
+///   front-end that accepts constructs `read_verilog` and sv2v reject (bounded
+///   `while` loops, `module M import pkg::*;`, …). Errors clearly if the plugin is
+///   not found. Validated in the `mununu-sva` image (the plugin ships there).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SvFrontend {
+    /// Env-driven (default): `MUNUNU_YOSYS_FRONTEND=slang` → slang, else read_verilog.
+    #[default]
+    Auto,
+    /// Force yosys `read_verilog` (+ sv2v per `use_sv2v`).
+    Verilog,
+    /// Force the slang front-end (`read_slang`); error if the plugin is absent.
+    Slang,
+}
+
 /// Yosys-specific options.
 #[derive(Debug, Clone, Default)]
 pub struct YosysOptions {
@@ -104,6 +126,12 @@ pub struct YosysOptions {
     /// `--preprocessor sv2v` or the API field `use_sv2v: true` on the
     /// import request.
     pub use_sv2v: bool,
+    /// RTL front-end selection. `Auto` (default) preserves the env-driven
+    /// behaviour; `Slang` forces the yosys-slang plugin (`read_slang`), which
+    /// lifts modern-SV constructs `read_verilog`/sv2v reject (`while` loops,
+    /// `module M import pkg::*;`). Populated from the CLI `--frontend` flag / the
+    /// API `use_slang` field. See [`SvFrontend`].
+    pub frontend: SvFrontend,
     /// When `true`, Yosys's `setundef -anyseq` pass replaces every
     /// undefined net with a fresh symbolic choice instead of pinning
     /// it to zero. Preserves CWE-1245-class bug-bearing semantics
@@ -376,7 +404,24 @@ fn run_sv_flatten_btor2(
     // A3 — the opt-in slang RTL frontend (`MUNUNU_YOSYS_FRONTEND=slang`). `read_slang`
     // parses SystemVerilog natively (a superset of what `read_verilog` accepts), so sv2v
     // is redundant with it and is skipped when slang is active.
-    let slang_plugin = slang_frontend_selection();
+    // Front-end selection: an explicit `Slang` request forces the plugin (and
+    // errors if it is absent — never a silent fall-back to read_verilog, which
+    // would defeat the whole point of asking for slang); `Verilog` forces
+    // read_verilog; `Auto` keeps the env-driven default.
+    let slang_plugin = match yopts.frontend {
+        SvFrontend::Slang => Some(locate_slang_plugin().ok_or_else(|| {
+            AdapterError {
+                kind: AdapterErrorKind::UnsupportedConstruct,
+                message: "adapter/yosys: the slang RTL front-end was requested (--frontend slang \
+                      / use_slang) but the yosys-slang plugin was not found. Set \
+                      MUNUNU_YOSYS_SLANG_PLUGIN to slang.so, or run in the mununu-sva image."
+                    .into(),
+                location: None,
+            }
+        })?),
+        SvFrontend::Verilog => None,
+        SvFrontend::Auto => slang_frontend_selection(),
+    };
     if yopts.use_sv2v && slang_plugin.is_none() {
         let sv2v = locate_sv2v()?;
         let preprocessed = tmp.path().join("preprocessed.sv");
@@ -2842,6 +2887,48 @@ mod tests {
         assert!(
             sv_to_btor2(top, &no_inc).is_err(),
             "expected the lift to fail when the include dir is absent"
+        );
+    }
+
+    // (a) front-end selection — a non-constant `while` loop is rejected by yosys
+    // `read_verilog` ("While loops are only allowed in constant functions!") but
+    // accepted by the slang front-end (`read_slang`), which elaborates it. This is
+    // the real corpus lift blocker the slang front-end unlocks (e.g. AssertLLM2
+    // `xgate`). yosys + yosys-slang-plugin gated → runs in the `mununu-sva` image.
+    #[test]
+    #[ignore = "requires yosys + the yosys-slang plugin (run in the mununu-sva image)"]
+    fn frontend_slang_lifts_while_loop_read_verilog_rejects() {
+        let src = "module m(input [3:0] n, output reg [7:0] y);\n\
+                   integer i;\n\
+                   always @* begin\n\
+                     y = 8'd0; i = 0;\n\
+                     while (i < n) begin y = y + 8'd1; i = i + 1; end\n\
+                   end\n\
+                   endmodule\n";
+
+        // read_verilog rejects the non-constant while loop.
+        let verilog = YosysOptions {
+            top: Some("m".to_string()),
+            frontend: SvFrontend::Verilog,
+            skip_verific_check: true,
+            ..Default::default()
+        };
+        assert!(
+            sv_to_btor2(src, &verilog).is_err(),
+            "read_verilog should reject a non-constant while loop"
+        );
+
+        // The slang front-end elaborates it → the design lifts.
+        let slang = YosysOptions {
+            top: Some("m".to_string()),
+            frontend: SvFrontend::Slang,
+            skip_verific_check: true,
+            ..Default::default()
+        };
+        let lifted = sv_to_btor2(src, &slang);
+        assert!(
+            lifted.as_ref().is_ok_and(|b| !b.is_empty()),
+            "the slang front-end should lift the while loop, got {lifted:?}"
         );
     }
 

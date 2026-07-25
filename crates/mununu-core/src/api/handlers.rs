@@ -875,6 +875,11 @@ pub async fn sv_verify_handler(
         // on-disk include-search dir is a local (CLI) concept; the flat
         // name-staging of `additional_sources` already resolves includes here.
         include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
     };
     let outcome = sv_verify_safety(&lift).map_err(|message| ApiError::BadRequest {
         message,
@@ -914,6 +919,11 @@ pub async fn sv_verify_liveness_handler(
         // on-disk include-search dir is a local (CLI) concept; the flat
         // name-staging of `additional_sources` already resolves includes here.
         include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
     };
     let (verdict, outcome) =
         sv_verify_liveness(&lift, &request.request, &request.grant).map_err(|message| {
@@ -959,6 +969,11 @@ pub async fn sv_verify_liveness_all_handler(
         // on-disk include-search dir is a local (CLI) concept; the flat
         // name-staging of `additional_sources` already resolves includes here.
         include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
     };
     let (verdict, outcomes) =
         sv_verify_liveness_all(&lift, &request.responses).map_err(|message| {
@@ -1010,6 +1025,11 @@ pub async fn sv_verify_recoverability_handler(
         // on-disk include-search dir is a local (CLI) concept; the flat
         // name-staging of `additional_sources` already resolves includes here.
         include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
     };
     let verdict = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra)
         .map_err(|message| ApiError::BadRequest {
@@ -1043,6 +1063,11 @@ pub async fn sv_check_fsm_handler(
         // on-disk include-search dir is a local (CLI) concept; the flat
         // name-staging of `additional_sources` already resolves includes here.
         include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
     };
     let findings =
         sv_check_fsm(&lift, request.max_width).map_err(|message| ApiError::BadRequest {
@@ -1209,6 +1234,11 @@ pub async fn sv_verify_auto_handler(
             .collect(),
         use_sv2v: request.use_sv2v,
         cutpoint_signals: request.cutpoint.clone(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
         ..Default::default()
     };
     let must_edge_inference = match request.must_edge_inference.as_deref() {
