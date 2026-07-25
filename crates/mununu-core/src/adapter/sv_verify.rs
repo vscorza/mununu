@@ -26,7 +26,7 @@ use crate::adapter::liveness_rescue::{
 };
 use crate::adapter::reach_portfolio::{ReachOutcome, decide_reach_portfolio_parallel};
 use crate::adapter::recoverability::verify_recoverability_with_predicates;
-use crate::adapter::yosys::{YosysOptions, sv_to_btor2};
+use crate::adapter::yosys::{SvFrontend, YosysOptions, sv_to_btor2};
 use crate::verdict::PropertyVerdict;
 
 /// The SV → BTOR2 lift inputs shared by every SV-direct verb.
@@ -44,6 +44,10 @@ pub struct SvLift {
     /// without the fragment being read as a standalone compilation unit.
     /// Feeds [`YosysOptions::extra_include_dirs`]; empty by default.
     pub include_dirs: Vec<std::path::PathBuf>,
+    /// RTL front-end selection. `Slang` forces the yosys-slang plugin, which
+    /// lifts modern-SV constructs `read_verilog`/sv2v reject. Feeds
+    /// [`YosysOptions::frontend`]; `Auto` by default.
+    pub frontend: SvFrontend,
 }
 
 impl SvLift {
@@ -54,6 +58,7 @@ impl SvLift {
             additional_sources: self.additional_sources.clone(),
             use_sv2v: self.use_sv2v,
             extra_include_dirs: self.include_dirs.clone(),
+            frontend: self.frontend,
             ..Default::default()
         };
         sv_to_btor2(&self.source, &yopts)
@@ -150,6 +155,7 @@ mod tests {
             top: None,
             use_sv2v: false,
             include_dirs: Vec::new(),
+            frontend: SvFrontend::Auto,
         }
     }
 
@@ -199,6 +205,7 @@ mod tests {
             top: Some("aes_cipher_control_fsm".into()),
             use_sv2v: true,
             include_dirs: Vec::new(),
+            frontend: SvFrontend::Auto,
         };
         let verdict = sv_verify_recoverability(&lift, "aes_cipher_ctrl_cs == 9")
             .expect("recoverability decides on the AES cipher-control FSM");
