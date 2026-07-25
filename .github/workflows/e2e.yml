@@ -32,12 +32,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # The sva image extends `mununu-dev` (FROM mununu-dev), so build dev first
       # and tag it locally for the sva build to pick up.
       - name: Build mununu-dev image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.dev

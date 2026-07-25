@@ -24,10 +24,10 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build mununu-dev image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.dev
@@ -99,7 +99,7 @@ jobs:
           tool: tokei
       - name: Count lines of code
         run: tokei --output json > tokei.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: tokei-report
           path: tokei.json
