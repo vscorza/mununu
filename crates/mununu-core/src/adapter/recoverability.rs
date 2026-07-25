@@ -1032,6 +1032,171 @@ fn verify_recoverability_counter_abstracted(
     }
 }
 
+/// A best-effort, SOUND-hint explanation of WHY an `AG EF good` recoverability property stayed ⊥ —
+/// so a ⊥ becomes ACTIONABLE ("what would it take to decide this?") instead of a bare "don't know".
+/// Purely a diagnostic: it NEVER produces or changes a verdict. Localizes the structural obstacles in
+/// the good's recovery cone that the predicate abstraction cannot cross.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoverabilityBotDiagnosis {
+    /// Down-counters that GATE the recovery (in the good's cone, not read by the good) whose descent
+    /// is NOT ranking-certified — a fairness-gated reload or a non-affine descent: `(name, width)`.
+    /// Deciding needs a ranking certificate or a fairness assumption.
+    pub uncertified_counters: Vec<(String, u32)>,
+    /// Wide state / inputs (NOT a small FSM, NOT a certified counter) whose value flows into the
+    /// recovery target: `(name, width)`. The recovery value rides that wide state, so the verdict is
+    /// data/config-scoped (a specific config may HOLD, another VIOLATE) — the predicate cube cannot
+    /// enumerate it. Constrain those inputs, or the ⊥ is the honest config-independent answer.
+    pub wide_influences: Vec<(String, u32)>,
+}
+
+impl RecoverabilityBotDiagnosis {
+    /// True when no structural obstacle was localized — the abstraction may simply be too coarse
+    /// (more predicates could close it).
+    pub fn is_empty(&self) -> bool {
+        self.uncertified_counters.is_empty() && self.wide_influences.is_empty()
+    }
+
+    /// A one-line, actionable hint for the ⊥ note.
+    pub fn hint(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.uncertified_counters.is_empty() {
+            let names: Vec<String> = self
+                .uncertified_counters
+                .iter()
+                .map(|(n, w)| format!("`{n}` ({w}-bit)"))
+                .collect();
+            parts.push(format!(
+                "gated by {} counter(s) with an un-certified descent [{}] — needs a ranking \
+                 certificate or a fairness assumption",
+                self.uncertified_counters.len(),
+                names.join(", ")
+            ));
+        }
+        if !self.wide_influences.is_empty() {
+            let names: Vec<String> = self
+                .wide_influences
+                .iter()
+                .map(|(n, w)| format!("`{n}` ({w}-bit)"))
+                .collect();
+            parts.push(format!(
+                "the recovery value rides wide data/config state [{}] the predicate cube cannot \
+                 enumerate — the verdict is input-scoped (constrain those inputs to decide, else ⊥ \
+                 is the honest config-independent answer)",
+                names.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            "no structural obstacle localized by the best-effort cone walk — the ⊥ may be a coarse \
+             but closable abstraction (add predicates), OR a deeper config/sequence dependence this \
+             light pass does not localize"
+                .to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+/// See [`RecoverabilityBotDiagnosis`]. `good` is the `REG == VALUE` recovery atom; a parse failure
+/// yields an empty diagnosis (a hint is never load-bearing).
+pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> RecoverabilityBotDiagnosis {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::parser::{collect_symbols, find_next_value_operand};
+    const WIDE_MIN_WIDTH: u32 = 8;
+    const MAX_LISTED: usize = 4;
+    let mut diag = RecoverabilityBotDiagnosis::default();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return diag;
+    };
+    let Ok(good_expr) = parse_predicate_expr(good) else {
+        return diag;
+    };
+    let good_registers = good_expr.registers();
+    let symbols = collect_symbols(&file);
+
+    // The good's BACKWARD cone (crossing state boundaries): the named cells/inputs whose value
+    // transitively determines the recovery target.
+    let mut queue: std::collections::VecDeque<i64> = good_registers
+        .iter()
+        .filter_map(|gr| symbols.iter().find_map(|(n, s)| (s == gr).then_some(*n)))
+        .collect();
+    let mut cone: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    while let Some(nid) = queue.pop_front() {
+        if !cone.insert(nid) {
+            continue;
+        }
+        match file.lookup(nid).map(|l| &l.node) {
+            Some(Node::State { .. }) => {
+                if let Some(nv) = find_next_value_operand(&file, nid) {
+                    queue.push_back(nv.0.abs());
+                }
+            }
+            Some(Node::Op { args, .. }) => {
+                for o in args {
+                    queue.push_back(o.0.abs());
+                }
+            }
+            // A combinational OUTPUT (e.g. `cs_n`) carries the atom on an `output`/alias node —
+            // follow its driving signal so the walk reaches the underlying state + datapath.
+            Some(Node::Output { signal, .. }) => {
+                queue.push_back(signal.0.abs());
+            }
+            _ => {}
+        }
+    }
+
+    // (1) Uncertified gating down-counters in the cone (the good does not read them).
+    let counter_nids: std::collections::HashSet<i64> =
+        crate::adapter::btor2::bit_blast::detect_down_counter(&file)
+            .iter()
+            .map(|c| c.nid)
+            .collect();
+    for c in crate::adapter::btor2::bit_blast::detect_down_counter(&file) {
+        if let Some(sym) = symbols.get(&c.nid)
+            && cone.contains(&c.nid)
+            && !good_registers.contains(sym)
+            && !ranking_certificate_holds(&file, std::slice::from_ref(sym), Some(c.threshold))
+        {
+            diag.uncertified_counters.push((sym.clone(), c.width));
+        }
+    }
+
+    // (2) Wide data/config state the recovery value rides — EXCLUDING small FSM states (enum-detected,
+    // cube-handleable) and the certified/uncertified counters (already reported / handled).
+    let enum_nids: std::collections::HashSet<i64> =
+        crate::adapter::btor2::bit_blast::detect_enum_states(&file)
+            .iter()
+            .map(|e| e.nid)
+            .collect();
+    for nid in &cone {
+        if counter_nids.contains(nid) || enum_nids.contains(nid) {
+            continue;
+        }
+        let Some(sym) = symbols.get(nid) else {
+            continue;
+        };
+        if good_registers.contains(sym) {
+            continue;
+        }
+        let sort = match file.lookup(*nid).map(|l| &l.node) {
+            Some(Node::State { sort, .. }) | Some(Node::Input { sort, .. }) => *sort,
+            _ => continue,
+        };
+        if let Some(w) = crate::adapter::btor2::parser::bv_width(&file, sort)
+            && w >= WIDE_MIN_WIDTH
+        {
+            diag.wide_influences.push((sym.clone(), w));
+        }
+    }
+
+    diag.uncertified_counters.sort();
+    diag.uncertified_counters.dedup();
+    diag.uncertified_counters.truncate(MAX_LISTED);
+    diag.wide_influences.sort();
+    diag.wide_influences.dedup();
+    diag.wide_influences.truncate(MAX_LISTED);
+    diag
+}
+
 /// P2 Slice 1 — decide recoverability `AG EF good` via the **predicate-cube +
 /// `smt-hyper-must`** path, so the νμ property decides beyond the exact engine's
 /// ~40-bit cone cap.
@@ -2850,6 +3015,43 @@ mod tests {
             None,
             "a gated (non-pure-Eq) event driver is not rewritten (soundness)"
         );
+    }
+
+    /// Actionable-⊥ diagnosis — a recovery target whose value rides a WIDE datapath register. The
+    /// diagnosis must localize the 16-bit `wide_data` influence (recovery value is data-scoped) and
+    /// find no gating counter.
+    #[test]
+    fn recoverability_bot_diagnosis_flags_wide_data_influence() {
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 16\n3 state 1 flag\n4 state 2 wide_data\n\
+5 zero 1\n6 one 1\n7 zero 2\n8 one 2\n9 init 1 3 5\n10 init 2 4 7\n11 slice 1 4 0 0\n\
+12 next 1 3 11\n13 add 2 4 8\n14 next 2 4 13\n";
+        let diag = diagnose_recoverability_bot(D, "flag == 1");
+        assert!(
+            diag.uncertified_counters.is_empty(),
+            "no down-counter gates it"
+        );
+        assert_eq!(
+            diag.wide_influences,
+            vec![("wide_data".to_string(), 16)],
+            "the 16-bit datapath the recovery value rides is localized"
+        );
+        assert!(diag.hint().contains("wide data/config state"));
+        assert!(!diag.is_empty());
+    }
+
+    /// Actionable-⊥ diagnosis — a recovery target riding only NARROW control state localizes NO
+    /// structural obstacle (the abstraction may be closable with more predicates), so the hint says so.
+    #[test]
+    fn recoverability_bot_diagnosis_empty_when_control_only() {
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 2\n3 state 1 flag\n4 state 2 st\n\
+5 zero 1\n6 one 1\n7 zero 2\n8 one 2\n9 init 1 3 5\n10 init 2 4 7\n11 slice 1 4 0 0\n\
+12 next 1 3 11\n13 add 2 4 8\n14 next 2 4 13\n";
+        let diag = diagnose_recoverability_bot(D, "flag == 1");
+        assert!(
+            diag.is_empty(),
+            "narrow control-only cone: no wide influence, no uncertified counter"
+        );
+        assert!(diag.hint().contains("no structural obstacle"));
     }
 
     // Ranking certificate — the well-founded-descent / RANKING class. A down-counter to 0: `cnt`
