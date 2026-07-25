@@ -21,7 +21,8 @@
 13. [Available Agents and Skills](#available-agents-and-skills) `[REFERENCE]`
 14. [Private Files Policy](#private-files-policy) `[RULE]`
 15. [Reasoning & Recommendation Honesty](#reasoning--recommendation-honesty) `[RULE]`
-16. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
+16. [Business Plan & Commercial Decisions](#business-plan--commercial-decisions) `[RULE]`
+17. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
 
 ---
 
@@ -29,7 +30,7 @@
 
 Mununu is a formal verification tool for analyzing and synthesizing controllers for reactive systems modeled as Compositional Labeled Transition Systems (CLTS). It includes mu-calculus formula evaluation, controller synthesis, LTL pattern support, state variable abstraction, and a DSL (CTXDSL) for specifying concurrent systems.
 
-See `docs/architecture/` for the three-layer model (extraction → adaptation → verification).
+See [`docs/design/post-rf5-architecture.md`](docs/design/post-rf5-architecture.md) (end-to-end engine picture: explicit vs symbolic, IR layering) and [`docs/design/sts-ir.md`](docs/design/sts-ir.md) (the STS-IR narrow waist) for the internal architecture (extraction → adaptation → verification).
 
 ## Workspace Structure
 
@@ -56,6 +57,21 @@ For CI-exact reproduction inside the pinned dev container, see [`docs/dev-contai
 
 The `security-audit` CI job runs `cargo audit`. The `dependency-check` job is non-blocking.
 
+### Local build gotchas `[REFERENCE]` (added 2026-07-25)
+
+Two host-local traps that look like failures but are not code bugs — recognise them before reacting:
+
+- **`ld64.lld: too many errors emitted` on a commit/test link.** The host `.cargo/config.toml` pins a fast
+  custom linker (`-fuse-ld=…/ld64.lld`); a **stale incremental artifact for one feature-hash** can make it emit
+  a spurious "undefined symbols / too many errors" even when the code compiles cleanly (a `--workspace` build with
+  a different feature set links fine; the narrower hook hash doesn't). It is NOT a code error. **Fix:** force a
+  recompile of that hash — any `RUSTFLAGS` tweak, or `cargo clean -p mununu-core` — then re-commit. Do **not**
+  reach for `--no-verify` to route around it (that needs authorisation regardless; see Git Operations).
+- **`MUNUNU_SLANG_PATH` is NOT auto-detected from `$PATH`.** `locate_slang()` checks the env var + fixed paths,
+  not `$PATH`. For any SystemVerilog design, set it explicitly (in `mununu-sva`: `MUNUNU_SLANG_PATH=/usr/local/bin/slang`),
+  or the `@mununu_guarantee` design-lift falls to the **sv2v-only** path — which drops `assert property` and
+  chokes on `module X import pkg::*` (→ EFAIL, or a vacuous `holds`). See the SVA e2e note below.
+
 ### SVA-verification e2e validation (slang) `[REFERENCE]` (added 2026-06-27)
 
 The SVA front-end (`mununu sv extract-sva` / `mununu sv verify-auto`) shells out to **slang** (SystemVerilog elaboration), **sv2v**, and **yosys**. Per the subprocess-tools-are-not-bundled policy, these are NOT in `mununu-dev`, so the slang-gated end-to-end tests are `#[ignore]`d and do not run in `make ci`. Their mechanisms are covered by non-ignored unit tests; the `#[ignore]` tests validate the full chain when the tools are present.
@@ -79,65 +95,25 @@ docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target \
 
 **How to comply.** Any change that exercises `adapter/slang/**`, `sv extract-sva`, `sv verify-auto`, or an SV→BTOR2 path that must preserve assertions is validated by running the relevant `#[ignore]`d `e2e_` tests **in the `mununu-sva` image** (command above), not by a host `cargo test`. Pure-Rust / `btor2` / non-slang paths may still be validated on the host. When a host run of an SV path returns `holds` with no counterexample, treat it as *unverified* until reproduced under `mununu-sva` — a bare-host `holds` on SVA is presumed vacuous. slang honours `MUNUNU_SLANG_PATH`; the image provides a pinned build.
 
-### Pre-push workspace check (added 2026-06-08)
+### Local CI discipline — hook serialisation + pre-push workspace check
 
-**Rule.** Before `git push`, when a commit touches a field of a struct with multiple construction sites (`OriginalTransition`, `TransitionSpec`, `SignalAnnotation`, `CegarOptions`, `PredicateCubeLiftOptions`, `TransitionDecl`, etc.), run the CI-equivalent workspace check:
+**Serialisation rule.** While a pre-commit hook is running, **never** launch a second HEAVY cargo workload that competes for the rustc / nextest pool. (macOS runs background hooks at lowered priority; two heavy workloads on one pool reproduced the 2026-05-27 incident — 36/1853 tests in 1h 32min. Test execution is sub-ms; the cost is scheduling, so lightweight concurrency is safe.)
+
+- **HEAVY — forbidden concurrent with a hook:** `cargo {test,build,check,clippy} --workspace`, `make ci`, `cargo nextest run --workspace`, a **second `git commit` whose hook would fire** (don't chain commits — land commit N's hook, verified by `git log` showing the new HEAD, before N+1). Any all-workspace compile/test.
+- **Lightweight — allowed concurrent with a hook's test phase:** `cargo check/clippy -p <one_crate>`, `cargo test -p <one_crate> --lib <specific_test>`, `cargo fmt[ --check]`.
+- **Always allowed (no cargo):** working-tree edits (the hook reads the COMMITTED state, not the tree), `.claude/plans/` edits, drafting messages, git status/log/diff, `gh` CI-status checks.
+- Skipping the hook with `--no-verify` requires explicit per-commit user authorisation (see [Git Operations & Destructive Commands](#git-operations--destructive-commands)). Subagents inherit this heavy-vs-lightweight distinction — never a second hook or workspace compile while another hook is in flight.
+
+**Pre-push workspace check.** Before `git push`, when a commit touches a `pub` field of a struct with **multiple construction sites** (`OriginalTransition`, `TransitionSpec`, `SignalAnnotation`, `CegarOptions`, `PredicateCubeLiftOptions`, `TransitionDecl`, …), run the CI-equivalent workspace check **as a pre-push step** (not concurrent with a hook):
 
 ```bash
 cargo check --workspace --all-features --tests
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --check
-cargo test --workspace --all-features --doc    # <-- doctests too (revised 2026-06-08)
+cargo test --workspace --all-features --doc    # doctests have a SEPARATE phase only `--doc` / make ci runs
 ```
 
-**Why.** Per-crate `cargo check` (the typical hook-light pattern under [Pre-commit hook serialisation](#pre-commit-hook-serialisation)) does NOT compile:
-- the **legacy root-level bin** at `src/main.rs` (gated on `--features cli`, separate from the workspace `crates/mununu-cli/src/main.rs`).
-- crates that depend on the touched type through workspace edges.
-- test crates that construct the type in fixtures.
-- **doctests** inside `///` examples that construct the type literally. `cargo check --tests` does NOT compile doctests — they have a separate compilation phase that only `cargo test --doc` (or `make ci`) runs. Doctest gaps surface only at CI.
-
-Three recent incidents exposed the gap:
-- `3923822` (K.2b): added `modality` to `OriginalTransition`; the api-feature build at `crates/mununu-core/src/api/graph.rs` had a variable-name typo CI caught (fix `04beae6`).
-- `cfee81d` (K.1b-unrolled): added `additional_targets` to `OriginalTransition`; the legacy root bin's `src/main.rs:3738` site was missed; user surfaced the CI failure (fix `04f01f9`).
-- `cfee81d` (K.1b-unrolled, second-order): the doctests in `crates/mununu-core/src/abstraction/unrolling.rs:911,945` constructed `OriginalTransition` literals without the new field; `c3ecb38` + `04f01f9` + `832f552` all ran CI red because the pre-push check (revised at `c3ecb38`) did not include doctests (fix `4a07df7`).
-
-**Scope.** Trigger this check whenever the diff touches a `pub` field of any of the load-bearing struct types listed above. For commits that don't touch IR / sidecar / CegarOptions shape (e.g. parser-internal changes, doc edits), the lighter per-crate pattern in the next section is sufficient.
-
-**Hook compatibility.** The full workspace check is HEAVY per the hook-serialisation rule below — do NOT run it concurrent with another commit's hook. Run it as a pre-push step (no other heavy work in flight), not as a concurrent background task.
-
-### Pre-commit hook serialisation
-
-**Rule (revised 2026-06-03).** When a pre-commit hook is running, **never** launch a second heavy cargo workload that competes for the rustc compilation pool or the nextest thread pool. Lightweight per-crate cargo work is allowed.
-
-**Heavy** (FORBIDDEN to run concurrent with a hook):
-- `cargo nextest run --workspace` / `cargo test --workspace` / `make ci`
-- `cargo build --workspace` / `cargo check --workspace` / `cargo clippy --workspace`
-- A second `git commit` whose hook would fire (don't chain commits — the prior hook must complete first)
-- Any command that compiles or tests across the entire workspace at once
-
-**Lightweight** (ALLOWED to run concurrent with a hook's test phase):
-- `cargo check -p <one_crate>` (compile-only, much smaller resource footprint)
-- `cargo clippy -p <one_crate>` (single crate)
-- `cargo test -p <one_crate> --lib <specific_test_name>` (single test, single crate)
-- `cargo fmt` / `cargo fmt --check` (no compilation)
-
-**Always allowed** (no cargo invocation at all):
-- File edits in the working tree (including the source files the hook is validating — the hook reads the COMMITTED state, not the working tree)
-- Plan-doc edits in `.claude/plans/`
-- Drafting commit messages, reading source, git status / log / diff queries
-- Background CI status checks via `gh run view`
-
-**Why.** macOS schedules pre-commit hooks at lowered priority (`STAT=SN`) when launched in the background. Two **heavy** cargo workloads competing for the same compilation pool reproduce the 2026-05-27 R.2.5 incident where 36 / 1853 tests took 1h 32min wall-clock. Lightweight per-crate work uses a fraction of the cores and shares the pool without starvation. Test execution itself is sub-millisecond per area; the wall-clock cost is entirely scheduling — so the relaxation is safe as long as no second heavy workload competes.
-
-**How to comply.**
-
-- Before kicking off any commit that runs the pre-commit hook (any `git commit` without `--no-verify`), check that no other **heavy** cargo / make-ci process is running.
-- While a commit is in flight, you MAY draft + lightweight-validate the next commit's code in the working tree. You may NOT start a second hook or run a workspace-wide cargo invocation.
-- Do not chain commits back-to-back. Land commit N's hook (verify via `git log` showing the new HEAD, or the sentinel file exit code) before launching commit N+1's `git commit`.
-- Single-test validation runs (e.g. `cargo test -p mununu-core --lib <specific_test>`) are now permitted concurrent with a hook's test phase. Full per-crate test runs (`cargo test -p mununu-core --lib`, no test filter) are also permitted but use more resources — apply judgment based on what the hook is currently doing.
-- Skipping the hook with `--no-verify` requires explicit per-commit user authorisation, per [Git Operations & Destructive Commands](#git-operations--destructive-commands).
-
-**Propagation to subagents.** Any subagent that issues `git commit` or runs cargo inherits the heavy-vs-lightweight distinction. Subagents may freely run lightweight per-crate cargo work concurrent with another subagent's hook; they MUST NOT start a second hook or workspace-wide compile while another hook is in flight.
+**Why:** per-crate `cargo check` misses the legacy root bin (`src/main.rs`, `--features cli`), workspace-edge dependents, test-fixture construction sites, and **doctests** (`///` literals compile in a separate phase). Three `OriginalTransition`-field incidents (`3923822`, `cfee81d` ×2 — the last a doctest-only gap) each shipped CI-red past a per-crate check. For diffs that don't touch these load-bearing struct shapes, the lightweight per-crate pattern suffices.
 
 ## Git Identity
 
@@ -190,7 +166,7 @@ Use the KMTS path whenever the property has a μ inside a ν (or a ν inside a �
 
 Strategy extraction uses **signature-based selection** from iteration ranks. Both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998); memoryless on the model-checking product = finite-memory on the plant. See [`docs/synthesis.md`](docs/synthesis.md) for `ControllerMode` options, lasso trace format, counterstrategy emission, and the Skolem-paradigm rules for nondeterminism vs. controllability.
 
-Contract-specific soundness (chaotic-stub default, cyclic-discharge handling, codesign rules) is in [`docs/design/black-box-modules.md`](docs/design/black-box-modules.md) and [`docs/design/hw-sw-codesign-extraction.md`](docs/design/hw-sw-codesign-extraction.md).
+Contract-specific soundness (chaotic-stub default, cyclic-discharge handling, codesign rules) is in [`docs/design/auto-extraction-architecture.md`](docs/design/auto-extraction-architecture.md).
 
 ## Abstraction Guidelines
 
@@ -212,7 +188,7 @@ For benchmarks of state-space cost per abstraction choice, see `docs/abstraction
 
 **Why.** Doc rot is the single most common reason users distrust the tool. Anchoring docs to symbols lets reviewers grep for drift the moment code is renamed, removed, or made unreachable from any surface.
 
-**Where this applies.** `wiki/**`, `docs/**` (except `docs/architecture/` design notes and planning docs tagged `> Status: planning`), `README.md`, `examples/**/README.md`, and the `description:` / inline guidance inside `.claude/agents/**` and `.claude/skills/**`.
+**Where this applies.** `wiki/**`, `docs/**` (except `docs/design/` design notes and planning docs tagged `> Status: planning`), `README.md`, `examples/**/README.md`, and the `description:` / inline guidance inside `.claude/agents/**` and `.claude/skills/**`.
 
 **Anchor format.** Every H2 / H3 section that documents a concrete capability must carry a *Source of truth* line near the top:
 
@@ -281,17 +257,19 @@ The load-bearing rules at a glance:
 
 The full policy — with the abstraction-soundness procedure, the extraction-pipeline contract, the RTL evidence rules, the C-extractor unit-vs-end-to-end distinction, and the editorial framing rules for LinkedIn / Substack / talks — is at [`docs/policies/claims-integrity.md`](docs/policies/claims-integrity.md). Read it before publishing anything that references a real system.
 
+**Measured-verdict discipline (the local artifacts).** Two gitignored working docs under `.claude/plans/` operationalize this policy — reference and append to them as you verify (they are personal working notes, not committed guidelines): the **benchmark-property ledger** (`benchmark-property-ledger.md`) records every measured verdict per property — **RTL-native designs only**, each row timestamped `[measured <ISO-8601>, <env>, <rev>]`; a verdict not in the ledger did not happen, and a row predating a relevant engine/harness change is stale until re-run. The **property-authoring playbook** (`property-authoring-playbook.md`) is the guidance for writing meaningful μ-calculus properties (the meaningfulness bar, per-formula patterns, decidability heuristics, soundness posture) — the reference for authoring properties and for tuning the property-writing agent.
+
 ## Adapter / Emitter Capability Use
 
 The CLTS data model and CTXDSL grammar already express more than most adapters reach for. When writing or modifying an extractor, adapter, or emitter, prefer these primitives over re-encoding source-language features as state-name suffixes or parallel single-label edges.
 
-- **Multi-label transitions.** A single CLTS edge carries a `SmallVec<[LabelId; 4]>` of labels — see `crates/mununu-core/src/clts/mod.rs:265`. CTXDSL: `transition s -> t on label a, label b;` (parser at `crates/mununu-core/src/context_dsl/parser.rs:733`, AST at `crates/mununu-core/src/context_dsl/ast.rs:156`). Multi-labeled edges are *one* transition, not parallel ones.
-- **Per-state predicates.** Kripke-style state labeling via `state_variable_bitset` (`crates/mununu-core/src/clts/mod.rs:1173`) and `state_valuation` (`crates/mununu-core/src/clts/mod.rs:1178`). CTXDSL: `predicates { predicate foo = state S1; }` (parser at `crates/mununu-core/src/context_dsl/parser.rs:485`). Use these instead of encoding state attributes into state names.
+- **Multi-label transitions.** A single CLTS edge carries a `SmallVec<[LabelId; 4]>` of labels (`Transition` in `crates/mununu-core/src/clts/mod.rs`). CTXDSL: `transition s -> t on label a, label b;` (parser + AST in `crates/mununu-core/src/context_dsl/`). Multi-labeled edges are *one* transition, not parallel ones.
+- **Per-state predicates.** Kripke-style state labeling via `state_variable_bitset` and `state_valuation` (`crates/mununu-core/src/clts/mod.rs`). CTXDSL: `predicates { predicate foo = state S1; }` (parser in `crates/mununu-core/src/context_dsl/parser.rs`). Use these instead of encoding state attributes into state names.
 - **Per-state structured valuations.** Hand-write display-only metadata directly on a state: `state S1 { valuations { signal_a = 1; phase = idle; } };`. Realize merges these with adapter-side `ContextDoc.state_valuations` and registers them via `Clts::with_valuation_for_state`. The CTXDSL emitter round-trips them.
-- **Per-label controllability.** `LabelControllability { Controllable, Internal, Uncontrollable }` at `crates/mununu-core/src/clts/mod.rs:248`. Declare controllability in the automaton's `controllable { ... }` / `internal { ... }` blocks; do not fold it into label-name prefixes.
-- **Rich modal guards.** `Guard { labels, current, next, control, max_steps }` at `crates/mununu-core/src/mu_calculus/mod.rs:323`. A single `[...]` or `<...>` modality can constrain all five axes — labels, current-state predicates (`req_cur` / `forb_cur`), next-state predicates (`req_next` / `forb_next`), controllability class (`ctrl = controllable | environment | all`), and step bound (`steps`). Syntax: `[(labels = {a}, req_next = {active}, ctrl = controllable)] φ`. Reach for `req_next` / `forb_next` whenever a property is naturally phrased "after this transition the system must be in a state where …" — the most under-used primitive.
+- **Per-label controllability.** `LabelControllability { Controllable, Internal, Uncontrollable }` in `crates/mununu-core/src/clts/mod.rs`. Declare controllability in the automaton's `controllable { ... }` / `internal { ... }` blocks; do not fold it into label-name prefixes.
+- **Rich modal guards.** `Guard { labels, current, next, control, max_steps }` in `crates/mununu-core/src/mu_calculus/mod.rs`. A single `[...]` or `<...>` modality can constrain all five axes — labels, current-state predicates (`req_cur` / `forb_cur`), next-state predicates (`req_next` / `forb_next`), controllability class (`ctrl = controllable | environment | all`), and step bound (`steps`). Syntax: `[(labels = {a}, req_next = {active}, ctrl = controllable)] φ`. Reach for `req_next` / `forb_next` whenever a property is naturally phrased "after this transition the system must be in a state where …" — the most under-used primitive.
 
-**Reference implementations.** Signal-state emit path with turn-aware `[(ctrl=Controllable)]` guards: `crates/mununu-core/src/adapter/emit.rs:587-872`. SystemVerilog Kripke valuations: `crates/mununu-core/src/adapter/systemverilog/kripke.rs:450`.
+**Reference implementations** (symbol refs — grep, don't trust line numbers). Signal-state emit path with turn-aware `[(ctrl=Controllable)]` guards: `emit_signal_state` in `crates/mununu-core/src/adapter/emit.rs`. SystemVerilog per-state valuations: `state_valuation` emit in `crates/mununu-core/src/adapter/systemverilog/emit_controller.rs`.
 
 **Anti-pattern.** Do not re-encode source features as state-name suffixes (e.g. `S1_req_high`) or as parallel single-label edges between the same source/target pair when a multi-label edge fits.
 
@@ -345,7 +323,12 @@ These live under `.claude/agents/**` and `.claude/skills/**`. Invoke them rather
 | `/soundness-check` | Flags `eval_expr → None` choices that are undocumented or silent under-uses of CLTS / CTXDSL primitives. |
 | `/review-orchestrator` | Coordinates a full review across `/parity-check`, `/docs-traceability`, and the qualitative skills. |
 | `/domain-adequacy` | Checks that a domain profile (agentic, codesign) covers the controllability / composition / label conventions for its target. |
+| `/rust-best-practices` | Rust idiom / API-hygiene review of a target scope. |
+| `/test-coverage` | Assesses behavioral test coverage (integration-first) over a scope. |
+| `/security-audit` | OWASP / input-validation / secret-handling review. |
 | `target-executor` | RTL counterexample reproduction agent. See its Phase 3.5 for the Verilator-under-`hw-verif:latest` procedure and `.claude/reviews/prospector/staging/RTL-002/repro/` for the canonical pattern. |
+| `sidecar-auditor` | Whole-sidecar-surface audit (redundancy / outdatedness / missing ergonomics); analysis + phased plan only, no edits. |
+| `verification-prospector` | Mines external literature for systems mununu can verify; produces a cited target backlog. |
 
 When extending an agent or skill, follow Documentation Traceability for the `description:` and inline guidance.
 
@@ -382,11 +365,21 @@ Sensitive or unpublished materials live in the sibling private repo, not here: `
 
 **How to apply.** When tempted to defer or hedge, state the *actual* reason. If the only reason is genuinely "the user should make this call," say exactly that — do not pad it with a fabricated fatigue rationale. Build/cache state (warm `target/`, warm docker volumes) typically *improves* over a session, so longer-running work is often cheaper to iterate, not riskier.
 
+## Business Plan & Commercial Decisions
+
+**Rule.** The single source of truth for mununu's business — strategy, positioning, market sizing, business model, pricing, financials, funding, IP posture, go-to-market, partnerships, exit, hiring plan, and any incubator/grant/investor application — is the **canonical living business plan** at [`mununu-private/docs/business/business-plan.md`](../mununu-private/docs/business/business-plan.md) (private repo, per [Private Files Policy](#private-files-policy)). It is a *living document*, not a one-off application.
+
+**When to consult it.** Any time a business or commercial question is asked, or a business/strategic decision is being made or discussed, **read this document first and answer from it.** It supersedes ad-hoc reasoning and older business docs. The deeper strategy/market analysis it synthesizes lives alongside it in `mununu-private/docs/business/`; when they conflict, **the business plan wins** and should be reconciled.
+
+**When to update it (keep in sync).** The **same turn** a commercial decision is made or changed, or a material fact changes (a customer/evaluation, a funding event, a license or incorporation status change, a pricing change, a positioning shift), update the relevant section, append a line to the plan's **Decision Log (§19)**, and bump its *Last updated* date. This is the commercial analogue of [Documentation Traceability](#documentation-traceability): a business decision not reflected in the plan is drift. When the roadmap's native BMC→k-induction→IMC (P1) scale milestone lands, fire the plan's standing re-review gate.
+
+**Honesty.** All commercial claims respect [Claims Integrity](#claims-integrity) and [Reasoning & Recommendation Honesty](#reasoning--recommendation-honesty) — no overclaiming scale or pedigree; projections labeled as projections.
+
 ## Reference Docs Index
 
 Reference and how-to material — read when the task calls for it, not on every session.
 
-- [`docs/architecture/`](docs/architecture/) — three-layer model, internal data flow.
+- [`docs/design/post-rf5-architecture.md`](docs/design/post-rf5-architecture.md), [`docs/design/sts-ir.md`](docs/design/sts-ir.md) — internal architecture (STS-IR waist, engine layering, data flow).
 - [`docs/dev-container.md`](docs/dev-container.md) — pinned Docker dev container.
 - [`docs/build-recipes.md`](docs/build-recipes.md) — finer-grained `cargo` invocations beyond `make ci`.
 - [`docs/toolchain.md`](docs/toolchain.md) — Rust version pinning and clippy compatibility notes.
@@ -401,11 +394,9 @@ Reference and how-to material — read when the task calls for it, not on every 
 - [`docs/adapters/extraction.md`](docs/adapters/extraction.md) — `.espec.json` extraction adapter, mode filtering, property templates.
 - [`docs/adapters/tlsf-aiger.md`](docs/adapters/tlsf-aiger.md) — Turn-based compound-label encoding for TLSF and AIGER.
 - [`docs/policies/claims-integrity.md`](docs/policies/claims-integrity.md) — Full claims-integrity policy (10 rules + editorial framing).
-- [`docs/design/black-box-modules.md`](docs/design/black-box-modules.md) — Document A (foundations of black-box contracts).
-- [`docs/design/rtl-frontend-unification.md`](docs/design/rtl-frontend-unification.md) — Document B (SV frontends).
-- [`docs/design/contract-corpus-and-config.md`](docs/design/contract-corpus-and-config.md) — Document D (corpus + annotations).
-- [`docs/design/hw-sw-codesign-extraction.md`](docs/design/hw-sw-codesign-extraction.md) — Document C (HW/SW codesign).
-- [`docs/design/c-extraction-correctness-scope.md`](docs/design/c-extraction-correctness-scope.md) — Honest scope statement for the C extractor.
+- [`docs/design/auto-extraction-architecture.md`](docs/design/auto-extraction-architecture.md) — the extraction framework: black-box contracts, HW/SW codesign, corpus + annotations (the former Documents A/C/D, reorganized).
+- [`docs/design/native-sv-abstraction.md`](docs/design/native-sv-abstraction.md) — the SystemVerilog front-end (former Document B).
+- [`docs/design/auto-extraction-real-bug-gap.md`](docs/design/auto-extraction-real-bug-gap.md) — honest scope of the auto-extraction / C-extractor path.
 
 ## Environment Variables
 
