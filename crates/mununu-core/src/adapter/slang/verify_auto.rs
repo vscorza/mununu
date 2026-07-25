@@ -2632,10 +2632,17 @@ fn escalate_bottom(
                             }
                             PropertyVerdict::Unknown => {
                                 // Provenance: the recoverability rescue RAN but the cube +
-                                // smt-hyper-must abstained (sound — never a fabricated verdict;
-                                // precision follow-up = tighter hyper-must target sets). Recorded
-                                // so a ⊥ that reached the rescue is explained, not silent.
+                                // smt-hyper-must abstained (sound — never a fabricated verdict).
+                                // Recorded so a ⊥ that reached the rescue is explained, not silent.
                                 notes.push(recoverability_rescue_note(&prop.name, "UNKNOWN"));
+                                // Actionable-⊥: localize WHY it abstained (structural obstacles in
+                                // the recovery cone) so the ⊥ is actionable, not a bare "don't know".
+                                let diag =
+                                    crate::adapter::recoverability::diagnose_recoverability_bot(
+                                        design_btor2,
+                                        &good_str,
+                                    );
+                                notes.push(recoverability_bot_reason_note(&prop.name, &diag));
                             }
                             PropertyVerdict::Skipped => {}
                         }
@@ -2785,6 +2792,42 @@ fn recoverability_rescue_note(name: &str, verdict: &str) -> VerificationNote {
                  Shoham–Grumberg); box-AF liveness and safety take their own reductions."
             .into(),
         items: Vec::new(),
+    }
+}
+
+/// Actionable-⊥: an explanation of WHY a νμ recoverability property stayed ⊥ — the structural
+/// obstacles in its recovery cone the predicate abstraction cannot cross (uncertified gating
+/// counters; wide data/config state the recovery value rides). Purely diagnostic: it never changes
+/// the ⊥ verdict, only makes it actionable. The `items` carry the machine-readable obstacle list.
+fn recoverability_bot_reason_note(
+    name: &str,
+    diag: &crate::adapter::recoverability::RecoverabilityBotDiagnosis,
+) -> VerificationNote {
+    let mut items: Vec<String> = Vec::new();
+    for (n, w) in &diag.uncertified_counters {
+        items.push(format!("uncertified-counter: {n} ({w}-bit)"));
+    }
+    for (n, w) in &diag.wide_influences {
+        items.push(format!("wide-influence: {n} ({w}-bit)"));
+    }
+    VerificationNote {
+        kind: "recoverability-bot-reason".into(),
+        // A localized obstacle narrows the verdict's scope (input-scoped / needs an assumption);
+        // an empty diagnosis is purely informational.
+        level: if diag.is_empty() {
+            NoteLevel::Info
+        } else {
+            NoteLevel::ScopeCaveat
+        },
+        summary: format!("`{name}`: ⊥ because — {}", diag.hint()),
+        detail: "This is a best-effort, sound explanation of the abstain (never a verdict): the \
+                 structural obstacles in the recovery cone the predicate cube cannot cross. An \
+                 un-certified counter needs a ranking certificate or a fairness assumption; a wide \
+                 data/config influence means the recovery value is input-scoped (constrain those \
+                 inputs to decide). No obstacle localized ⇒ the abstraction may be closable with \
+                 additional predicates."
+            .into(),
+        items,
     }
 }
 
