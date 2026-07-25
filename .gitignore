@@ -77,6 +77,9 @@ examples/verify/**/build/
 # Quality session artifacts
 /.quality/sessions/
 
+# Scratchpad / temp working files (never committed)
+/scratchpad/
+
 # Private / unpublished material (lives in mununu-private/)
 /paper/
 /artifact/
