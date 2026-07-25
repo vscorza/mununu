@@ -4508,6 +4508,7 @@ members = ["x"]
             additional_sources: vec![],
             top: None,
             use_sv2v: false,
+            use_slang: false,
             request: "x == y".to_string(), // relational — rejected before the lift
             grant: "st == 1".to_string(),
         };
@@ -4524,6 +4525,7 @@ members = ["x"]
             additional_sources: vec![],
             top: None,
             use_sv2v: false,
+            use_slang: false,
             target: "not an atom !!".to_string(),
             predicates: Vec::new(),
         };
