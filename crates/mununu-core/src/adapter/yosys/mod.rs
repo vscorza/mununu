@@ -1946,6 +1946,14 @@ fn build_script(
     // and `--ignore-assertions` drops embedded SVA (extracted separately by the slang
     // `extract_sva` path). `read_verilog` reads each source. Everything after the read is
     // identical, so the lift is frontend-agnostic downstream.
+    //
+    // `--ignore-timing`: slang is stricter than `read_verilog` about `#`-delay timing
+    // controls (`error: unsynthesizable timing control`), which `read_verilog` silently
+    // drops. Ignoring them here matches `read_verilog`'s behaviour and is the correct
+    // cycle-based-verification modelling choice — `#delays` are non-synthesizable and are
+    // not part of the design's synthesized (cycle) behaviour. SOUNDNESS: this is
+    // read_verilog-equivalent, not an extra abstraction. Without it, slang regressed ~18
+    // corpus designs that read_verilog lifts (measured 2026-07-25 lift sweep).
     let read_cmds: Vec<String> = if use_slang {
         let files = sources
             .iter()
@@ -1961,7 +1969,7 @@ fn build_script(
             .map(|d| format!(" -I{}", d.display()))
             .unwrap_or_default();
         vec![format!(
-            "read_slang --ignore-assertions{top_arg}{inc}{extra_inc} {files}"
+            "read_slang --ignore-assertions --ignore-timing{top_arg}{inc}{extra_inc} {files}"
         )]
     } else {
         sources
@@ -2733,6 +2741,10 @@ mod tests {
             "slang read command missing: {script}"
         );
         assert!(
+            script.contains("--ignore-timing"),
+            "read_slang must pass --ignore-timing (read_verilog-equivalent #delay handling): {script}"
+        );
+        assert!(
             script.contains("--top top"),
             "top not passed to read_slang: {script}"
         );
@@ -2839,7 +2851,9 @@ mod tests {
             &inc,
         );
         assert!(
-            script.contains("read_slang --ignore-assertions -I/stage -I/design/pkg /stage/a.sv"),
+            script.contains(
+                "read_slang --ignore-assertions --ignore-timing -I/stage -I/design/pkg /stage/a.sv"
+            ),
             "caller include dir not appended on the slang path: {script}"
         );
     }
