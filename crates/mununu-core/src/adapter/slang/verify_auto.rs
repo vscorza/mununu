@@ -2378,11 +2378,15 @@ pub fn verify_auto(
         });
     }
 
-    // ⊥ escalation (P3 router): dispatch each ⊥ property by property_class to its sound
-    // reduction — safety→reach_rescue, box-AF→l2s, νμ recoverability→cube+hyper-must.
-    // Runs before the notes/coverage build so the counts reflect any rescue; each arm is
-    // gated by its own `rescue_bottom_*` opt and only fires on its recognized shape.
-    let rescue_notes = escalate_bottom(&mut report, &btor2, reset_pinned, opts);
+    // ⊥ RE-PLAN (verification-execution-planner P2.1b): the planner's reactive re-plan
+    // step. When the main-path plan leaves a property ⊥, `planner::replan` dispatches it by
+    // property_class to a sound reduction (safety→reach_rescue, box-AF→l2s, νμ
+    // recoverability→exact+COI / cube+hyper-must) — the re-plan edges. Runs before the
+    // notes/coverage build so the counts reflect any rescue; each edge is gated by its own
+    // `rescue_bottom_*` opt and only fires on its recognized shape. (P2.1b routes the
+    // re-plan entry through the planner, delegating the edge-application to the existing
+    // rescue subsystem — verdict-equivalent; P2.1c adds the soundness plan-invariants.)
+    let rescue_notes = crate::planner::replan(&mut report, &btor2, reset_pinned, opts);
 
     // Lever (b) — exact-symbolic rescue for cube-SKIPPED properties. The predicate cube
     // cannot seed an ATOM-LESS modal formula (no-deadlock `nu X.(<> true && [] X)`, a pure
@@ -2390,7 +2394,7 @@ pub fn verify_auto(
     // seeding and decides it. Only fires on a cube run under reset-gating (the exact main
     // path already ran exact; A.6 requires reset gating). Sound: exact is the differential
     // oracle — a Skipped property is upgraded only on a DEFINITE Holds/Violated.
-    let exact_skip_notes = rescue_skipped_via_exact(&mut report, &btor2, opts);
+    let exact_skip_notes = crate::planner::rescue_skipped(&mut report, &btor2, opts);
 
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
@@ -2438,7 +2442,7 @@ pub fn verify_auto(
 /// path could decide it. Pure over `(report, design_btor2)`, so it is unit-testable on a
 /// BTOR2 fixture without the SV toolchain. Per-arm rescues are gated by
 /// `rescue_bottom_{safety,liveness,recoverability}`.
-fn escalate_bottom(
+pub(crate) fn escalate_bottom(
     report: &mut AutoVerifyReport,
     design_btor2: &str,
     reset_pinned: bool,
@@ -2598,7 +2602,7 @@ fn escalate_bottom(
 ///
 /// Pure over `(report, design_btor2)`, so it is unit-testable on a BTOR2 fixture without
 /// the SV toolchain.
-fn rescue_skipped_via_exact(
+pub(crate) fn rescue_skipped_via_exact(
     report: &mut AutoVerifyReport,
     design_btor2: &str,
     opts: &VerifyAutoOptions,

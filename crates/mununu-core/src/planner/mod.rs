@@ -21,8 +21,8 @@
 //! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
 
 use crate::adapter::slang::verify_auto::{
-    AutoVerifyReport, PortfolioMode, VerifyAutoOptions, merge_portfolio_reports, outcome_definite,
-    verify_auto,
+    AutoVerifyReport, PortfolioMode, VerificationNote, VerifyAutoOptions, escalate_bottom,
+    merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact, verify_auto,
 };
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -193,6 +193,41 @@ pub fn execute(
             merge_portfolio_reports(&runs, plan.mode)
         }
     }
+}
+
+/// The planner's reactive **re-plan** step (verification-execution-planner §4.5 step 4 /
+/// roadmap P2.1b) — when the main-path plan ([`execute`]) leaves a property `⊥`, feed the
+/// reason back and route it to a sound reduction. The re-plan **edges**, dispatched by
+/// property class (each gated by its own `rescue_bottom_*` opt, firing only on its shape):
+///
+/// - **safety** `AG`-invariant → the reachability portfolio (reduce to a `bad`-monitor);
+/// - **box-AF response** `AG(a→AF b)` → liveness-to-safety (l2s) → the portfolio;
+/// - **νμ recoverability** `AG EF good` → exact+COI (reset-pinned) or cube+`smt-hyper-must`.
+///
+/// P2.1b routes the re-plan **entry** through the planner (so both halves of the
+/// orchestration — main-path [`plan`]/[`execute`] and this reactive step — are planner-owned)
+/// while **delegating the edge application** to the existing rescue subsystem
+/// ([`escalate_bottom`]). Verdict-equivalent. P2.1c adds the soundness plan-invariants here
+/// (cube-νμ exact-corroboration; property-class-aware transfer reporting).
+pub fn replan(
+    report: &mut AutoVerifyReport,
+    design_btor2: &str,
+    reset_pinned: bool,
+    opts: &VerifyAutoOptions,
+) -> Vec<VerificationNote> {
+    escalate_bottom(report, design_btor2, reset_pinned, opts)
+}
+
+/// The companion re-plan edge for cube-**Skipped** (not `⊥`) properties: an atom-less modal
+/// formula the cube cannot seed gets one full-state exact-symbolic attempt, upgraded on a
+/// definite verdict (lever b). Gated to the cube path under reset-gating. Delegates to the
+/// existing [`rescue_skipped_via_exact`] — verdict-equivalent.
+pub fn rescue_skipped(
+    report: &mut AutoVerifyReport,
+    design_btor2: &str,
+    opts: &VerifyAutoOptions,
+) -> Vec<VerificationNote> {
+    rescue_skipped_via_exact(report, design_btor2, opts)
 }
 
 #[cfg(test)]
