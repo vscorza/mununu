@@ -206,6 +206,24 @@ The load-bearing rules at a glance:
 
 For benchmarks of state-space cost per abstraction choice, see `docs/abstraction.md`'s "What this doc deliberately does not do" — they are not yet shipped, and any claim about absolute state-space numbers must be measured per-model.
 
+### Lever validation — the wall-class matrix `[RULE]` (added 2026-07-26)
+
+**Rule.** A decidability lever or verification mechanism (a new engine, refinement source, abstraction pass, or re-plan operator, and any claim that one "decides / doesn't decide" a class of properties) is validated against the **fixed wall-class set** — `crates/mununu-core/tests/wall_class_matrix.rs` — **not** against whichever design happens to lift or be handy. Run it and record the `class × lever → verdict` matrix with the change:
+
+```bash
+cargo test -p mununu-core --test wall_class_matrix -- --ignored --nocapture
+# in mununu-sva-pono with MUNUNU_MATHSAT_PATH set, the MathSAT/Craig column comes alive
+```
+
+**Why.** Convenience-biased testing conflates *the lever doesn't work* with *we tested it on the wrong class*. A lever that targets wall-class X must be judged on the cases classified X (plus a control of class ≠ X), or its true reach is never measured. (2026-07-26: the matrix showed Craig/emergent-K has **zero marginal reach** over the shipped guard-atom lever on the set — caught *before* integration, unlike `--include-dir` / auto-config-value / F2, which shipped-then-measured-0.)
+
+**How to comply.**
+- **New/changed lever:** add its column to the matrix (or run the existing columns), confirm the **soundness invariant** (no lever contradicts a case's oracle verdict) and measure its **marginal reach** (does it decide a case the shipped levers leave ⊥?). A lever with no marginal reach on the set is not integrated into the planner without an explicit, recorded justification.
+- **New wall class discovered:** add a class-representative case to the set (RTL-lifted preferred; synthetic fills the class until a real one lifts) so future levers are tested against it.
+- **Re-evaluating a dropped lever:** run it against the whole set — a lever that decides its target class was mis-rejected on convenience-biased evidence; one that decides nothing of any class has its drop confirmed on principled evidence.
+
+The set is the RTL/synthetic union of the ledger's wall taxonomy (§A.3); its *class coverage* is the invariant, and RTL realism per class grows with the P1.1 harness-lift track. Working notes: `.claude/plans/wall-class-lever-evaluation.md`.
+
 ## Documentation Traceability
 
 **Rule.** Every documentation page or section that describes a feature, flag, endpoint, file format, syntax form, or behavior must be traceable to a *live* code artifact (Rust `struct` / `enum` / `fn`, clap arg, axum handler, TypeScript client, or a checked-in configuration file) that is reachable from at least one of mununu's three user-facing surfaces — **CLI**, **HTTP API**, or **UI**. Documentation that cannot point at such an artifact is either obsolete, aspirational, or unverifiable, and must be marked or removed.
