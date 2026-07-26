@@ -6422,6 +6422,295 @@ mod tests {
     use super::*;
     use crate::adapter::AdapterOptions;
 
+    /// Measure-first probe (register-width wall, 2026-07-26). Decomposes a property CONE's
+    /// state registers into the classes a *sound* width-reducer can address, sizing the ceiling
+    /// of F2 (counter) + data-independence BEFORE either is built:
+    /// - `counter(F2)`   — `detect_down_counter`: value-range re-encodable to ⌈log₂⌉ bits.
+    /// - `enum(F1)`      — `detect_enum_states`: already re-encoded by #381.
+    /// - `frozen(F4)`    — next = self / constant: constant-foldable.
+    /// - `data-movement` — value only moved/copied (concat/slice/mux-branch/eq-vs-var), never
+    ///   branched on: a Wolper data-independence candidate (shrinkable to 1–2 bits).
+    /// - `data-dependent`— value reaches arithmetic / ordering / eq-vs-const / reduction / a
+    ///   mux-select: genuinely value-dependent → not soundly width-reducible (research / ⊥).
+    ///
+    /// `#[ignore]` (a measurement harness, not an assertion). Reads `MUNUNU_PROBE_BTOR2` (a
+    /// lifted design.btor) and optional `MUNUNU_PROBE_ATOMS` (comma-separated seed signal names
+    /// for the cone; empty ⇒ whole design). The data-movement/-dependent split approximates
+    /// Wolper data-independence and is **hardened** three ways so it does not over-count
+    /// movement: (1) *property-aware* — a register whose value reaches a seed signal is
+    /// data-dependent (the property compares it against a constant); (2) *sequential* — the walk
+    /// follows `next` edges so a value moved through pipeline/shift stages before interpretation
+    /// is traced; (3) *table-aware* — a value used as a `Read` index (S-box / lookup) is
+    /// interpreted. Measured (2026-07-26): i2c 86% / gost 100% / present 100% data-dependent —
+    /// the residual register wall for value-comparing recoverability is datapath-dependence,
+    /// not width the F1/F2/F4 re-encoders can reclaim.
+    #[test]
+    #[ignore]
+    fn probe_cone_register_width_decomposition() {
+        use crate::adapter::btor2::ast::{Line, Nid, Node, Op};
+        use crate::adapter::btor2::dep_graph::cone_leaf_nids;
+        use std::collections::{BTreeMap, HashMap, HashSet};
+
+        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let content = std::fs::read_to_string(&path).expect("read btor2");
+        let file = parser::parse(&content).expect("parse btor2");
+        let atoms: Vec<String> = std::env::var("MUNUNU_PROBE_ATOMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // state register widths
+        let mut state_width: HashMap<Nid, u32> = HashMap::new();
+        for l in &file.lines {
+            if let Node::State { sort, .. } = &l.node {
+                state_width.insert(l.nid, parser::bv_width(&file, *sort).unwrap_or(0));
+            }
+        }
+        let enum_nids: HashSet<Nid> = detect_enum_states(&file).iter().map(|m| m.nid).collect();
+        let counter_nids: HashSet<Nid> = detect_down_counter(&file).iter().map(|m| m.nid).collect();
+
+        // cone state registers (whole design if no atoms given)
+        let cone_states: Vec<Nid> = if atoms.is_empty() {
+            state_width.keys().copied().collect()
+        } else {
+            let leaves = cone_leaf_nids(&file, &atoms);
+            state_width
+                .keys()
+                .copied()
+                .filter(|n| leaves.contains(n))
+                .collect()
+        };
+
+        // next-value operand per state (frozen check)
+        let mut next_of: HashMap<Nid, Nid> = HashMap::new();
+        for l in &file.lines {
+            if let Node::Next { state, value, .. } = &l.node {
+                next_of.insert(*state, value.nid().abs());
+            }
+        }
+        fn is_const_node(file: &Btor2File, nid: Nid) -> bool {
+            matches!(file.lookup(nid).map(|l| &l.node), Some(Node::Const { .. }))
+        }
+        let frozen = |s: Nid| match next_of.get(&s) {
+            None => true,
+            Some(&nv) => nv == s || is_const_node(&file, nv),
+        };
+
+        // uses map: nid -> [(user_op, arg_index, user_nid)]
+        let mut uses: HashMap<Nid, Vec<(Op, usize, Nid)>> = HashMap::new();
+        for l in &file.lines {
+            if let Node::Op { op, args, .. } = &l.node {
+                for (i, a) in args.iter().enumerate() {
+                    uses.entry(a.nid().abs()).or_default().push((*op, i, l.nid));
+                }
+            }
+        }
+        // SEQUENTIAL edges: a `next` node's value-root feeds its state register, so a value that
+        // MOVES through a register (shift / pipeline stage) before being interpreted is traced.
+        // Without this the forward walk stops at register boundaries and under-flags dependence.
+        let mut next_drives: HashMap<Nid, Vec<Nid>> = HashMap::new();
+        for l in &file.lines {
+            if let Node::Next { state, value, .. } = &l.node {
+                next_drives
+                    .entry(value.nid().abs())
+                    .or_default()
+                    .push(*state);
+            }
+        }
+        // PROPERTY-AWARE sink: the recoverability property compares each seed signal against a
+        // constant (`target == K`), so ANY register whose value reaches a seed signal is
+        // value-relevant to that comparison — data-dependent w.r.t. the property regardless of
+        // how the design routes it. Resolve each atom name to its signal node.
+        let mut seed_nids: HashSet<Nid> = HashSet::new();
+        for l in &file.lines {
+            match &l.node {
+                Node::Op {
+                    symbol: Some(s), ..
+                }
+                | Node::State {
+                    symbol: Some(s), ..
+                }
+                | Node::Input {
+                    symbol: Some(s), ..
+                } if atoms.iter().any(|a| a == s) => {
+                    seed_nids.insert(l.nid);
+                }
+                Node::Output {
+                    signal,
+                    symbol: Some(s),
+                } if atoms.iter().any(|a| a == s) => {
+                    seed_nids.insert(signal.nid().abs());
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "  (property-aware seed nodes resolved: {})",
+            seed_nids.len()
+        );
+        fn other_operand_is_const(file: &Btor2File, user_nid: Nid, this: Nid) -> bool {
+            if let Some(Line {
+                node: Node::Op { args, .. },
+                ..
+            }) = file.lookup(user_nid)
+            {
+                args.iter()
+                    .any(|a| a.nid().abs() != this && is_const_node(file, a.nid().abs()))
+            } else {
+                false
+            }
+        }
+        // Wolper data-independence approximation: does the register's value (propagated through
+        // value-movement ops) reach a use that distinguishes specific values?
+        fn is_data_dependent(
+            file: &Btor2File,
+            uses: &HashMap<Nid, Vec<(Op, usize, Nid)>>,
+            next_drives: &HashMap<Nid, Vec<Nid>>,
+            seed_nids: &HashSet<Nid>,
+            start: Nid,
+        ) -> bool {
+            let arith = |o: Op| {
+                matches!(
+                    o,
+                    Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::Neg
+                        | Op::Inc
+                        | Op::Dec
+                        | Op::Sdiv
+                        | Op::Udiv
+                        | Op::Smod
+                        | Op::Srem
+                        | Op::Urem
+                        | Op::Sll
+                        | Op::Srl
+                        | Op::Sra
+                        | Op::Rol
+                        | Op::Ror
+                )
+            };
+            let ordering = |o: Op| {
+                matches!(
+                    o,
+                    Op::Sgt
+                        | Op::Ugt
+                        | Op::Sgte
+                        | Op::Ugte
+                        | Op::Slt
+                        | Op::Ult
+                        | Op::Slte
+                        | Op::Ulte
+                )
+            };
+            let reduction = |o: Op| matches!(o, Op::Redand | Op::Redor | Op::Redxor);
+            let mut seen = HashSet::new();
+            let mut stack = vec![start];
+            while let Some(n) = stack.pop() {
+                if !seen.insert(n) {
+                    continue;
+                }
+                if seed_nids.contains(&n) {
+                    return true; // value reaches the property-compared signal (`target == K`)
+                }
+                // Sequential movement: this node roots some register's next-state → follow into
+                // that register so the value's downstream interpretation is seen.
+                if let Some(driven) = next_drives.get(&n) {
+                    stack.extend(driven.iter().copied());
+                }
+                let Some(users) = uses.get(&n) else { continue };
+                for &(op, idx, un) in users {
+                    if arith(op) || ordering(op) || reduction(op) {
+                        return true; // value's magnitude/bits are computed on
+                    }
+                    if matches!(op, Op::Eq | Op::Neq) && other_operand_is_const(file, un, n) {
+                        return true; // compared against a specific constant
+                    }
+                    if op == Op::Ite && idx == 0 {
+                        return true; // register drives a control select
+                    }
+                    if op == Op::Read && idx == 1 {
+                        return true; // data indexes a table (S-box / lookup) — interpreted
+                    }
+                    stack.push(un); // movement: concat/slice/uext/sext/bitwise/ite-branch/eq-vs-var
+                }
+            }
+            false
+        }
+
+        let mut bits: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut cnt: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut hard: Vec<u32> = Vec::new();
+        for &s in &cone_states {
+            let w = *state_width.get(&s).unwrap_or(&0);
+            let class = if counter_nids.contains(&s) {
+                "counter(F2)"
+            } else if enum_nids.contains(&s) {
+                "enum(F1)"
+            } else if frozen(s) {
+                "frozen(F4)"
+            } else if is_data_dependent(&file, &uses, &next_drives, &seed_nids, s) {
+                hard.push(w);
+                "data-dependent(research/⊥)"
+            } else {
+                "data-movement(indep.)"
+            };
+            *bits.entry(class).or_default() += w;
+            *cnt.entry(class).or_default() += 1;
+        }
+        let tot: u32 = bits.values().sum();
+        eprintln!(
+            "=== cone register width decomposition: {} regs, {} bits (cap 64) ===",
+            cone_states.len(),
+            tot
+        );
+        for (c, b) in &bits {
+            eprintln!(
+                "  {:28} {:3} regs {:5} bits ({}%)",
+                c,
+                cnt[c],
+                b,
+                100 * b / tot.max(1)
+            );
+        }
+        hard.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!(
+            "  widest data-dependent reg widths: {:?}",
+            &hard[..hard.len().min(10)]
+        );
+        // F2 REDUCTION POTENTIAL: a counter re-encode only saves bits when the reachable range
+        // [0, init] is ≪ 2^width (an over-wide counter register). Report per in-cone counter.
+        eprintln!("  --- F2 counter reduction potential (in-cone) ---");
+        let mut f2_total = 0u32;
+        for m in detect_down_counter(&file) {
+            let in_cone = if atoms.is_empty() {
+                true
+            } else {
+                let leaves = cone_leaf_nids(&file, &atoms);
+                leaves.contains(&m.nid)
+            };
+            if !in_cone {
+                continue;
+            }
+            let init =
+                init_value_of(&file, m.nid).and_then(|op| resolve_btor2_constant(&file, op.nid()));
+            let re_bits = match init {
+                Some(v) if v >= 1 => 64 - v.leading_zeros(), // ⌈log₂(v+1)⌉ for a 0..v range
+                Some(_) => 1,
+                None => m.width, // unknown init ⇒ assume no saving
+            };
+            let saving = m.width.saturating_sub(re_bits);
+            f2_total += saving;
+            eprintln!(
+                "    counter nid={} width={} init={:?} → reencoded {} bits, saving {}",
+                m.nid, m.width, init, re_bits, saving
+            );
+        }
+        eprintln!("  F2 total bit-saving on this cone: {f2_total}");
+    }
+
     #[test]
     fn detect_enum_states_finds_fsm_rejects_counter() {
         use crate::adapter::btor2::parser::parse;
