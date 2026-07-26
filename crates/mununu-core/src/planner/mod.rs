@@ -21,8 +21,9 @@
 //! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
 
 use crate::adapter::slang::verify_auto::{
-    AutoVerifyReport, PortfolioMode, VerificationNote, VerifyAutoOptions, escalate_bottom,
-    merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact, verify_auto,
+    AutoVerifyReport, NoteLevel, PortfolioMode, VerificationNote, VerifyAutoOptions, VerifyOutcome,
+    escalate_bottom, merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact,
+    verify_auto,
 };
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -227,7 +228,114 @@ pub fn rescue_skipped(
     design_btor2: &str,
     opts: &VerifyAutoOptions,
 ) -> Vec<VerificationNote> {
-    rescue_skipped_via_exact(report, design_btor2, opts)
+    let mut notes = rescue_skipped_via_exact(report, design_btor2, opts);
+    // P2.2a — the first ModelFacts consumer: an actionable diagnostic for what remains
+    // Skipped. Verdict-equivalent (a note, never a verdict change); P2.2b will *act* on the
+    // same cone-vs-cap facts to auto-pin and re-decide.
+    notes.extend(skip_over_cap_notes(report, design_btor2));
+    notes
+}
+
+/// P2.2a/b — **residual-register-aware** actionable Skip diagnostic (the `ModelFacts`
+/// consumer). For each property STILL Skipped after the exact attempt, use `ModelFacts` to
+/// check whether the exact engine bailed because the property's cone exceeds the bit cap
+/// (`cone_bits > cap`); if so, attach a note naming the cone width and the cap.
+///
+/// The **key fact** (P2.2b, measure-first 2026-07-26) is the *residual* — the register bits
+/// that remain even after pinning **every** in-cone free input
+/// (`residual = cone_bits − Σ pinnable_input_widths`). This is what decides whether
+/// `--config-value` pinning can actually help:
+///
+/// - `residual ≤ cap` — **input-inflated** cone: pinning the in-cone inputs drops the cone to
+///   ~`residual` bits ≤ cap, so `--config-value SIGNAL=VALUE` (a scoped verdict) decides it.
+///   The note lists the pinnable inputs and how far pinning gets.
+/// - `residual > cap` — **register-dominated** cone: even pinning ALL in-cone inputs leaves
+///   `residual` register bits over the cap, so `--config-value` **cannot** decide it. The note
+///   says so and points at the real levers (structural compression: one-hot re-encode /
+///   counter abstraction; or cutpoint, posture-permitting).
+///
+/// A measure-first sweep (i2c 122 / gost 360 / present_cipher 144 residual register bits, all
+/// above the 64-bit cap) showed the corpus's over-cap cones are register-dominated — so the
+/// earlier "just pin the wide inputs" advice over-promised. This diagnostic tells the truth
+/// per property instead of assuming input-inflation. Verdict-equivalent — a diagnostic, never
+/// a verdict change.
+fn skip_over_cap_notes(report: &AutoVerifyReport, design_btor2: &str) -> Vec<VerificationNote> {
+    use crate::adapter::btor2::model_facts::ModelFacts;
+    use crate::adapter::btor2::symbolic_bitblast::formula_seed_atoms;
+
+    let Ok(file) = crate::adapter::btor2::parser::parse(design_btor2) else {
+        return Vec::new();
+    };
+    let facts = ModelFacts::new(&file);
+    let mut notes = Vec::new();
+    for prop in &report.properties {
+        if !matches!(prop.outcome, VerifyOutcome::Skipped { .. }) {
+            continue;
+        }
+        let Ok(formula) = crate::mu_calculus::parser::parse(&prop.formula) else {
+            continue;
+        };
+        let atoms = formula_seed_atoms(&formula);
+        let (cone_bits, cap) = facts.cone_vs_cap(&atoms);
+        if cone_bits <= cap {
+            // Skipped for another reason (atom-less cube, unsupported op) — not a cap issue;
+            // leave it to the existing Skip provenance.
+            continue;
+        }
+        let inputs = facts.pinnable_cone_inputs(&atoms);
+        let input_bits: u32 = inputs.iter().map(|i| i.width).sum();
+        // The register bits that remain even after pinning EVERY in-cone input — the true test
+        // of whether config-value pinning can bring the cone under the cap.
+        let residual = cone_bits.saturating_sub(input_bits);
+        let items: Vec<String> = inputs
+            .iter()
+            .take(8)
+            .map(|i| format!("{}({} bits)", i.name, i.width))
+            .collect();
+        let detail = if residual <= cap {
+            // Input-inflated: pinning these inputs fits the cap → config-value decides.
+            format!(
+                "The exact engine bit-blasts a property's cone-of-influence; this cone exceeds \
+                 the bit cap, so it bailed to Skipped. The cone is INPUT-inflated: pinning the \
+                 {} in-cone free input(s) below ({input_bits} bits) to representative constants \
+                 (`--config-value SIGNAL=VALUE`) drops the cone to ~{residual} register bits (≤ \
+                 the {cap}-bit cap), so exact decides — a verdict scoped to the pinned \
+                 configuration.",
+                inputs.len()
+            )
+        } else {
+            // Register-dominated: even pinning all inputs leaves > cap register bits.
+            format!(
+                "The exact engine bit-blasts a property's cone-of-influence; this cone exceeds \
+                 the bit cap, so it bailed to Skipped. This cone is REGISTER-dominated: even \
+                 pinning ALL {} in-cone free input(s) ({input_bits} bits) leaves ~{residual} \
+                 register bits (still > the {cap}-bit cap), so `--config-value` CANNOT bring it \
+                 under the cap. The decidable lever here is sound register reduction — \
+                 structural compression (one-hot re-encode, counter abstraction) or a cutpoint \
+                 (safety-posture only; unsound for νμ) — not input concretization.",
+                inputs.len()
+            )
+        };
+        notes.push(VerificationNote {
+            kind: "skip-over-cap-reason".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "`{}`: Skipped — the exact cone is {cone_bits} register+input bits (> the \
+                 {cap}-bit cap); {} even fully input-pinned ({residual} residual register \
+                 bits {} {cap}).",
+                prop.name,
+                if residual <= cap {
+                    "config-value decidable"
+                } else {
+                    "register-dominated"
+                },
+                if residual <= cap { "≤" } else { ">" },
+            ),
+            detail,
+            items,
+        });
+    }
+    notes
 }
 
 #[cfg(test)]
@@ -297,5 +405,92 @@ mod tests {
             assert_eq!(p.ops.len(), 1, "single-engine intent → one operator");
             assert_eq!(p.ops[0].label, label);
         }
+    }
+
+    // ---- P2.2b: residual-register-aware over-cap Skip diagnostic --------------------------
+
+    fn skipped_report(name: &str, formula: &str) -> AutoVerifyReport {
+        use crate::adapter::slang::translate::SvaKind;
+        use crate::adapter::slang::verify_auto::PropertyVerdict;
+        AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: name.into(),
+                kind: SvaKind::Assert,
+                formula: formula.into(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: "cone too wide".into(),
+                },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            unsupported: Vec::new(),
+            diagnostics: Default::default(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skip_note_register_dominated_says_config_value_cannot_help() {
+        // A 70-bit self-incrementing register: the property cone is 70 bits, ALL register
+        // (no in-cone inputs), so residual = 70 > the 64-bit cap — pinning inputs can't help.
+        let btor2 = "\
+1 sort bitvec 70
+2 sort bitvec 1
+3 state 1 big
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+";
+        let report = skipped_report("p_reg", "mu X.(big == 0 || <> X)");
+        let notes = skip_over_cap_notes(&report, btor2);
+        assert_eq!(
+            notes.len(),
+            1,
+            "an over-cap Skipped property gets one diagnostic"
+        );
+        let n = &notes[0];
+        assert!(
+            n.summary.contains("register-dominated"),
+            "summary must flag register-domination: {}",
+            n.summary
+        );
+        assert!(
+            n.detail.contains("CANNOT") && n.detail.contains("register reduction"),
+            "detail must say config-value cannot help + point at register reduction: {}",
+            n.detail
+        );
+    }
+
+    #[test]
+    fn skip_note_input_inflated_points_at_config_value() {
+        // A 70-bit INPUT feeding a 1-bit register: cone = 71 (1 register + 70 input), so
+        // residual = 1 ≤ the 64-bit cap — pinning the input via --config-value decides it.
+        let btor2 = "\
+1 sort bitvec 70
+2 sort bitvec 1
+3 input 1 wide
+4 state 2 flag
+5 zero 1
+6 eq 2 3 5
+7 next 2 4 6
+";
+        let report = skipped_report("p_io", "mu X.(flag == 1 || <> X)");
+        let notes = skip_over_cap_notes(&report, btor2);
+        assert_eq!(
+            notes.len(),
+            1,
+            "an over-cap Skipped property gets one diagnostic"
+        );
+        let n = &notes[0];
+        assert!(
+            n.summary.contains("config-value decidable"),
+            "summary must flag config-value decidability: {}",
+            n.summary
+        );
+        assert!(
+            n.detail.contains("--config-value") && n.detail.contains("INPUT-inflated"),
+            "detail must point at --config-value on an input-inflated cone: {}",
+            n.detail
+        );
     }
 }
