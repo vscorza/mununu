@@ -244,8 +244,14 @@ const I2C_SCL_PADOEN: &str = include_str!("fixtures/wall_classes/i2c_scl_padoen.
 // the standard operational reset-gating) → VIOLATED (the FSM traps in its absorbing error state,
 // only reset recovers). Reproduce: examples/verify/dc_opentitan_aes_cipher_control_fsm/source.
 const AES_CIPHER: &str = include_str!("fixtures/wall_classes/aes_cipher_control_fsm.btor");
+// More RTL FSMs of the SAME two classes (breadth across designs, via the #396 Auto→slang
+// fallback): OpenTitan csrng_main_sm (single 6-bit sparse FSM, idle MainSmIdle=55) + aes_ctr_fsm
+// (idle CTR_IDLE=14). Same pattern: free-reset HOLDS, reset-pinned `rst_ni=1` VIOLATED.
+const CSRNG: &str = include_str!("fixtures/wall_classes/csrng_main_sm.btor");
+const AES_CTR: &str = include_str!("fixtures/wall_classes/aes_ctr_fsm.btor");
 
 const NO_PIN: &[(&str, u64)] = &[];
+const PIN_RST: &[(&str, u64)] = &[("rst_ni", 1)];
 
 fn cases() -> Vec<Case> {
     vec![
@@ -348,7 +354,43 @@ fn cases() -> Vec<Case> {
             target: "aes_cipher_ctrl_cs == 9",
             oracle: Oracle::Violated,
             source: "RTL:opentitan-aes",
-            pin: &[("rst_ni", 1)],
+            pin: PIN_RST,
+        },
+        Case {
+            name: "csrng (free)",
+            class: "decidable/HOLDS",
+            btor2: CSRNG,
+            target: "state_q == 55",
+            oracle: Oracle::Holds,
+            source: "RTL:opentitan-csrng",
+            pin: NO_PIN,
+        },
+        Case {
+            name: "csrng (rst pinned)",
+            class: "operational/VIOLATED",
+            btor2: CSRNG,
+            target: "state_q == 55",
+            oracle: Oracle::Violated,
+            source: "RTL:opentitan-csrng",
+            pin: PIN_RST,
+        },
+        Case {
+            name: "aes_ctr (free)",
+            class: "decidable/HOLDS",
+            btor2: AES_CTR,
+            target: "aes_ctr_cs == 14",
+            oracle: Oracle::Holds,
+            source: "RTL:opentitan-aes",
+            pin: NO_PIN,
+        },
+        Case {
+            name: "aes_ctr (rst pinned)",
+            class: "operational/VIOLATED",
+            btor2: AES_CTR,
+            target: "aes_ctr_cs == 14",
+            oracle: Oracle::Violated,
+            source: "RTL:opentitan-aes",
+            pin: PIN_RST,
         },
     ]
 }
