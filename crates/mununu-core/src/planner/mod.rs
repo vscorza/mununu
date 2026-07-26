@@ -1,0 +1,266 @@
+//! Verification execution planner (verification-execution-planner Phase 3 / roadmap P2.1).
+//!
+//! **P2.1a — the planner seam.** A [`VerificationTask`] is turned by [`plan`] into a
+//! [`PhysicalPlan`] (an ordered set of engine operators + a scheduling mode), which
+//! [`execute`] drives — delegating each operator to the existing single-engine
+//! [`verify_auto`](crate::adapter::slang::verify_auto::verify_auto) pass and merging under
+//! the existing runtime soundness guard
+//! ([`merge_portfolio_reports`](crate::adapter::slang::verify_auto::merge_portfolio_reports)).
+//!
+//! This re-expresses today's `verify_auto` portfolio dispatch as an explicit plan/execute
+//! pair **without changing any verdict** — it is verdict-equivalent by construction (same
+//! operators, same precision order, same merge, same early-exit; the driver body is
+//! relocated verbatim from the former `verify_auto_portfolio`). What it buys is the *seam*:
+//! one place where the "which engines, in what order/mode" decision lives, ready for the
+//! later phases to make cost-based.
+//!
+//! Not yet here (deliberately): cost-based operator selection off `ModelFacts` (P2.2), the
+//! ⊥-reactive re-plan edges that generalise `escalate_bottom` (P2.1b), and the soundness
+//! plan-invariants — cube-νμ exact-corroboration, property-class transfer gating (P2.1c).
+//!
+//! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
+
+use crate::adapter::slang::verify_auto::{
+    AutoVerifyReport, PortfolioMode, VerifyAutoOptions, merge_portfolio_reports, outcome_definite,
+    verify_auto,
+};
+use crate::adapter::yosys::YosysOptions;
+use crate::adapter::{AdapterError, AdapterErrorKind};
+
+/// One physical engine operator — a single-engine [`verify_auto`] pass.
+///
+/// P2.1a covers the μ-calculus engine leaves (the precision ladder). Abstraction transforms
+/// (cutpoint / predicate-seed) and the ⊥-reactive rescue edges become operators in later
+/// increments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineOp {
+    /// Mirrors the CLI/API `--engine` label (the value the merge keys provenance on).
+    pub label: &'static str,
+    /// Select the may/must cube ("symbolic") engine.
+    pub symbolic_engine: bool,
+    /// Select the full-state exact BDD ("exact-symbolic") engine.
+    pub exact_symbolic: bool,
+}
+
+/// The physical plan — the ordered engine operators plus how to schedule them.
+#[derive(Debug, Clone)]
+pub struct PhysicalPlan {
+    /// Operators in precision order (exact first).
+    pub ops: Vec<EngineOp>,
+    /// `Sequential` = run in order, merge after each, stop when no ⊥ property remains (the
+    /// budget win); `Parallel` = run all concurrently, merge once. A single-op plan runs the
+    /// same under either mode.
+    pub mode: PortfolioMode,
+}
+
+/// The logical verification task — the planner's input.
+///
+/// **P2.1a form:** the *pre-lift bundle* the SV `verify-auto` entry already holds (sources +
+/// lift options + verify options). It migrates to the plan doc's
+/// `(Sts, MuFormula, posture, ModelFacts, hints, budget)` form when the common-IR hub lands
+/// (Phase 2); the seam is introduced now so later phases extend this struct, not the call
+/// graph. Borrows its inputs — cheap to build at the dispatch point.
+pub struct VerificationTask<'a> {
+    /// `(file_name, content)`, the first being the primary source.
+    pub sources: &'a [(String, String)],
+    /// The SV → BTOR2 lift options.
+    pub yosys_opts: &'a YosysOptions,
+    /// The verify-auto options (engine intent, budgets, rescue gates, hints).
+    pub opts: &'a VerifyAutoOptions,
+}
+
+/// The μ-calculus engine precision ladder (exact → symbolic-cube → explicit-CEGAR) — the
+/// order the portfolio has always used. Exact first: 2-valued, never-⊥ within its bit cap,
+/// richest witness; the two cube engines are complementary fallbacks the parity differential
+/// proved never contradict it. (Relocated verbatim from `verify_auto`'s `PORTFOLIO_ENGINES`.)
+const PRECISION_LADDER: [EngineOp; 3] = [
+    EngineOp {
+        label: "exact-symbolic",
+        symbolic_engine: false,
+        exact_symbolic: true,
+    },
+    EngineOp {
+        label: "symbolic",
+        symbolic_engine: true,
+        exact_symbolic: false,
+    },
+    EngineOp {
+        label: "explicit",
+        symbolic_engine: false,
+        exact_symbolic: false,
+    },
+];
+
+/// Rule-based planner (P2.1a): reproduce today's fixed engine selection. A portfolio intent
+/// emits the full precision ladder in the requested mode; a single-engine intent emits just
+/// that operator. (P2.2 makes this cost-based off `ModelFacts` — cone-vs-cap, property-class
+/// → verdict requirement.)
+pub fn plan(task: &VerificationTask) -> PhysicalPlan {
+    match task.opts.portfolio {
+        Some(mode) => PhysicalPlan {
+            ops: PRECISION_LADDER.to_vec(),
+            mode,
+        },
+        None => PhysicalPlan {
+            ops: vec![EngineOp {
+                label: single_engine_label(task.opts),
+                symbolic_engine: task.opts.symbolic_engine,
+                exact_symbolic: task.opts.exact_symbolic,
+            }],
+            mode: PortfolioMode::Sequential,
+        },
+    }
+}
+
+/// The `--engine` label a single-engine option pair resolves to (exact takes precedence, as
+/// in `engine_selection`).
+fn single_engine_label(opts: &VerifyAutoOptions) -> &'static str {
+    match (opts.symbolic_engine, opts.exact_symbolic) {
+        (_, true) => "exact-symbolic",
+        (true, false) => "symbolic",
+        (false, false) => "explicit",
+    }
+}
+
+/// Execute the plan: run each engine operator as a single-engine [`verify_auto`] pass and
+/// merge under the runtime soundness guard. Relocated verbatim from the former
+/// `verify_auto_portfolio` — behaviour-identical, so the portfolio's verdicts are unchanged.
+pub fn execute(
+    plan: &PhysicalPlan,
+    task: &VerificationTask,
+) -> Result<AutoVerifyReport, AdapterError> {
+    // A single-engine option set derived from `task.opts` with the portfolio disabled and the
+    // two engine flags forced to this operator's pair (so the inner call runs exactly one
+    // engine and does not recurse).
+    let mk_opts = |op: &EngineOp| {
+        let mut o = task.opts.clone();
+        o.portfolio = None;
+        o.symbolic_engine = op.symbolic_engine;
+        o.exact_symbolic = op.exact_symbolic;
+        o
+    };
+
+    match plan.mode {
+        PortfolioMode::Sequential => {
+            let mut runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> = Vec::new();
+            for op in &plan.ops {
+                runs.push((
+                    op.label,
+                    verify_auto(task.sources, task.yosys_opts, &mk_opts(op)),
+                ));
+                // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
+                let merged = merge_portfolio_reports(&runs, plan.mode);
+                if let Ok(rep) = &merged
+                    && rep
+                        .properties
+                        .iter()
+                        .all(|p| outcome_definite(&p.outcome).is_some())
+                {
+                    return merged;
+                }
+            }
+            merge_portfolio_reports(&runs, plan.mode)
+        }
+        PortfolioMode::Parallel => {
+            // Scoped threads borrow the task's sources / yosys_opts; each owns its option clone.
+            let runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<(&str, _)> = plan
+                        .ops
+                        .iter()
+                        .map(|op| {
+                            let o = mk_opts(op);
+                            (
+                                op.label,
+                                scope.spawn(move || verify_auto(task.sources, task.yosys_opts, &o)),
+                            )
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(label, h)| {
+                            let r = h.join().unwrap_or_else(|_| {
+                                Err(AdapterError {
+                                    kind: AdapterErrorKind::IrConsistencyError,
+                                    message: format!("portfolio: engine `{label}` panicked"),
+                                    location: None,
+                                })
+                            });
+                            (label, r)
+                        })
+                        .collect()
+                });
+            merge_portfolio_reports(&runs, plan.mode)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_with(portfolio: Option<PortfolioMode>, sym: bool, exact: bool) -> VerifyAutoOptions {
+        VerifyAutoOptions {
+            portfolio,
+            symbolic_engine: sym,
+            exact_symbolic: exact,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_portfolio_sequential_emits_the_precision_ladder() {
+        let o = opts_with(Some(PortfolioMode::Sequential), false, false);
+        let sources: Vec<(String, String)> = vec![];
+        let yopts = YosysOptions::default();
+        let task = VerificationTask {
+            sources: &sources,
+            yosys_opts: &yopts,
+            opts: &o,
+        };
+        let p = plan(&task);
+        assert_eq!(p.mode, PortfolioMode::Sequential);
+        assert_eq!(
+            p.ops.iter().map(|e| e.label).collect::<Vec<_>>(),
+            vec!["exact-symbolic", "symbolic", "explicit"],
+            "portfolio must plan the exact-first precision ladder"
+        );
+    }
+
+    #[test]
+    fn plan_portfolio_parallel_keeps_the_ladder_and_mode() {
+        let o = opts_with(Some(PortfolioMode::Parallel), false, false);
+        let sources: Vec<(String, String)> = vec![];
+        let yopts = YosysOptions::default();
+        let task = VerificationTask {
+            sources: &sources,
+            yosys_opts: &yopts,
+            opts: &o,
+        };
+        let p = plan(&task);
+        assert_eq!(p.mode, PortfolioMode::Parallel);
+        assert_eq!(p.ops.len(), 3);
+    }
+
+    #[test]
+    fn plan_single_engine_emits_one_op() {
+        // exact-symbolic
+        let sources: Vec<(String, String)> = vec![];
+        let yopts = YosysOptions::default();
+        for (sym, exact, label) in [
+            (false, true, "exact-symbolic"),
+            (true, false, "symbolic"),
+            (false, false, "explicit"),
+        ] {
+            let o = opts_with(None, sym, exact);
+            let task = VerificationTask {
+                sources: &sources,
+                yosys_opts: &yopts,
+                opts: &o,
+            };
+            let p = plan(&task);
+            assert_eq!(p.ops.len(), 1, "single-engine intent → one operator");
+            assert_eq!(p.ops[0].label, label);
+        }
+    }
+}

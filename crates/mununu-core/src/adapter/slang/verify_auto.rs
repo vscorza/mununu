@@ -1463,100 +1463,13 @@ fn symbolic_final_verdict(
     crate::mu_calculus::trit::TritSet::from_parts(must, may)
 }
 
-/// Verify every translated SVA property in `sources` against the model, with no
-/// sidecar. `sources` is `(file_name, content)`, the first being the primary.
-/// The portfolio's engines, in PRECISION order (`(label, symbolic_engine, exact_symbolic)`).
-/// Exact first — it is 2-valued/never-⊥ within its bit cap and carries the richest witness;
-/// the two cube engines follow as complementary fallbacks (proven by the parity differential to
-/// never contradict exact or each other). The `label` mirrors the CLI/API `--engine` value.
-const PORTFOLIO_ENGINES: [(&str, bool, bool); 3] = [
-    ("exact-symbolic", false, true),
-    ("symbolic", true, false),
-    ("explicit", false, false),
-];
-
 /// A property's definite verdict as a bool (`Some(true)` = Holds, `Some(false)` = Violated),
 /// or `None` for an undecided (⊥) outcome. The portfolio merges on this.
-fn outcome_definite(o: &VerifyOutcome) -> Option<bool> {
+pub(crate) fn outcome_definite(o: &VerifyOutcome) -> Option<bool> {
     match o {
         VerifyOutcome::Holds => Some(true),
         VerifyOutcome::Violated { .. } => Some(false),
         VerifyOutcome::Unknown { .. } | VerifyOutcome::Skipped { .. } => None,
-    }
-}
-
-/// PORTFOLIO orchestrator — run several single-engine [`verify_auto`] passes and merge them
-/// (see [`PortfolioMode`]). `Sequential` runs the engines in precision order, merging after each
-/// and stopping the moment every property is decided (early-exit — often just the exact engine).
-/// `Parallel` runs all three concurrently in scoped threads and merges once. Both call
-/// [`merge_portfolio_reports`], which enforces the runtime soundness guard.
-fn verify_auto_portfolio(
-    sources: &[(String, String)],
-    yosys_opts: &YosysOptions,
-    opts: &VerifyAutoOptions,
-    mode: PortfolioMode,
-) -> Result<AutoVerifyReport, AdapterError> {
-    // A single-engine option set derived from `opts` with the portfolio disabled and the two
-    // engine flags forced to this engine's pair.
-    let mk_opts = |symbolic_engine: bool, exact_symbolic: bool| {
-        let mut o = opts.clone();
-        o.portfolio = None;
-        o.symbolic_engine = symbolic_engine;
-        o.exact_symbolic = exact_symbolic;
-        o
-    };
-
-    match mode {
-        PortfolioMode::Sequential => {
-            let mut runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> = Vec::new();
-            for (label, sym, exact) in PORTFOLIO_ENGINES {
-                runs.push((
-                    label,
-                    verify_auto(sources, yosys_opts, &mk_opts(sym, exact)),
-                ));
-                // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
-                let merged = merge_portfolio_reports(&runs, mode);
-                if let Ok(rep) = &merged
-                    && rep
-                        .properties
-                        .iter()
-                        .all(|p| outcome_definite(&p.outcome).is_some())
-                {
-                    return merged;
-                }
-            }
-            merge_portfolio_reports(&runs, mode)
-        }
-        PortfolioMode::Parallel => {
-            // Scoped threads borrow `sources` / `yosys_opts`; each owns its option clone.
-            let runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> =
-                std::thread::scope(|scope| {
-                    let handles: Vec<(&str, _)> = PORTFOLIO_ENGINES
-                        .iter()
-                        .map(|&(label, sym, exact)| {
-                            let o = mk_opts(sym, exact);
-                            (
-                                label,
-                                scope.spawn(move || verify_auto(sources, yosys_opts, &o)),
-                            )
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|(label, h)| {
-                            let r = h.join().unwrap_or_else(|_| {
-                                Err(AdapterError {
-                                    kind: AdapterErrorKind::IrConsistencyError,
-                                    message: format!("portfolio: engine `{label}` panicked"),
-                                    location: None,
-                                })
-                            });
-                            (label, r)
-                        })
-                        .collect()
-                });
-            merge_portfolio_reports(&runs, mode)
-        }
     }
 }
 
@@ -1568,7 +1481,7 @@ fn verify_auto_portfolio(
 /// `portfolio-soundness-alarm` note — never a silent pick (the runtime form of the parity gate;
 /// the differential proved this never fires on the corpus). Pure over the input reports, so it is
 /// unit-testable without the toolchain.
-fn merge_portfolio_reports(
+pub(crate) fn merge_portfolio_reports(
     runs: &[(&str, Result<AutoVerifyReport, AdapterError>)],
     mode: PortfolioMode,
 ) -> Result<AutoVerifyReport, AdapterError> {
@@ -1721,11 +1634,18 @@ pub fn verify_auto(
     use crate::mu_calculus::parser as mu_parser;
     use crate::mu_calculus::trit::Trit;
 
-    // PORTFOLIO dispatch — when a portfolio mode is set, run several single-engine
-    // passes and merge (each inner call has `portfolio: None`, so no recursion). The
-    // single-engine flags are ignored in this mode.
-    if let Some(mode) = opts.portfolio {
-        return verify_auto_portfolio(sources, yosys_opts, opts, mode);
+    // PORTFOLIO dispatch — when a portfolio mode is set, hand the task to the execution
+    // planner (verification-execution-planner P2.1a): `plan()` emits the engine-operator
+    // ladder, `execute()` drives it, delegating each single-engine pass back here (each with
+    // `portfolio: None`, so no recursion) and merging under the runtime soundness guard.
+    // Verdict-equivalent to the former inline `verify_auto_portfolio`.
+    if opts.portfolio.is_some() {
+        let task = crate::planner::VerificationTask {
+            sources,
+            yosys_opts,
+            opts,
+        };
+        return crate::planner::execute(&crate::planner::plan(&task), &task);
     }
 
     let (primary_name, primary_content) = sources.first().ok_or_else(|| AdapterError {
