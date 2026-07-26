@@ -368,7 +368,51 @@ pub(crate) fn strip_port_net_types(src: &str) -> String {
     out
 }
 
+/// The SV → flattened-BTOR2 lift (verification-execution-planner P1.1). When the frontend is
+/// [`SvFrontend::Auto`] it tries the `read_verilog`(+sv2v) path first and, on a hard lift ERROR,
+/// **falls back to slang** — which parses SystemVerilog natively (module-header package imports
+/// `read_verilog` rejects with `unexpected TOK_IMPORT`, `while` loops, `import pkg::*`). This
+/// unlocks the OpenTitan-class designs the default frontend cannot lift while keeping the broad
+/// default for everything else. Fallback fires only on `Err` (never a vacuous success, so the
+/// sv2v-drops-SVA trap can't be masked); an EXPLICIT `Verilog`/`Slang` request is honoured as-is
+/// with no fallback. Preference is env-driven (`MUNUNU_YOSYS_FRONTEND=slang` tries slang first).
 fn run_sv_flatten_btor2(
+    content: &str,
+    yopts: &YosysOptions,
+) -> Result<SvFlattenArtifacts, AdapterError> {
+    if yopts.frontend != SvFrontend::Auto {
+        return run_sv_flatten_btor2_concrete(content, yopts);
+    }
+    let slang_ok = locate_slang_plugin().is_some();
+    let prefer_slang = std::env::var("MUNUNU_YOSYS_FRONTEND")
+        .map(|v| v.eq_ignore_ascii_case("slang"))
+        .unwrap_or(false);
+    let mut last_err = None;
+    for fe in frontend_attempt_order(slang_ok, prefer_slang) {
+        let mut y = yopts.clone();
+        y.frontend = fe;
+        match run_sv_flatten_btor2_concrete(content, &y) {
+            Ok(a) => return Ok(a),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("Auto frontend has at least the Verilog attempt"))
+}
+
+/// The ordered concrete frontends an [`SvFrontend::Auto`] lift attempts (P1.1 fallback). The
+/// broad `read_verilog`(+sv2v) path leads (no plugin needed, handles inout / use-before-decl that
+/// yosys-slang rejects); slang is the fallback (module-header package imports, `while` loops).
+/// `MUNUNU_YOSYS_FRONTEND=slang` flips the preference. slang is included only when its plugin is
+/// present — otherwise the sole attempt is `read_verilog` (unchanged legacy behaviour).
+fn frontend_attempt_order(slang_available: bool, prefer_slang: bool) -> Vec<SvFrontend> {
+    match (slang_available, prefer_slang) {
+        (true, true) => vec![SvFrontend::Slang, SvFrontend::Verilog],
+        (true, false) => vec![SvFrontend::Verilog, SvFrontend::Slang],
+        (false, _) => vec![SvFrontend::Verilog],
+    }
+}
+
+fn run_sv_flatten_btor2_concrete(
     content: &str,
     yopts: &YosysOptions,
 ) -> Result<SvFlattenArtifacts, AdapterError> {
@@ -2126,6 +2170,66 @@ impl Drop for TempDir {
 mod tests {
     use super::*;
     use crate::controllability::BoundaryDirection;
+
+    // P1.1 — Auto-frontend fallback attempt ordering (the slang branch itself needs the plugin /
+    // mununu-sva image; the ordering is deterministic + host-testable).
+    #[test]
+    fn auto_frontend_attempt_order() {
+        // No slang plugin → the sole attempt is read_verilog (unchanged legacy behaviour).
+        assert_eq!(
+            frontend_attempt_order(false, false),
+            vec![SvFrontend::Verilog]
+        );
+        assert_eq!(
+            frontend_attempt_order(false, true),
+            vec![SvFrontend::Verilog]
+        );
+        // slang present, default preference → verilog first, slang fallback (broad default leads).
+        assert_eq!(
+            frontend_attempt_order(true, false),
+            vec![SvFrontend::Verilog, SvFrontend::Slang]
+        );
+        // MUNUNU_YOSYS_FRONTEND=slang flips the preference → slang first, verilog fallback.
+        assert_eq!(
+            frontend_attempt_order(true, true),
+            vec![SvFrontend::Slang, SvFrontend::Verilog]
+        );
+    }
+
+    // P1.1 — the Auto-frontend fallback, end-to-end. `read_verilog` rejects a module-header
+    // package import (`module m import p::*;`) with `unexpected TOK_IMPORT`; Auto must retry with
+    // slang and lift. (Unblocks OpenTitan-class designs — the roadmap's stated P1.1 blocker.)
+    // Needs the yosys-slang plugin ⇒ mununu-sva image.
+    #[test]
+    #[ignore = "requires the yosys-slang plugin (mununu-sva image)"]
+    fn e2e_auto_frontend_falls_back_to_slang_on_module_import() {
+        const IMPORT_SV: &str = "\
+package p; typedef enum logic [1:0] {A=0, B=1, C=2} st_e; endpackage
+module m import p::*; (input logic clk, output logic [1:0] o);
+  st_e s = A;
+  always_ff @(posedge clk) s <= (s == C) ? A : st_e'(s + 2'd1);
+  assign o = s;
+endmodule
+";
+        // Auto → read_verilog fails (TOK_IMPORT) → falls back to slang → lifts.
+        let auto = YosysOptions {
+            frontend: SvFrontend::Auto,
+            ..Default::default()
+        };
+        let btor2 = sv_to_btor2(IMPORT_SV, &auto)
+            .expect("Auto must fall back to slang and lift a module-header package import");
+        assert!(!btor2.is_empty(), "the fallback lift produced empty BTOR2");
+        // An EXPLICIT Verilog frontend must still FAIL on the same input — proving it is the
+        // fallback (not read_verilog) that lifted it, and that an explicit request is honoured.
+        let verilog = YosysOptions {
+            frontend: SvFrontend::Verilog,
+            ..Default::default()
+        };
+        assert!(
+            sv_to_btor2(IMPORT_SV, &verilog).is_err(),
+            "read_verilog must reject the module-header import (no silent fallback on explicit request)"
+        );
+    }
 
     // A2 — port net-type stripping (`input tri0 x` → `input x`).
     #[test]
