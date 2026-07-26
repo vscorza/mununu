@@ -1,11 +1,15 @@
 //! Track R — the **wall-class lever-evaluation matrix** (`.claude/plans/wall-class-lever-evaluation.md`).
 //!
 //! A FIXED set of class-representative recoverability cases (§ `CASES`) × the mechanisms with a
-//! corpus claim (`default` = exact-first+WP · `cube-wp` · `cube-craig`), run as ONE matrix so a
-//! lever is judged on the class it TARGETS, not on whatever design happened to be handy. This is
-//! the methodology fix for the convenience-biased lever-testing (2026-07-26): the run prints a
-//! `class × lever → verdict` table and asserts the SOUNDNESS invariant (no lever contradicts the
-//! oracle) + that each decidable case is decided by at least one lever.
+//! corpus claim — the SINGLETONS (`default` = exact-first+WP · `cube-wp` · `cube-craig`) AND the
+//! `combined` COMPOSED plan (config-pin + exact + cube + ranking + guard + Craig, via
+//! [`solve_recoverability_combined`]) — run as ONE matrix so a lever is judged on the class it
+//! TARGETS, not on whatever design happened to be handy. Crucially, no single mechanism is
+//! expected to flip a ⊥ alone: the `combined` column measures whether COMPOSITION decides what
+//! every singleton leaves ⊥ (the planner's raison d'être). The run prints a `class × lever →
+//! verdict` table and asserts the SOUNDNESS invariant (no lever contradicts the oracle) + that
+//! each decidable case is decided by at least one lever. A `*` on a `combined` verdict = the
+//! decision is config-SCOPED (pins were applied).
 //!
 //! `#[ignore]` — a validation HARNESS (some cones are wide + the Craig lever needs MathSAT), run on
 //! demand: `cargo test -p mununu-core --test wall_class_matrix -- --ignored --nocapture`
@@ -16,6 +20,7 @@ use mununu_core::adapter::recoverability::{
     verify_recoverability, verify_recoverability_scalable,
     verify_recoverability_scalable_with_source,
 };
+use mununu_core::planner::solve_recoverability_combined;
 use mununu_core::verdict::PropertyVerdict;
 
 /// The sound oracle verdict for a case — what a COMPLETE analysis reaches.
@@ -312,13 +317,15 @@ fn decides(r: &Result<PropertyVerdict, String>, want: PropertyVerdict) -> bool {
 fn wall_class_matrix() {
     let mathsat = std::env::var_os("MUNUNU_MATHSAT_PATH").is_some();
     println!(
-        "\n{:32} {:30} {:>6} {:>6} {:>6}",
-        "case", "class", "dflt", "wp", "craig"
+        "\n{:32} {:26} {:>6} {:>6} {:>6} {:>7}",
+        "case", "class", "dflt", "wp", "craig", "comb"
     );
-    println!("{}", "-".repeat(88));
+    println!("{}", "-".repeat(92));
 
     let mut soundness_violations = Vec::new();
     let mut craig_unique = Vec::new();
+    let mut combined_fullspace = Vec::new(); // ⊥-singletons → combined decides with NO pins (transfers)
+    let mut combined_scoped = Vec::new(); // ⊥-singletons → combined decides but pins applied (scoped)
 
     for c in cases() {
         let dflt = verify_recoverability(c.btor2, c.target);
@@ -329,13 +336,23 @@ fn wall_class_matrix() {
             &[],
             PredicateSource::CraigInterpolation,
         );
+        // The COMPOSED plan (config-pin + exact + cube + ranking + guard + Craig) — the whole
+        // point of a planner: a lever that is 0 alone can contribute in combination. A HOLDS with
+        // pins applied is SCOPED to that configuration (marked `*`).
+        let (combined, pins) = solve_recoverability_combined(c.btor2, c.target);
+        let comb_str = if pins.is_empty() {
+            v(&combined).to_string()
+        } else {
+            format!("{}*", v(&combined).trim())
+        };
         println!(
-            "{:32} {:30} {:>6} {:>6} {:>6}",
+            "{:32} {:26} {:>6} {:>6} {:>6} {:>7}",
             c.name,
             c.class,
             v(&dflt),
             v(&wp),
-            v(&craig)
+            v(&craig),
+            comb_str
         );
 
         // SOUNDNESS invariant — no lever may contradict the oracle.
@@ -373,13 +390,52 @@ fn wall_class_matrix() {
         if matches!(wp, Ok(PropertyVerdict::Unknown)) && is_holds(&craig) {
             craig_unique.push(c.name);
         }
+
+        // The COMBINE-MECHANISMS hypothesis: a case EVERY singleton leaves ⊥ that the composed
+        // plan DECIDES. Split by soundness — a decision reached with NO pins is a genuine
+        // FULL-SPACE win (transfers); one reached WITH config-pins is SCOPED: recoverability
+        // (AG EF) is not monotone under input-restriction, so a config-pinned verdict answers only
+        // "recoverable under held inputs" and does NOT transfer to the full space.
+        let all_singletons_bottom = [&dflt, &wp, &craig]
+            .iter()
+            .all(|r| matches!(r, Ok(PropertyVerdict::Unknown)));
+        let combined_decides = matches!(
+            combined,
+            Ok(PropertyVerdict::Holds | PropertyVerdict::Violated)
+        );
+        if all_singletons_bottom && combined_decides {
+            if pins.is_empty() {
+                combined_fullspace.push(c.name);
+            } else {
+                combined_scoped.push(c.name);
+            }
+        }
     }
 
-    println!("{}", "-".repeat(88));
+    println!("{}", "-".repeat(92));
     assert!(
         soundness_violations.is_empty(),
         "SOUNDNESS VIOLATIONS (a lever contradicted the oracle): {soundness_violations:?}"
     );
+
+    // The COMBINE-MECHANISMS hypothesis (the planner's raison d'être) — measured, not assumed,
+    // split by what actually TRANSFERS. A `*` in the table = the combined verdict is config-scoped.
+    if combined_fullspace.is_empty() {
+        println!(
+            "MEASURED: no genuine FULL-SPACE combination win on this set. The composed plan's only \
+             ⊥→decided cases are config-SCOPED (pins applied): {combined_scoped:?} — a valid but \
+             weaker 'recoverable under held inputs' sub-question that does NOT transfer (AG EF is \
+             not monotone under input-restriction; pinning `go`/`start`=0 hides the trap). The \
+             sound verdict-PRESERVING shrinkers (F1/F2/COI) save ~0 on the data-dependent ⊥, so \
+             composition adds no full-space decision here. Combination stays the right DEFAULT; \
+             this set simply has no combination-only full-space-decidable case yet."
+        );
+    } else {
+        println!(
+            "COMBINATION WIN (full-space, transfers — decided with no pins where every singleton \
+             was ⊥): {combined_fullspace:?}   [config-scoped-only: {combined_scoped:?}]"
+        );
+    }
 
     // Craig's MARGINAL reach is MEASURED, not presupposed. Through the production pipeline the
     // WP path already runs guard-atom extraction (reads a syntactic invariant like `data==target`

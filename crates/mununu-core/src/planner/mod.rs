@@ -219,6 +219,78 @@ pub fn replan(
     escalate_bottom(report, design_btor2, reset_pinned, opts)
 }
 
+/// A **composed** recoverability plan — the point of a *planner*: mechanisms combine. A single
+/// lever rarely flips a ⊥ on its own (measured, this whole track), so this stacks the sound
+/// cone-shrink transforms and the solver refinements into ONE plan, so a design whose complexity
+/// no singleton cracks can still be decided by their combination:
+///
+///   COI (auto) → **config-pin** the in-cone free inputs (removes input bits — auto-config-value
+///   as a COMBINATION COMPONENT, not a standalone) → exact-first on the shrunk model → cube +
+///   ranking + guard-atoms + **Craig** on the shrunk model.
+///
+/// Returns `(verdict, pinned_inputs)`. A verdict reached AFTER pinning is SCOPED to that
+/// configuration (a VIOLATED is a real counterexample at those input values; a HOLDS holds only
+/// for them). Used by the wall-class matrix's `combined` column to MEASURE whether composition
+/// decides what every singleton lever leaves ⊥.
+pub fn solve_recoverability_combined(
+    design_btor2: &str,
+    target: &str,
+) -> (Result<crate::verdict::PropertyVerdict, String>, Vec<String>) {
+    use crate::adapter::btor2::cegar::PredicateSource;
+    use crate::adapter::btor2::model_facts::ModelFacts;
+    use crate::adapter::btor2::pin::pin_inputs_to_constants;
+    use crate::adapter::recoverability::{
+        verify_recoverability, verify_recoverability_scalable_with_source,
+    };
+    use crate::verdict::PropertyVerdict;
+
+    let definite = |r: &Result<PropertyVerdict, String>| {
+        matches!(r, Ok(PropertyVerdict::Holds | PropertyVerdict::Violated))
+    };
+
+    // Cone seed = the target's compared register (LHS of `reg op value`).
+    let seed: Vec<String> = target
+        .split(['=', '<', '>', '!'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+
+    // config-pin the in-cone free inputs (auto-config-value AS A COMBINATION COMPONENT).
+    let pins: Vec<(String, u64)> = crate::adapter::btor2::parser::parse(design_btor2)
+        .ok()
+        .map(|file| {
+            ModelFacts::new(&file)
+                .pinnable_cone_inputs(&seed)
+                .iter()
+                .map(|i| (i.name.clone(), 0u64))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (model, applied) = if pins.is_empty() {
+        (design_btor2.to_string(), Vec::new())
+    } else {
+        pin_inputs_to_constants(design_btor2, &pins)
+    };
+
+    // exact-first on the (shrunk) model — pinning may bring the cone under the bit cap so exact
+    // decides where it abstained unpinned; then cube + ranking + guard-atoms + Craig.
+    let exact_first = verify_recoverability(&model, target);
+    if definite(&exact_first) {
+        return (exact_first, applied);
+    }
+    let cube_craig = verify_recoverability_scalable_with_source(
+        &model,
+        target,
+        &[],
+        PredicateSource::CraigInterpolation,
+    );
+    (cube_craig, applied)
+}
+
 /// The companion re-plan edge for cube-**Skipped** (not `⊥`) properties: an atom-less modal
 /// formula the cube cannot seed gets one full-state exact-symbolic attempt, upgraded on a
 /// definite verdict (lever b). Gated to the cube path under reset-gating. Delegates to the
