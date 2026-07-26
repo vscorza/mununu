@@ -1215,6 +1215,36 @@ pub fn verify_recoverability_scalable(
     good: &str,
     extra_predicates: &[PredicateSpec],
 ) -> Result<PropertyVerdict, String> {
+    verify_recoverability_scalable_with_source(
+        btor2_content,
+        good,
+        extra_predicates,
+        default_craig_source(),
+    )
+}
+
+/// The default CEGAR predicate source: the `MUNUNU_CRAIG_REFINE` opt-in (WP otherwise). Used by
+/// every non-planner caller (CLI / API / tests) so their behaviour is unchanged.
+pub fn default_craig_source() -> PredicateSource {
+    if std::env::var_os("MUNUNU_CRAIG_REFINE").is_some() {
+        PredicateSource::CraigInterpolation
+    } else {
+        PredicateSource::WeakestPrecondition
+    }
+}
+
+/// [`verify_recoverability_scalable`] with the CEGAR predicate source chosen by the CALLER (the
+/// planner / a validation harness) rather than the `MUNUNU_CRAIG_REFINE` env — front-B's
+/// integration seam. The planner schedules [`PredicateSource::CraigInterpolation`] when its
+/// MathSAT dependency is available; the wall-class matrix uses it to run the Craig lever
+/// deterministically (no racy global env). Craig always falls back to WP inside the loop, so an
+/// explicit `Craig` source can only DECIDE MORE (sound + monotone under `SmtHyperMust`).
+pub fn verify_recoverability_scalable_with_source(
+    btor2_content: &str,
+    good: &str,
+    extra_predicates: &[PredicateSpec],
+    predicate_source: PredicateSource,
+) -> Result<PropertyVerdict, String> {
     // Parse `good` and require a `REG == VALUE` equality atom.
     let good_expr = parse_predicate_expr(good).map_err(|e| {
         format!("recoverability target `{good}` is not a register-comparison atom (`REG op VALUE`): {e:?}")
@@ -1612,16 +1642,12 @@ pub fn verify_recoverability_scalable(
     // Cube + smt-hyper-must, matching the verify_auto CegarOptions shape.
     let cegar_opts = CegarOptions {
         max_iterations: RECOVERABILITY_MAX_ITERATIONS,
-        // F.1 (2026-07-24) — opt into the transition-aware Craig refinement (discovers the
-        // relational/bound invariant a datapath-dependent ⊥ needs) via `MUNUNU_CRAIG_REFINE`.
-        // Default stays WP: Craig spawns a cvc5 subprocess per classifying transition, so it is
-        // opt-in until the corpus cost/benefit is measured. The loop always falls back to WP, so
-        // enabling it can only DECIDE MORE (sound + monotone under SmtHyperMust).
-        predicate_source: if std::env::var_os("MUNUNU_CRAIG_REFINE").is_some() {
-            PredicateSource::CraigInterpolation
-        } else {
-            PredicateSource::WeakestPrecondition
-        },
+        // F.1 (2026-07-24) — the transition-aware Craig refinement (discovers the relational/bound
+        // invariant a datapath-dependent ⊥ needs). The source is chosen by the CALLER
+        // (front-B seam): `default_craig_source()` for CLI/API/tests (env-gated, WP default), or
+        // the planner's MathSAT-aware decision. The loop always falls back to WP, so an explicit
+        // `Craig` can only DECIDE MORE (sound + monotone under SmtHyperMust).
+        predicate_source,
         max_cube_count: 1024,
         capture_approximants: false,
         enable_approximant_reuse: false,
