@@ -162,7 +162,7 @@ fn default_cap_for_cone(cone_bits: u32) -> u32 {
 /// asked for a specific limit, so we neither raise nor lower it. With NO override, the cap is
 /// [`default_cap_for_cone`]: the conservative default auto-raised to admit a modestly-wide
 /// concrete cone.
-fn effective_bitblast_cap(cone_bits: u32) -> u32 {
+pub(crate) fn effective_bitblast_cap(cone_bits: u32) -> u32 {
     match std::env::var("MUNUNU_BDD_MAX_BITS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -2093,6 +2093,28 @@ pub(crate) fn collect_predicate_registers(
         }
         PredicateExpr::Not(a) => collect_predicate_registers(a, out),
     }
+}
+
+/// The exact engine's cone SEED ATOMS for a formula — the register names its predicate atoms
+/// reference (via [`collect_predicate_registers`]). These seed the cone-of-influence keep-set
+/// that sets how many register+input bits the exact engine must bit-blast; the planner reads
+/// them (with `ModelFacts::cone_bits`) to predict a cone-over-cap Skip and pick pinnable
+/// inputs (P2.2). This is the UNRESOLVED extraction (no alias canonicalization) —
+/// diagnostic-grade for the planner's cost estimate; the exact engine additionally resolves
+/// aliases for its authoritative keep-set. An atom-free formula yields no seeds ⇒ the caller
+/// treats the whole design as the cone.
+pub(crate) fn formula_seed_atoms(formula: &Formula) -> Vec<String> {
+    let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for node in formula.nodes() {
+        if let MuNode::Predicate(name) = node
+            && let Ok(expr) = parse_predicate_atom_bool(name)
+        {
+            collect_predicate_registers(&expr, &mut regs);
+        }
+    }
+    let mut v: Vec<String> = regs.into_iter().collect();
+    v.sort();
+    v
 }
 
 /// Directly decide whether ANY `bad` property of a BTOR2 design is REACHABLE from the reset

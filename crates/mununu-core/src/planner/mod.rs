@@ -21,8 +21,9 @@
 //! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
 
 use crate::adapter::slang::verify_auto::{
-    AutoVerifyReport, PortfolioMode, VerificationNote, VerifyAutoOptions, escalate_bottom,
-    merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact, verify_auto,
+    AutoVerifyReport, NoteLevel, PortfolioMode, VerificationNote, VerifyAutoOptions, VerifyOutcome,
+    escalate_bottom, merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact,
+    verify_auto,
 };
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -227,7 +228,69 @@ pub fn rescue_skipped(
     design_btor2: &str,
     opts: &VerifyAutoOptions,
 ) -> Vec<VerificationNote> {
-    rescue_skipped_via_exact(report, design_btor2, opts)
+    let mut notes = rescue_skipped_via_exact(report, design_btor2, opts);
+    // P2.2a — the first ModelFacts consumer: an actionable diagnostic for what remains
+    // Skipped. Verdict-equivalent (a note, never a verdict change); P2.2b will *act* on the
+    // same cone-vs-cap facts to auto-pin and re-decide.
+    notes.extend(skip_over_cap_notes(report, design_btor2));
+    notes
+}
+
+/// P2.2a — actionable Skip diagnostic (the first `ModelFacts` consumer). For each property
+/// STILL Skipped after the exact attempt, use `ModelFacts` to check whether the exact engine
+/// bailed because the property's cone exceeds the bit cap (`cone_bits > cap`); if so, attach a
+/// note naming the cone width, the cap, and the pinnable in-cone config inputs — the surface a
+/// `--config-value` pin (or auto-config-value, P2.2b) would shrink so it decides. (Mirrors the
+/// actionable-⊥ note #385; verdict-equivalent — a diagnostic, never a verdict change.)
+fn skip_over_cap_notes(report: &AutoVerifyReport, design_btor2: &str) -> Vec<VerificationNote> {
+    use crate::adapter::btor2::model_facts::ModelFacts;
+    use crate::adapter::btor2::symbolic_bitblast::formula_seed_atoms;
+
+    let Ok(file) = crate::adapter::btor2::parser::parse(design_btor2) else {
+        return Vec::new();
+    };
+    let facts = ModelFacts::new(&file);
+    let mut notes = Vec::new();
+    for prop in &report.properties {
+        if !matches!(prop.outcome, VerifyOutcome::Skipped { .. }) {
+            continue;
+        }
+        let Ok(formula) = crate::mu_calculus::parser::parse(&prop.formula) else {
+            continue;
+        };
+        let atoms = formula_seed_atoms(&formula);
+        let (cone_bits, cap) = facts.cone_vs_cap(&atoms);
+        if cone_bits <= cap {
+            // Skipped for another reason (atom-less cube, unsupported op) — not a cap issue,
+            // so auto-config-value cannot help; leave it to the existing Skip provenance.
+            continue;
+        }
+        let inputs = facts.pinnable_cone_inputs(&atoms);
+        let items: Vec<String> = inputs
+            .iter()
+            .take(8)
+            .map(|i| format!("{}({} bits)", i.name, i.width))
+            .collect();
+        notes.push(VerificationNote {
+            kind: "skip-over-cap-reason".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "`{}`: Skipped — the exact cone is {cone_bits} register+input bits (> the \
+                 {cap}-bit cap), too wide to bit-blast.",
+                prop.name
+            ),
+            detail: "The exact engine bit-blasts a property's cone-of-influence; this cone \
+                     exceeds the bit cap, so it bailed to Skipped. The cone is inflated by wide \
+                     free INPUTS the design compares against — pinning the widest in-cone ones \
+                     to representative constants (`--config-value SIGNAL=VALUE`) removes their \
+                     bits and can bring the cone under the cap so exact decides (a verdict \
+                     scoped to the pinned configuration). Auto-deriving these pins is the \
+                     planner's next increment (P2.2b)."
+                .into(),
+            items,
+        });
+    }
+    notes
 }
 
 #[cfg(test)]
