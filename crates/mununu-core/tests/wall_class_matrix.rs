@@ -16,6 +16,7 @@
 //! (in `mununu-sva-pono` with `MUNUNU_MATHSAT_PATH` set, the `cube-craig` column comes alive).
 
 use mununu_core::adapter::btor2::cegar::PredicateSource;
+use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
 use mununu_core::adapter::recoverability::{
     verify_recoverability, verify_recoverability_scalable,
     verify_recoverability_scalable_with_source,
@@ -40,6 +41,19 @@ struct Case {
     btor2: &'static str,
     target: &'static str,
     oracle: Oracle,
+    /// Provenance: `"RTL:<design>"` for a lifted design, `"synthetic"` for a hand-written
+    /// class fixture. The requirement (2026-07-26) is an RTL representative for every class;
+    /// synthetic fixtures are labelled "awaiting RTL" so the gap is explicit + trackable.
+    source: &'static str,
+    /// Config/reset inputs baked to constants BEFORE the levers run (e.g. `rst_ni=1` to pin an
+    /// active-low reset inactive → the operational, no-reset recoverability question). A pinned
+    /// verdict is config-SCOPED but sound (the exact engine on the concrete pinned model is
+    /// 2-valued sound); used to source the RTL VIOLATED class from a reset-recovering FSM.
+    pin: &'static [(&'static str, u64)],
+}
+
+fn is_rtl(c: &Case) -> bool {
+    c.source.starts_with("RTL")
 }
 
 // ---- The fixed class-representative set --------------------------------------------------------
@@ -224,14 +238,26 @@ const CRAIG_EMERGENT: &str = "\
 // `sv verify-auto --engine exact-symbolic` + MUNUNU_KEEP_YOSYS_TMP=1.
 const I2C_SCL_PADOEN: &str = include_str!("fixtures/wall_classes/i2c_scl_padoen.btor");
 
+// RTL — lifted OpenTitan aes_cipher_control_fsm (5-state sparse FSM), via the Auto→slang
+// fallback (#396; read_verilog rejects its `module … import aes_pkg::*;`). Two classes from one
+// design: free-reset recoverability HOLDS (reset clears any state); reset PINNED (`rst_ni=1`,
+// the standard operational reset-gating) → VIOLATED (the FSM traps in its absorbing error state,
+// only reset recovers). Reproduce: examples/verify/dc_opentitan_aes_cipher_control_fsm/source.
+const AES_CIPHER: &str = include_str!("fixtures/wall_classes/aes_cipher_control_fsm.btor");
+
+const NO_PIN: &[(&str, u64)] = &[];
+
 fn cases() -> Vec<Case> {
     vec![
+        // ---- synthetic class fixtures (mechanism checks; awaiting RTL representatives) ----
         Case {
             name: "responder",
             class: "decidable-exact/HOLDS",
             btor2: RESPONDER,
             target: "st == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "staller",
@@ -239,6 +265,8 @@ fn cases() -> Vec<Case> {
             btor2: STALLER,
             target: "st == 0",
             oracle: Oracle::Violated,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "wide_recoverable",
@@ -246,6 +274,8 @@ fn cases() -> Vec<Case> {
             btor2: WIDE_RECOVERABLE,
             target: "st == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "wide_trap",
@@ -253,6 +283,8 @@ fn cases() -> Vec<Case> {
             btor2: WIDE_TRAP,
             target: "st == 0",
             oracle: Oracle::Violated,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "trap_uf_w48",
@@ -260,6 +292,8 @@ fn cases() -> Vec<Case> {
             btor2: TRAP_UF_W48,
             target: "ctrl == 0",
             oracle: Oracle::NeverHolds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "pos_w48",
@@ -267,6 +301,8 @@ fn cases() -> Vec<Case> {
             btor2: POS_W48,
             target: "ctrl == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "class2_datadep",
@@ -274,20 +310,45 @@ fn cases() -> Vec<Case> {
             btor2: CLASS2_DATADEP,
             target: "ctrl == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
         Case {
             name: "craig_emergent",
-            class: "invariant-class/HOLDS (Craig)",
+            class: "invariant-class/HOLDS",
             btor2: CRAIG_EMERGENT,
             target: "busy == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
         },
+        // ---- RTL class-representatives (lifted designs — the curation target) ----
         Case {
-            name: "i2c_scl_padoen (RTL)",
+            name: "i2c_scl_padoen",
             class: "register-dominated/⊥",
             btor2: I2C_SCL_PADOEN,
             target: "scl_padoen_o == 1",
             oracle: Oracle::HardUnknown,
+            source: "RTL:i2c",
+            pin: NO_PIN,
+        },
+        Case {
+            name: "aes_cipher (free)",
+            class: "decidable/HOLDS",
+            btor2: AES_CIPHER,
+            target: "aes_cipher_ctrl_cs == 9",
+            oracle: Oracle::Holds,
+            source: "RTL:opentitan-aes",
+            pin: NO_PIN,
+        },
+        Case {
+            name: "aes_cipher (rst pinned)",
+            class: "operational/VIOLATED",
+            btor2: AES_CIPHER,
+            target: "aes_cipher_ctrl_cs == 9",
+            oracle: Oracle::Violated,
+            source: "RTL:opentitan-aes",
+            pin: &[("rst_ni", 1)],
         },
     ]
 }
@@ -327,11 +388,28 @@ fn wall_class_matrix() {
     let mut combined_fullspace = Vec::new(); // ⊥-singletons → combined decides with NO pins (transfers)
     let mut combined_scoped = Vec::new(); // ⊥-singletons → combined decides but pins applied (scoped)
 
+    let mut rtl_classes = std::collections::BTreeSet::new();
+    let mut synthetic_classes = std::collections::BTreeSet::new();
+
     for c in cases() {
-        let dflt = verify_recoverability(c.btor2, c.target);
-        let wp = verify_recoverability_scalable(c.btor2, c.target, &[]);
+        // Bake the case's reset/config pins (e.g. `rst_ni=1` — the standard operational
+        // reset-gating) into the model BEFORE the levers. Sound: the exact engine on the
+        // concrete pinned model is 2-valued sound (the operational, out-of-reset question).
+        let model = if c.pin.is_empty() {
+            c.btor2.to_string()
+        } else {
+            let pins: Vec<(String, u64)> = c.pin.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+            pin_inputs_to_constants(c.btor2, &pins).0
+        };
+        if is_rtl(&c) {
+            rtl_classes.insert(c.class);
+        } else {
+            synthetic_classes.insert(c.class);
+        }
+        let dflt = verify_recoverability(&model, c.target);
+        let wp = verify_recoverability_scalable(&model, c.target, &[]);
         let craig = verify_recoverability_scalable_with_source(
-            c.btor2,
+            &model,
             c.target,
             &[],
             PredicateSource::CraigInterpolation,
@@ -339,7 +417,7 @@ fn wall_class_matrix() {
         // The COMPOSED plan (config-pin + exact + cube + ranking + guard + Craig) — the whole
         // point of a planner: a lever that is 0 alone can contribute in combination. A HOLDS with
         // pins applied is SCOPED to that configuration (marked `*`).
-        let (combined, pins) = solve_recoverability_combined(c.btor2, c.target);
+        let (combined, pins) = solve_recoverability_combined(&model, c.target);
         let comb_str = if pins.is_empty() {
             v(&combined).to_string()
         } else {
@@ -459,4 +537,13 @@ fn wall_class_matrix() {
              run in mununu-sva-pono to exercise + measure the Craig column."
         );
     }
+
+    // RTL-COVERAGE tracker (requirement 2026-07-26: an RTL representative for every class). The
+    // synthetic fixtures are valid MECHANISM checks; RTL adds realism. This prints the classes
+    // that HAVE a lifted-RTL representative vs those still synthetic-only, so the gap is explicit
+    // and shrinks visibly as P1.1 lifts more designs (OpenTitan via the #396 Auto→slang fallback).
+    println!("{}", "-".repeat(92));
+    println!("RTL-backed classes: {rtl_classes:?}");
+    let synthetic_only: Vec<_> = synthetic_classes.difference(&rtl_classes).collect();
+    println!("synthetic-only (awaiting RTL representative): {synthetic_only:?}");
 }
