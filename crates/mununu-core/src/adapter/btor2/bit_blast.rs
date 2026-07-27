@@ -6711,6 +6711,358 @@ mod tests {
         eprintln!("  F2 total bit-saving on this cone: {f2_total}");
     }
 
+    /// MK.0 feasibility probe for mixed-precision KMTS (`.claude/plans/mixed-precision-kmts.md`).
+    /// The go/no-go before building the pipeline: partition the cone's state registers into
+    /// CONTROL (`C`, kept concrete) vs DATAPATH (`D`, predicate-abstracted), and bound the
+    /// reachable concrete-control state count `|Reach_C|`. If `|Reach_C|` is enumerable the
+    /// approach applies; if it explodes on a control-web design (i2c) the control cannot stay
+    /// concrete and mixed-precision degrades to the plain cube.
+    ///
+    /// A register is DATAPATH iff its value (through value-movement ops + register stages)
+    /// reaches an ARITHMETIC op or a READ index — its magnitude/bits are computed on, so it
+    /// cannot be enumerated. CONTROL uses — driving an `ite` SELECT (`args[0]`), `eq`/ordering
+    /// COMPARISONS, bit REDUCTIONS — do NOT make a register datapath; those are exactly the
+    /// decision-tree edges the concrete control LTS must keep exact. Small-value-set registers
+    /// (`detect_enum_states`, `detect_down_counter`) and frozen/config registers are always
+    /// control with a KNOWN reachable count (the "tight" bound); a narrow non-enum control
+    /// register contributes a CRUDE `2^width` upper bound (its reachable subset is unknown to a
+    /// syntactic probe — that gap is what MK.1's actual reachability closes).
+    ///
+    /// `MUNUNU_PROBE_BTOR2=<file> MUNUNU_PROBE_ATOMS=<sig[,sig...]>`; no atoms ⇒ whole design.
+    #[test]
+    #[ignore = "MK.0 probe — set MUNUNU_PROBE_BTOR2 + MUNUNU_PROBE_ATOMS"]
+    fn probe_mixed_precision_reach_c_partition() {
+        use crate::adapter::btor2::ast::{Nid, Node, Op};
+        use crate::adapter::btor2::dep_graph::cone_leaf_nids;
+        use std::collections::{HashMap, HashSet};
+
+        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let content = std::fs::read_to_string(&path).expect("read btor2");
+        let file = parser::parse(&content).expect("parse btor2");
+        let atoms: Vec<String> = std::env::var("MUNUNU_PROBE_ATOMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // state widths + the shipped small-value-set detectors
+        let mut state_width: HashMap<Nid, u32> = HashMap::new();
+        for l in &file.lines {
+            if let Node::State { sort, .. } = &l.node {
+                state_width.insert(l.nid, parser::bv_width(&file, *sort).unwrap_or(0));
+            }
+        }
+        let enum_values: HashMap<Nid, usize> = detect_enum_states(&file)
+            .iter()
+            .map(|m| (m.nid, m.values.len()))
+            .collect();
+        let counter_nids: HashSet<Nid> = detect_down_counter(&file).iter().map(|m| m.nid).collect();
+
+        let cone_states: Vec<Nid> = if atoms.is_empty() {
+            state_width.keys().copied().collect()
+        } else {
+            let leaves = cone_leaf_nids(&file, &atoms);
+            state_width
+                .keys()
+                .copied()
+                .filter(|n| leaves.contains(n))
+                .collect()
+        };
+
+        // frozen check + forward-use map + sequential (next) movement
+        let mut next_of: HashMap<Nid, Nid> = HashMap::new();
+        let mut uses: HashMap<Nid, Vec<(Op, usize, Nid)>> = HashMap::new();
+        let mut next_drives: HashMap<Nid, Vec<Nid>> = HashMap::new();
+        for l in &file.lines {
+            match &l.node {
+                Node::Next { state, value, .. } => {
+                    next_of.insert(*state, value.nid().abs());
+                    next_drives
+                        .entry(value.nid().abs())
+                        .or_default()
+                        .push(*state);
+                }
+                Node::Op { op, args, .. } => {
+                    for (i, a) in args.iter().enumerate() {
+                        uses.entry(a.nid().abs()).or_default().push((*op, i, l.nid));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let is_const =
+            |nid: Nid| matches!(file.lookup(nid).map(|l| &l.node), Some(Node::Const { .. }));
+        let frozen = |s: Nid| match next_of.get(&s) {
+            None => true,
+            Some(&nv) => nv == s || is_const(nv),
+        };
+
+        // datapath discriminator: value reaches an arith op or a Read index
+        fn feeds_datapath(
+            uses: &HashMap<Nid, Vec<(Op, usize, Nid)>>,
+            next_drives: &HashMap<Nid, Vec<Nid>>,
+            start: Nid,
+        ) -> bool {
+            let arith = |o: Op| {
+                matches!(
+                    o,
+                    Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::Neg
+                        | Op::Inc
+                        | Op::Dec
+                        | Op::Sdiv
+                        | Op::Udiv
+                        | Op::Smod
+                        | Op::Srem
+                        | Op::Urem
+                        | Op::Sll
+                        | Op::Srl
+                        | Op::Sra
+                        | Op::Rol
+                        | Op::Ror
+                )
+            };
+            let control = |o: Op| {
+                matches!(
+                    o,
+                    Op::Eq
+                        | Op::Neq
+                        | Op::Sgt
+                        | Op::Ugt
+                        | Op::Sgte
+                        | Op::Ugte
+                        | Op::Slt
+                        | Op::Ult
+                        | Op::Slte
+                        | Op::Ulte
+                        | Op::Redand
+                        | Op::Redor
+                        | Op::Redxor
+                )
+            };
+            let mut seen = HashSet::new();
+            let mut stack = vec![start];
+            while let Some(n) = stack.pop() {
+                if !seen.insert(n) {
+                    continue;
+                }
+                if let Some(driven) = next_drives.get(&n) {
+                    stack.extend(driven.iter().copied());
+                }
+                let Some(users) = uses.get(&n) else { continue };
+                for &(op, idx, un) in users {
+                    if arith(op) {
+                        return true; // magnitude/bits computed on ⇒ datapath
+                    }
+                    if op == Op::Read && idx == 1 {
+                        return true; // indexes a table ⇒ datapath
+                    }
+                    if control(op) || (op == Op::Ite && idx == 0) {
+                        continue; // control comparison / select — NOT datapath, stop here
+                    }
+                    stack.push(un); // value-movement: concat/slice/uext/sext/ite-branch/bitwise
+                }
+            }
+            false
+        }
+
+        const WIDE: u32 = 16; // a non-enum non-counter register wider than this is treated as data
+        let mut c_regs: Vec<(Nid, u32, f64, &str)> = Vec::new();
+        let mut d_regs: Vec<(Nid, u32, &str)> = Vec::new();
+        let mut log2_tight = 0.0f64; // enum/counter/frozen — reachable count KNOWN
+        let mut log2_flags = 0.0f64; // 1-bit control (FSM/flags) — genuinely control, correlated
+        let mut log2_multibit = 0.0f64; // multi-bit non-enum control — the RISK (shift/byte/data?)
+        let mut coupled = 0usize; // D registers that ALSO drive a control decision (div r_bit)
+        let mut counters: Vec<(Nid, u32, u64)> = Vec::new(); // nid, width, reachable range
+        let mut multibit: Vec<(Nid, u32)> = Vec::new(); // the risk regs MK.1 must measure
+
+        for &s in &cone_states {
+            let w = *state_width.get(&s).unwrap_or(&0);
+            if let Some(&nv) = enum_values.get(&s) {
+                let l = (nv.max(1) as f64).log2();
+                log2_tight += l;
+                c_regs.push((s, w, l, "enum"));
+            } else if counter_nids.contains(&s) {
+                let init =
+                    init_value_of(&file, s).and_then(|op| resolve_btor2_constant(&file, op.nid()));
+                let range = init
+                    .map(|v| v.saturating_add(1))
+                    .unwrap_or(1u64 << w.min(63));
+                let l = (range.max(1) as f64).log2();
+                log2_tight += l;
+                counters.push((s, w, range));
+                c_regs.push((s, w, l, "counter"));
+            } else if frozen(s) {
+                c_regs.push((s, w, 0.0, "frozen/config(1 val)"));
+            } else if feeds_datapath(&uses, &next_drives, s) {
+                let drives_ctrl = uses.get(&s).is_some_and(|us| {
+                    us.iter().any(|&(op, idx, _)| {
+                        (op == Op::Ite && idx == 0) || matches!(op, Op::Eq | Op::Neq)
+                    })
+                });
+                if drives_ctrl {
+                    coupled += 1;
+                }
+                d_regs.push((s, w, "datapath(arith/index)"));
+            } else if w > WIDE {
+                d_regs.push((s, w, "wide-nonenum(data)"));
+            } else if w == 1 {
+                log2_flags += 1.0;
+                c_regs.push((s, w, 1.0, "flag(1-bit)"));
+            } else {
+                log2_multibit += w as f64;
+                multibit.push((s, w));
+                c_regs.push((s, w, w as f64, "multibit-control(2^w)"));
+            }
+        }
+
+        let log2_crude = log2_flags + log2_multibit;
+        let bits_c = log2_tight + log2_crude;
+        let bits_d: u32 = d_regs.iter().map(|(_, w, _)| *w).sum();
+        eprintln!(
+            "=== MK.0 mixed-precision partition + |Reach_C| bound: {} cone regs, atoms={:?} ===",
+            cone_states.len(),
+            atoms
+        );
+        let mut by_tag: std::collections::BTreeMap<&str, (usize, u32)> =
+            std::collections::BTreeMap::new();
+        for (_, w, _, t) in &c_regs {
+            let e = by_tag.entry(t).or_default();
+            e.0 += 1;
+            e.1 += w;
+        }
+        eprintln!("  CONTROL (C): {} regs (kept concrete)", c_regs.len());
+        for (t, (n, b)) in &by_tag {
+            eprintln!("    {:24} {:3} regs {:4} bits", t, n, b);
+        }
+        eprintln!(
+            "  DATAPATH (D): {} regs, {} bits (predicate-abstracted)",
+            d_regs.len(),
+            bits_d
+        );
+        if !counters.is_empty() {
+            eprintln!("  counters (concrete-enumeration cost = the reachable RANGE, not 1 bit):");
+            for (nid, w, range) in &counters {
+                let note = if *range > (1 << 12) {
+                    " ⚠ WIDE — needs counter/ranking-abstraction, not concrete enumeration"
+                } else {
+                    ""
+                };
+                eprintln!("    nid={nid} width={w} range={range}{note}");
+            }
+        }
+        eprintln!(
+            "  |Reach_C| ≤ 2^{:.1}  =  tight(enum/counter) 2^{:.1} · flags(1-bit) 2^{:.1} · multibit-control 2^{:.1}",
+            bits_c, log2_tight, log2_flags, log2_multibit
+        );
+        if bits_c <= 40.0 {
+            eprintln!("     crude bound ≈ {} states", bits_c.exp2() as u128);
+        }
+        eprintln!(
+            "  mixed C-D coupling (D regs that also drive control, e.g. div r_bit): {coupled}"
+        );
+        // Concrete enumeration cost is dominated by the counter RANGES + the multibit-control regs;
+        // 1-bit flags are FSM-correlated (reachable ≪ 2^flags). A WIDE counter (range ≫ 2^12) means
+        // the control itself needs counter/ranking-abstraction — the flat 2-way split degrades.
+        let wide_counter = counters.iter().any(|(_, _, r)| *r > (1 << 12));
+        let hard_core = log2_tight + log2_multibit; // enumeration cost ignoring flag correlation
+        let verdict = if bits_c <= 20.0 {
+            "GREEN — |Reach_C| enumerable even at the crude bound ⇒ mixed-precision APPLIES cleanly"
+        } else if wide_counter {
+            "AMBER — a WIDE counter sits in the control cone: fully-concrete control is NOT small; \
+             mixed-precision needs the control ITSELF layered (concrete FSM + ranking-abstracted \
+             counter + predicate data), a 3-way split beyond the design's flat concrete-control/\
+             predicate-data. The FSM/flag skeleton may still be small — MK.1 must measure it after \
+             lifting the counters out."
+        } else if hard_core <= 20.0 {
+            "INCONCLUSIVE(cheap) — enumeration cost (counters + multibit-control) is small; the \
+             large bound is only the 1-bit-flag 2^w over-estimate (FSM-correlated, reachable ≪ 2^n) \
+             ⇒ plausibly tractable, MK.1 reachability confirms"
+        } else {
+            "RED — multibit-control state alone is large ⇒ concrete control does NOT stay small; \
+             those registers must move to D (predicated) or the split degrades to the cube"
+        };
+        eprintln!("  VERDICT: {verdict}");
+        if !multibit.is_empty() {
+            eprintln!(
+                "  multibit-control regs (the RISK — MK.1 must measure their reachable subset or move to D):"
+            );
+            for (nid, w) in &multibit {
+                eprintln!("    nid={nid} width={w}");
+            }
+        }
+    }
+
+    /// MK.0 cross-check — run the #385 recoverability-⊥ diagnosis (+ the scalable verdict) on a
+    /// lifted design, to decide whether a register-dominated ⊥ is (a) config/sequence/counter
+    /// dependent (mixed-precision's concrete-FSM does NOT help) or (b) "coarse-but-closable"
+    /// abstraction, i.e. FSM-predicate-coarseness (the one case a concrete control skeleton fixes).
+    /// `MUNUNU_PROBE_BTOR2=<file> MUNUNU_PROBE_GOOD="REG == VALUE"`.
+    #[test]
+    #[ignore = "MK.0 cross-check — set MUNUNU_PROBE_BTOR2 + MUNUNU_PROBE_GOOD"]
+    fn probe_recoverability_bot_diagnosis() {
+        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let good = std::env::var("MUNUNU_PROBE_GOOD").expect("set MUNUNU_PROBE_GOOD");
+        let content = std::fs::read_to_string(&path).expect("read btor2");
+        let verdict =
+            crate::adapter::recoverability::verify_recoverability_scalable(&content, &good, &[]);
+        let diag = crate::adapter::recoverability::diagnose_recoverability_bot(&content, &good);
+        eprintln!("=== MK.0 cross-check: recoverability ⊥ diagnosis for `AG EF ({good})` ===");
+        eprintln!("  scalable verdict: {verdict:?}");
+        eprintln!(
+            "  uncertified gating counters: {:?}",
+            diag.uncertified_counters
+        );
+        eprintln!("  wide data/config influences: {:?}", diag.wide_influences);
+        eprintln!(
+            "  is_empty (coarse-but-closable ⇒ possible FSM-coarseness): {}",
+            diag.is_empty()
+        );
+        eprintln!("  HINT: {}", diag.hint());
+        // The shipped diagnosis is SYMBOL-gated (skips unnamed regs), so on yosys lifts it misses
+        // internal counters. Re-scan the cone by NID to reveal what the symbol gate dropped.
+        if let Ok(file) = parser::parse(&content) {
+            use crate::adapter::btor2::ast::{Nid, Node};
+            use crate::adapter::btor2::dep_graph::cone_leaf_nids;
+            let atom = good.split("==").next().unwrap_or(&good).trim().to_string();
+            let leaves = cone_leaf_nids(&file, std::slice::from_ref(&atom));
+            let named: std::collections::HashMap<Nid, String> = file
+                .lines
+                .iter()
+                .filter_map(|l| match &l.node {
+                    Node::State {
+                        symbol: Some(s), ..
+                    }
+                    | Node::Op {
+                        symbol: Some(s), ..
+                    } => Some((l.nid, s.clone())),
+                    _ => None,
+                })
+                .collect();
+            eprintln!("  --- cone down-counters BY NID (bypassing the diagnosis symbol gate) ---");
+            for c in detect_down_counter(&file) {
+                if leaves.contains(&c.nid) {
+                    let nm = named.get(&c.nid).map(|s| s.as_str()).unwrap_or("<UNNAMED>");
+                    eprintln!(
+                        "    counter nid={} width={} threshold={} name={} — the diagnosis {} it",
+                        c.nid,
+                        c.width,
+                        c.threshold,
+                        nm,
+                        if named.contains_key(&c.nid) {
+                            "sees"
+                        } else {
+                            "SKIPS (unnamed)"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn detect_enum_states_finds_fsm_rejects_counter() {
         use crate::adapter::btor2::parser::parse;

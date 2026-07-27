@@ -1114,11 +1114,27 @@ pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> Recoverab
     let symbols = collect_symbols(&file);
 
     // The good's BACKWARD cone (crossing state boundaries): the named cells/inputs whose value
-    // transitively determines the recovery target.
-    let mut queue: std::collections::VecDeque<i64> = good_registers
-        .iter()
-        .filter_map(|gr| symbols.iter().find_map(|(n, s)| (s == gr).then_some(*n)))
-        .collect();
+    // transitively determines the recovery target. Resolve each good register to a seed nid — an
+    // Input/State/Op-alias (via `symbols`) OR a top-level `output` node carrying the atom. A lifted
+    // design's recovery target is commonly an `output` (e.g. i2c's `scl_padoen_o`), which
+    // `collect_symbols` does NOT index — without this fallback the cone seeds empty and the diagnosis
+    // reports "no obstacle" on exactly the lifted designs it serves. Seed from the output nid; the
+    // walk below follows `Node::Output.signal` into the driving logic.
+    let resolve_seed = |gr: &String| -> Option<i64> {
+        symbols
+            .iter()
+            .find_map(|(n, s)| (s == gr).then_some(*n))
+            .or_else(|| {
+                file.lines.iter().find_map(|l| match &l.node {
+                    Node::Output {
+                        symbol: Some(s), ..
+                    } if s == gr => Some(l.nid),
+                    _ => None,
+                })
+            })
+    };
+    let mut queue: std::collections::VecDeque<i64> =
+        good_registers.iter().filter_map(resolve_seed).collect();
     let mut cone: std::collections::HashSet<i64> = std::collections::HashSet::new();
     while let Some(nid) = queue.pop_front() {
         if !cone.insert(nid) {
@@ -1144,19 +1160,39 @@ pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> Recoverab
         }
     }
 
-    // (1) Uncertified gating down-counters in the cone (the good does not read them).
+    // (1) Uncertified gating down-counters in the cone (the good does not read them). A yosys-lifted
+    // INTERNAL counter is UNNAMED; the name-based ranking pipeline cannot reference it, so it is
+    // uncertified in practice — report it by a synthesized `nid<N>(<W>-bit)` label rather than
+    // silently dropping it. (Pre-fix the diagnosis was symbol-gated: it skipped every unnamed
+    // obstacle and reported "no structural obstacle" on exactly the real lifted designs it serves —
+    // e.g. i2c's counter-gated ⊥, whose 16-bit SCL prescaler is an unnamed internal register.)
     let counter_nids: std::collections::HashSet<i64> =
         crate::adapter::btor2::bit_blast::detect_down_counter(&file)
             .iter()
             .map(|c| c.nid)
             .collect();
     for c in crate::adapter::btor2::bit_blast::detect_down_counter(&file) {
-        if let Some(sym) = symbols.get(&c.nid)
-            && cone.contains(&c.nid)
-            && !good_registers.contains(sym)
-            && !ranking_certificate_holds(&file, std::slice::from_ref(sym), Some(c.threshold))
-        {
-            diag.uncertified_counters.push((sym.clone(), c.width));
+        if !cone.contains(&c.nid) {
+            continue;
+        }
+        match symbols.get(&c.nid) {
+            // Named: skip if the good reads it, or its descent is ranking-certified (unchanged).
+            Some(sym) => {
+                if !good_registers.contains(sym)
+                    && !ranking_certificate_holds(
+                        &file,
+                        std::slice::from_ref(sym),
+                        Some(c.threshold),
+                    )
+                {
+                    diag.uncertified_counters.push((sym.clone(), c.width));
+                }
+            }
+            // Unnamed lifted counter: unreachable by the name-based ranking pipeline ⇒ uncertified
+            // by construction — surface it by nid so the ⊥ hint is actionable on lifts.
+            None => diag
+                .uncertified_counters
+                .push((format!("nid{}({}-bit)", c.nid, c.width), c.width)),
         }
     }
 
@@ -1171,10 +1207,11 @@ pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> Recoverab
         if counter_nids.contains(nid) || enum_nids.contains(nid) {
             continue;
         }
-        let Some(sym) = symbols.get(nid) else {
-            continue;
-        };
-        if good_registers.contains(sym) {
+        // A NAMED cone register that is the good's own value is not an obstacle; an unnamed lifted
+        // register has no symbol, so it can never be the (named) good register — do not skip it.
+        if let Some(sym) = symbols.get(nid)
+            && good_registers.contains(sym)
+        {
             continue;
         }
         let sort = match file.lookup(*nid).map(|l| &l.node) {
@@ -1184,7 +1221,12 @@ pub fn diagnose_recoverability_bot(btor2_content: &str, good: &str) -> Recoverab
         if let Some(w) = crate::adapter::btor2::parser::bv_width(&file, sort)
             && w >= WIDE_MIN_WIDTH
         {
-            diag.wide_influences.push((sym.clone(), w));
+            // Named: report the symbol; unnamed lifted state: report by nid (the symbol-gate fix).
+            let label = symbols
+                .get(nid)
+                .cloned()
+                .unwrap_or_else(|| format!("nid{nid}({w}-bit)"));
+            diag.wide_influences.push((label, w));
         }
     }
 
@@ -3078,6 +3120,60 @@ mod tests {
             "narrow control-only cone: no wide influence, no uncertified counter"
         );
         assert!(diag.hint().contains("no structural obstacle"));
+    }
+
+    /// Actionable-⊥ diagnosis on a YOSYS-LIFT shape — the gating obstacles are UNNAMED internal
+    /// registers (as in i2c's `scl_padoen_o` cone: the 16-bit SCL prescaler is unnamed). Pre-fix the
+    /// diagnosis was symbol-gated and returned `is_empty()` ("coarse-but-closable") — a false negative.
+    /// The fix must localize the unnamed down-counter + unnamed wide datapath by `nid`.
+    #[test]
+    fn recoverability_bot_diagnosis_localizes_unnamed_lift_obstacles() {
+        // flag' = (cnt == 0); cnt is an UNNAMED 8-bit down-counter; data is an UNNAMED 16-bit datapath
+        // register whose value the recovery rides (flag also samples data's low bit).
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 8\n3 sort bitvec 16\n\
+4 state 1 flag\n5 state 2\n6 state 3\n\
+7 zero 1\n8 zero 2\n9 zero 3\n10 one 2\n11 one 3\n12 constd 2 200\n\
+13 init 1 4 7\n14 init 2 5 12\n15 init 3 6 9\n\
+16 eq 1 5 8\n17 slice 1 6 0 0\n18 and 1 16 17\n19 next 1 4 18\n\
+20 sub 2 5 10\n21 ite 2 16 8 20\n22 next 2 5 21\n23 add 3 6 11\n24 next 3 6 23\n";
+        let diag = diagnose_recoverability_bot(D, "flag == 1");
+        assert!(
+            !diag.is_empty(),
+            "the unnamed prescaler + datapath must be localized, not skipped by the symbol gate"
+        );
+        assert_eq!(
+            diag.uncertified_counters,
+            vec![("nid5(8-bit)".to_string(), 8)],
+            "the unnamed 8-bit down-counter is reported by nid"
+        );
+        assert_eq!(
+            diag.wide_influences,
+            vec![("nid6(16-bit)".to_string(), 16)],
+            "the unnamed 16-bit datapath the recovery rides is reported by nid"
+        );
+        assert!(diag.hint().contains("ranking certificate"));
+    }
+
+    /// Actionable-⊥ diagnosis when the recovery target is a top-level `output` (the lifted-design
+    /// shape — i2c's `scl_padoen_o`). `collect_symbols` does not index outputs, so pre-fix the cone
+    /// seeded empty and the diagnosis reported "no obstacle". The seed must resolve the output and
+    /// walk its driving logic to localize the unnamed gating counter.
+    #[test]
+    fn recoverability_bot_diagnosis_seeds_from_output_atom() {
+        // out = output(flag); flag' = (cnt == 0); cnt is an UNNAMED 8-bit down-counter.
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 8\n3 state 1 flag\n4 state 2\n\
+5 zero 1\n6 zero 2\n7 one 2\n8 constd 2 100\n9 init 1 3 5\n10 init 2 4 8\n\
+11 eq 1 4 6\n12 next 1 3 11\n13 sub 2 4 7\n14 ite 2 11 6 13\n15 next 2 4 14\n16 output 3 out\n";
+        let diag = diagnose_recoverability_bot(D, "out == 1");
+        assert!(
+            !diag.is_empty(),
+            "the output-named good must seed the cone and localize the unnamed counter"
+        );
+        assert_eq!(
+            diag.uncertified_counters,
+            vec![("nid4(8-bit)".to_string(), 8)],
+            "seeded from `output out`, the walk reaches the unnamed 8-bit down-counter"
+        );
     }
 
     // Ranking certificate — the well-founded-descent / RANKING class. A down-counter to 0: `cnt`
