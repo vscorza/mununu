@@ -3182,6 +3182,21 @@ mod tests {
                 }
                 Err(e) => eprintln!("  BDD build wall: {e}"),
             }
+            // The ALTERNATIVE tool for a wide / BDD-blowing datapath cone: PREDICATE ABSTRACTION
+            // (cube + smt-hyper-must). It has its own path (no full-state bit-blast), so it runs
+            // whether or not the exact BDD built — the "right tool vs reordering" comparison.
+            if let Ok(target) = std::env::var("MUNUNU_PROBE_GOOD") {
+                let tc = std::time::Instant::now();
+                let cube = crate::adapter::recoverability::verify_recoverability_scalable(
+                    &content,
+                    &target,
+                    &[],
+                );
+                eprintln!(
+                    "  CUBE (predicate-abstraction) AG EF ({target}): {cube:?}  [{} ms]",
+                    tc.elapsed().as_millis()
+                );
+            }
         }
     }
 
