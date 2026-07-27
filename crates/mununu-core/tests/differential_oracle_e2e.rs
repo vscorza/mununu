@@ -120,10 +120,10 @@ const BTOR2TOOLS_SUITE: &[(&str, Option<bool>)] = &[
     ("recount4.btor2", None),
     ("twocount2.btor2", None),
     ("factorial4even.btor2", None),
-    ("twocount32.btor2", None),
+    ("twocount32.btor2", None), // 65-bit (two 32-bit counters); exact abstains on the wall-clock deadline
     ("noninitstate.btor2", None), // has a `constraint` — the exact engine refuses (soundness)
-    ("twocount2c.btor2", None),   // has a `constraint`
-    ("ponylink-slaveTXlen-sat.btor2", Some(true)), // 228-bit / 320-state — over the cap
+    ("twocount2c.btor2", None), // has a `constraint`
+    ("ponylink-slaveTXlen-sat.btor2", Some(true)), // 2870 cone bits — over the cap (excluded fast)
 ];
 
 #[test]
@@ -234,7 +234,9 @@ fn native_engine_adjudication_over_btor2tools_suite() {
     for (fname, known) in BTOR2TOOLS_SUITE {
         let content = std::fs::read_to_string(root.join(fname))
             .unwrap_or_else(|e| panic!("read {fname}: {e}"));
-        // Exact BDD engine: Some(bool) reachability, or None (over-cap / free-init refusal).
+        // Exact BDD engine: Some(bool) reachability, or None — abstains on over-cap (ponylink's
+        // 2870 cone bits), free-init refusal (noninitstate), or the wall-clock deadline (the
+        // 65-bit twocount32 counter, whose 2^32-diameter fixpoint the cap can't exclude).
         let exact = exact_bad_reachable(&content).ok();
         // Native engine: in-house BMC + k-induction, bounded k=40 + a 2s per-check
         // budget (the deciding benchmarks resolve in well under it; only the 228-bit

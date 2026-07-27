@@ -335,12 +335,12 @@ mod tests {
 13 init 2 6 5
 ";
 
-    /// An 80-bit register `big` that stays 0 — `AG(big == 0)` HOLDS and is
-    /// 1-inductive. The 80-bit cone EXCEEDS the exact engine's auto-cap ceiling (64), so
+    /// A 300-bit register `big` that stays 0 — `AG(big == 0)` HOLDS and is
+    /// 1-inductive. The 300-bit cone EXCEEDS the exact engine's auto-cap ceiling (192), so
     /// the exact member abstains and only the subprocess members (btormc k-induction /
     /// Pono IC3) can decide it — the "beyond the BDD cap" value proof.
     const WIDE_STATE: &str = "\
-1 sort bitvec 80
+1 sort bitvec 300
 2 zero 1
 3 state 1 big
 4 init 1 3 2

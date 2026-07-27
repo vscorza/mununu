@@ -133,17 +133,34 @@ use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node 
 /// it is admitted automatically up to [`AUTO_CAP_CEILING`]; see [`effective_bitblast_cap`].
 const MAX_BITBLAST_BITS: u32 = 40;
 
-/// Auto-cap-management ceiling (verification-execution-planner Phase 4.6). With NO explicit
-/// `MUNUNU_BDD_MAX_BITS`, a concrete cone up to this width is admitted even though it exceeds
-/// the conservative [`MAX_BITBLAST_BITS`] default, so exact decides the CONCRETE model directly
-/// (no abstraction) instead of Skipping to the cube. This is sound now that BOTH failure modes
-/// a wider cone could hit bail deterministically: the mid-build node-budget guard
-/// ([`BddBitBlaster::node_budget`]) bounds BDD *size*, and the fixpoint iteration budget
-/// ([`fixpoint_iter_budget`], #369) bounds the `2^W`-diameter *counter* fixpoint the node guard
-/// alone misses — the exact reason the default stayed at 40 until that budget shipped. 64
-/// covers word-wide control designs (e.g. the OpenTitan i2c `AG EF ack` cone) while staying
-/// inside both guards' bounded-attempt cost; a wider cone still needs an explicit env opt-in.
-const AUTO_CAP_CEILING: u32 = 64;
+/// Auto-cap-management ceiling (verification-execution-planner Phase 4.6 / P2.5-A). With NO explicit
+/// `MUNUNU_BDD_MAX_BITS`, a concrete cone up to this width is admitted even though it exceeds the
+/// conservative [`MAX_BITBLAST_BITS`] default, so exact decides the CONCRETE model directly (no
+/// abstraction) instead of Skipping to the cube.
+///
+/// **Raised 64 → 192 (2026-07-27, P2.5-A).** The bit COUNT is a poor proxy for BDD tractability —
+/// measured, i2c's 173-bit recovery cone bit-blasts to an 11 135-node BDD and exact decides
+/// `AG EF (scl_padoen_o==1)` in 242 ms, but the old 64-bit ceiling Skipped it, leaving a ledger `⊥`
+/// (a cap ARTIFACT, not intractability). The size gates catch a large *BDD*: the mid-build
+/// node-budget guard ([`BddBitBlaster::node_budget`]) bounds node count and — since #813f505 — an
+/// arena exhaustion abstains GRACEFULLY (caught, not a crash); the fixpoint-iteration budget
+/// ([`fixpoint_iter_budget`], #369) bounds the `2^W`-diameter counter fixpoint.
+///
+/// **Why 192, and why the cap alone is NOT the safety guard.** Those two size/count gates do NOT
+/// bound wall-clock TIME. A deep FREE COUNTER (`twocount32` — two 32-bit counters, 2^32 fixpoint
+/// diameter) has a TINY BDD (never trips the node budget) but its EF fixpoint grinds ~1M cheap
+/// preimages ≈ 132 min before the iteration budget bails it. And the bit COUNT cannot exclude it:
+/// `twocount32`'s cone is 65 bits < i2c's 173, so ANY cap that admits the control cap-artifacts
+/// admits the counter too. (Admission is on the cone-bit SUM, not a sort width: the raw-228-bit
+/// `ponylink-slaveTXlen-sat` sums to 2870 cone bits and is excluded at EVERY cap — it is never the
+/// boundary; the actual hanger is the 65-bit counter.) So the cap can NOT be the tractability gate
+/// — the [`ExactModel::deadline`] wall-clock backstop is. 192 is chosen only to admit the measured
+/// control cap-artifacts (i2c's 173-bit cone) with modest headroom while keeping the auto-allocated
+/// arena bounded; a cone > 192 still needs an explicit `MUNUNU_BDD_MAX_BITS` opt-in (clamped to
+/// [`HARD_BITBLAST_CEILING`] = 1024). The residual — a single pathological in-op `apply_exists`
+/// (uninterruptible in-process; the BDD-blowup form is caught by the node budget) — needs a thread
+/// + `recv_timeout` to bound (P2.5-A-follow).
+const AUTO_CAP_CEILING: u32 = 192;
 
 /// Absolute ceiling the `MUNUNU_BDD_MAX_BITS` override is clamped to — bounds the largest
 /// arena we will allocate regardless of the env value. Raised 256 → 1024 (2026-07-27): measured
@@ -1726,12 +1743,33 @@ pub struct ExactModel {
     /// Fixpoint ITERATION budget — the total μ/ν fixpoint iterations across one
     /// [`ExactModel::evaluate`]. A wide FREE COUNTER has a small BDD (so the node-budget
     /// guard never fires) but a `2^W`-step (reachable-diameter) fixpoint; this bails it to
-    /// a clean `Err` (→ Skipped) DETERMINISTICALLY (machine-independent, unlike a wall clock).
+    /// a clean `Err` (→ Skipped) DETERMINISTICALLY (machine-independent). It bounds the
+    /// iteration COUNT, not wall-clock TIME: at ~ms per cheap preimage, reaching the ~1M
+    /// default takes MINUTES — so [`deadline`](Self::deadline) is the time backstop beside it.
     /// The other blowup mode — a large BDD — is caught by the node-budget guard + catch_unwind.
     iter_budget: usize,
     /// Running total of fixpoint iterations. Interior-mutable because `evaluate` / `fixpoint`
     /// take `&self`; the exact eval is single-threaded per call.
     iters: std::cell::Cell<usize>,
+    /// Wall-clock backstop DEADLINE (`Instant::now()` + [`exact_time_budget`]), SAMPLED every 256
+    /// iterations in [`Self::fixpoint`] BESIDE [`iter_budget`](Self::iter_budget) (so a fast
+    /// control fixpoint never reads the clock). `None` = no time bound (pure determinism, for
+    /// tests via `MUNUNU_BDD_TIME_BUDGET_MS=0`).
+    ///
+    /// **Why a wall clock despite the iteration budget's determinism.** The iteration budget
+    /// bounds COUNT; a deep free-counter (`twocount32` — two 32-bit counters, ~2^32 diameter)
+    /// reaches it only after ~132 min of individually-cheap preimages, and no bit-COUNT cap can
+    /// exclude it without also excluding the tractable wide-CONTROL cones the P2.5-A cap-raise
+    /// exists to admit (i2c's 173-bit cone decides in 242 ms; twocount32's 65 bits < i2c's 173).
+    /// So the cap cannot separate them and this deadline must. It is a SECONDARY guard: it only
+    /// fires for a design the deterministic budgets abstain on ANYWAY, bounding how LONG the
+    /// abstain takes, not WHETHER it happens — so a non-pathological verdict (which finishes far
+    /// under it) stays machine-independent. Abstain is always sound (never a fabricated verdict),
+    /// so a machine-dependent abstain BOUNDARY is a robustness, not a soundness, property. The
+    /// interruptible unit is one fixpoint iteration; a single pathological in-op `apply_exists`
+    /// (not observed in-corpus — the BDD-blowup form is caught by the node budget) is the residual
+    /// gap a thread + `recv_timeout` would close (P2.5-A-follow).
+    deadline: Option<std::time::Instant>,
 }
 
 /// The exact-engine fixpoint iteration budget: `MUNUNU_BDD_ITER_BUDGET` or a default sized to
@@ -1741,6 +1779,19 @@ fn fixpoint_iter_budget() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1 << 20) // ~1M iterations; a counter's steps are cheap (small BDD) so this is fast to reach
+}
+
+/// The exact-engine WALL-CLOCK backstop: `MUNUNU_BDD_TIME_BUDGET_MS` or a default. See
+/// [`ExactModel::deadline`] for why this exists beside the deterministic iteration budget. `0`
+/// disables it (returns `None` ⇒ no time bound, for tests wanting pure determinism). The default
+/// (10 s) is ~40× i2c's measured 242 ms — generous for any tractable control cone — while cutting a
+/// deep-counter abstain from the iteration budget's ~minutes down to seconds.
+fn exact_time_budget() -> Option<std::time::Duration> {
+    let ms = std::env::var("MUNUNU_BDD_TIME_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10_000);
+    (ms != 0).then(|| std::time::Duration::from_millis(ms))
 }
 
 impl BddBitBlaster {
@@ -1781,6 +1832,7 @@ impl BddBitBlaster {
             ff: self.ff.clone(),
             iter_budget: fixpoint_iter_budget(),
             iters: std::cell::Cell::new(0),
+            deadline: exact_time_budget().map(|d| std::time::Instant::now() + d),
         }
     }
 
@@ -2025,6 +2077,24 @@ impl ExactModel {
                     "symbolic bit-blaster: fixpoint iteration budget exceeded ({n} > {}) — the \
                      property's reachable diameter is too large to bit-blast; use `--engine explicit`",
                     self.iter_budget
+                ));
+            }
+            // Wall-clock backstop beside the count budget — bail a deep-counter fixpoint (whose
+            // cheap-but-many preimages reach `iter_budget` only after minutes) in seconds. The
+            // per-iteration preimage is the interruptible unit; the `Instant::now()` read is
+            // SAMPLED every `TIME_CHECK_STRIDE` iterations, not every one, so a fast control
+            // fixpoint (converges in < a stride) never touches the clock — zero overhead on the
+            // common path, ~stride×per-iter granularity on a deep loop. See [`Self::deadline`] for
+            // why a wall clock is sound here despite the count budget.
+            const TIME_CHECK_STRIDE: usize = 256;
+            if n.is_multiple_of(TIME_CHECK_STRIDE)
+                && let Some(dl) = self.deadline
+                && std::time::Instant::now() > dl
+            {
+                return Err(format!(
+                    "symbolic bit-blaster: exact time budget exceeded (fixpoint still iterating at \
+                     {n} steps) — the property's reachable diameter is too large to bit-blast in \
+                     the wall-clock budget; use `--engine explicit`"
                 ));
             }
             bindings.insert(var, x.clone());
@@ -4610,16 +4680,16 @@ mod tests {
     /// `Err` (which `verify_auto`'s exact branch maps to a `Skipped` property, per
     /// `e2e_sysrst`-style graceful degradation). This locks that OoM-safety
     /// guarantee for the exact path as a fast, non-docker regression. The fixture is
-    /// 80-bit — over the [`AUTO_CAP_CEILING`] (64) the no-env auto-cap will admit,
-    /// so it still degrades. (The 41–64-bit admit path is covered by
+    /// 300-bit — over the [`AUTO_CAP_CEILING`] (192) the no-env auto-cap will admit,
+    /// so it still degrades. (The 41–192-bit admit path is covered by
     /// `auto_cap_admits_modestly_wide_concrete_cone`.)
     #[test]
     fn d1_7_exact_verdict_over_bit_cap_degrades_gracefully() {
-        // One 80-bit register (80 > AUTO_CAP_CEILING = 64), no inputs. The formula is
+        // One 300-bit register (300 > AUTO_CAP_CEILING = 192), no inputs. The formula is
         // immaterial: the cap fires in `build`, before atom resolution or fixpoint
         // evaluation, so a caller degrades to Skipped rather than OoM.
         const WIDE_BTOR2: &str = r#"
-1 sort bitvec 80
+1 sort bitvec 300
 2 sort bitvec 1
 3 state 1 wide
 4 one 1
@@ -4628,9 +4698,9 @@ mod tests {
 "#;
         let formula = crate::mu_calculus::parser::parse("(wide == 0)").expect("formula parses");
         let err = exact_symbolic_verdict(WIDE_BTOR2, &formula)
-            .expect_err("80-bit design exceeds the auto-cap ceiling (64) → clean Err");
+            .expect_err("300-bit design exceeds the auto-cap ceiling (192) → clean Err");
         assert!(
-            err.contains("register+input bits") && err.contains("80"),
+            err.contains("register+input bits") && err.contains("300"),
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
         );
@@ -4638,7 +4708,7 @@ mod tests {
 
     /// Auto-cap-management (verification-execution-planner Phase 4.6) — with NO explicit
     /// `MUNUNU_BDD_MAX_BITS`, a concrete cone that modestly exceeds the conservative 40-bit
-    /// default is admitted up to [`AUTO_CAP_CEILING`] (64), so exact decides the CONCRETE model
+    /// default is admitted up to [`AUTO_CAP_CEILING`] (192), so exact decides the CONCRETE model
     /// directly instead of Skipping. Locks (a) the pure `default_cap_for_cone` thresholds and
     /// (b) that a 48-bit concrete cone — which the old 40-bit default rejected (see `d1_7`,
     /// which used exactly this width before the ceiling shipped) — now DECIDES. No env mutation:
@@ -4646,20 +4716,27 @@ mod tests {
     /// in the environment the assertion is skipped rather than falsely failing.
     #[test]
     fn auto_cap_admits_modestly_wide_concrete_cone() {
-        // Pure threshold math (no env, no BDD): the default floor is never lowered; a 41–64-bit
-        // cone raises the cap to fit; a > 64-bit cone is clamped to the ceiling (⇒ Err upstream).
+        // Pure threshold math (no env, no BDD): the default floor is never lowered; a 41–192-bit
+        // cone raises the cap to fit; a > 192-bit cone is clamped to the ceiling (⇒ Err upstream).
         assert_eq!(default_cap_for_cone(8), 40, "≤ floor ⇒ the 40-bit floor");
         assert_eq!(default_cap_for_cone(40), 40, "exactly the floor");
         assert_eq!(
             default_cap_for_cone(48),
             48,
-            "41–64 ⇒ raised to fit the cone"
+            "41–192 ⇒ raised to fit the cone"
         );
-        assert_eq!(default_cap_for_cone(64), 64, "exactly the ceiling");
         assert_eq!(
-            default_cap_for_cone(80),
-            64,
-            "> ceiling ⇒ clamped (build then Errs)"
+            default_cap_for_cone(173),
+            173,
+            "i2c's control cone ⇒ admitted (P2.5-A)"
+        );
+        assert_eq!(default_cap_for_cone(192), 192, "exactly the ceiling");
+        assert_eq!(
+            default_cap_for_cone(300),
+            192,
+            "> ceiling ⇒ clamped (build then Errs). NB the cap is NOT the tractability gate — a \
+             deep counter (twocount32, 65-bit cone < i2c's 173) is admitted and bounded by the \
+             wall-clock deadline, not the cap; see AUTO_CAP_CEILING + ExactModel::deadline",
         );
 
         // End-to-end: a 48-bit counter cone the old default Skipped now bit-blasts and decides.
@@ -4715,10 +4792,10 @@ mod tests {
 
     /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
     /// small even though the FULL design is over the cap. `fsm` (2-bit) cycles 1→2→3→0→…; `wide`
-    /// (70-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (72 >
-    /// the 64-bit auto-cap ceiling), but `exact_symbolic_verdict` restricts to the cone of
+    /// (300-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (302 >
+    /// the 192-bit auto-cap ceiling), but `exact_symbolic_verdict` restricts to the cone of
     /// `fsm == 0` = {fsm} (pinning `wide` to a constant) and DECIDES `EF (fsm == 0)` = Holds.
-    /// `wide` is 70-bit (not 45) so the full design exceeds the auto-cap ceiling — COI, not the
+    /// `wide` is 300-bit so the full design exceeds the auto-cap ceiling — COI, not the
     /// auto-raise, is what makes this decidable. Locks that (a) COI is wired into the exact path,
     /// and (b) pinning the out-of-cone datapath is verdict-preserving — the whole point of
     /// R-F5.6, as a fast non-docker regression.
@@ -4726,7 +4803,7 @@ mod tests {
     fn rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath() {
         const FSM_PLUS_WIDE_CTR: &str = r#"
 1 sort bitvec 2
-2 sort bitvec 70
+2 sort bitvec 300
 3 state 1 fsm
 4 one 1
 5 add 1 3 4
@@ -4738,12 +4815,12 @@ mod tests {
 11 add 2 9 10
 12 next 2 9 11
 "#;
-        // The full design is 2 + 70 = 72 bits — over the 64-bit auto-cap ceiling.
+        // The full design is 2 + 300 = 302 bits — over the 192-bit auto-cap ceiling.
         let file = parser::parse(FSM_PLUS_WIDE_CTR).expect("parse");
         let full_err = BddBitBlaster::build(&file).err();
         assert!(
-            full_err.as_ref().is_some_and(|e| e.contains("72")),
-            "full 72-bit build must still hit the cap; got {full_err:?}",
+            full_err.as_ref().is_some_and(|e| e.contains("302")),
+            "full 302-bit build must still hit the cap; got {full_err:?}",
         );
         // The exact verdict restricts to the {fsm} cone (2 bits), pinning `wide` → decidable.
         // `fsm` inits to 1 and cycles to 0, so `EF (fsm == 0)` holds from the initial state.
