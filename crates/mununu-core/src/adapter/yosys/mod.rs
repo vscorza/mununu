@@ -37,6 +37,7 @@
 
 /// R-MM (KMTS multi-module composition) — netlist-driven driver.
 pub mod multi_module;
+pub mod source_manifest;
 
 use crate::adapter::{
     AdapterError, AdapterErrorKind, AdapterOptions, AdapterOutput, FormatAdapter, SourceFormat,

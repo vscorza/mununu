@@ -1705,9 +1705,24 @@ struct SvVerifyAutoArgs {
 /// `verify-liveness` / `verify-recoverability`).
 #[derive(Args, Debug)]
 struct SvLiftArgs {
-    /// Primary SystemVerilog source file (.sv / .v).
-    #[arg(value_name = "SV_FILE")]
-    file: PathBuf,
+    /// Primary SystemVerilog source file (.sv / .v). Omit when using `--design-dir`.
+    #[arg(value_name = "SV_FILE", required_unless_present = "design_dir")]
+    file: Option<PathBuf>,
+    /// E6 — auto-assemble a multi-file design from a directory: discover every
+    /// `.v`/`.sv` under DIR (skipping `mutations`/`buggy`/`tb` subtrees), work out
+    /// the compilation units, the include-search dirs, and the top module
+    /// (declared-minus-instantiated), so a multi-file design lifts WITHOUT hand-
+    /// assembling `--source`/`--include-dir`/`--top`. An explicit `--top` overrides
+    /// the detected one; `--include-dir` adds to the detected dirs. Mutually
+    /// exclusive with the positional `SV_FILE`.
+    ///
+    /// surface: CLI-only — E6's on-disk directory scan + auto-assembly is a
+    /// filesystem convenience; the API/UI accept sources by name (the caller
+    /// stages them), so a directory scan has no analog there. The assembly core
+    /// (`yosys::source_manifest::assemble_sv_design`) is content-based and could
+    /// back a future API auto-top enhancement.
+    #[arg(long = "design-dir", value_name = "DIR", conflicts_with = "file")]
+    design_dir: Option<PathBuf>,
     /// Additional SV sources (packages, `include` targets), staged alongside the
     /// primary input. Repeatable.
     #[arg(long = "source", value_name = "FILE")]
@@ -5141,8 +5156,38 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
 
 /// Read the primary + additional SV sources named by `args` into a core `SvLift`.
 fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::SvLift, String> {
-    let source = std::fs::read_to_string(&args.file)
-        .map_err(|e| format!("Failed to read SV '{}': {e}", args.file.display()))?;
+    // E6 — `--design-dir`: discover + auto-assemble a multi-file design.
+    if let Some(dir) = &args.design_dir {
+        use mununu_core::adapter::yosys::source_manifest;
+        let files = source_manifest::discover_sv_files(dir)?;
+        let design_name = dir.file_name().and_then(|s| s.to_str());
+        let a = source_manifest::assemble_sv_design(&files, design_name);
+        for note in &a.notes {
+            eprintln!("design-dir: {note}");
+        }
+        // explicit --top overrides the detected top; --include-dir adds to detected dirs.
+        let top = args.top.clone().or(a.top);
+        let include_dirs = args
+            .include_dirs
+            .iter()
+            .cloned()
+            .chain(a.include_dirs)
+            .collect();
+        return Ok(mununu_core::adapter::sv_verify::SvLift {
+            source: a.primary.1,
+            additional_sources: a.additional,
+            top,
+            use_sv2v: args.preprocess_sv2v,
+            include_dirs,
+            frontend: args.frontend.into(),
+        });
+    }
+    let file = args
+        .file
+        .as_ref()
+        .ok_or_else(|| "provide a primary SV_FILE or --design-dir".to_string())?;
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| format!("Failed to read SV '{}': {e}", file.display()))?;
     let mut additional_sources = Vec::new();
     for p in &args.sources {
         let content = std::fs::read_to_string(p)
@@ -5164,12 +5209,24 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
     })
 }
 
+impl SvLiftArgs {
+    /// Display name for the primary input — the file path, or the assembled
+    /// design directory when `--design-dir` is used.
+    fn primary_display(&self) -> String {
+        match (&self.file, &self.design_dir) {
+            (Some(f), _) => f.display().to_string(),
+            (None, Some(d)) => format!("{} (design-dir)", d.display()),
+            (None, None) => "<none>".to_string(),
+        }
+    }
+}
+
 /// `mununu sv verify` — lift SV and decide `bad`-reachability with the portfolio.
 fn sv_verify(args: SvVerifyArgs) -> Result<(), String> {
     use mununu_core::adapter::sv_verify::sv_verify_safety;
     use mununu_core::verdict::PropertyVerdict;
 
-    let file = args.lift.file.display().to_string();
+    let file = args.lift.primary_display();
     let outcome = sv_verify_safety(&read_sv_lift(&args.lift)?)?;
     let summary = serde_json::json!({
         "file": file,
@@ -5192,7 +5249,7 @@ fn sv_verify_liveness(args: SvVerifyLivenessArgs) -> Result<(), String> {
     use mununu_core::adapter::sv_verify::sv_verify_liveness as core_sv_verify_liveness;
     use mununu_core::verdict::PropertyVerdict;
 
-    let file = args.lift.file.display().to_string();
+    let file = args.lift.primary_display();
     let (verdict, outcome) =
         core_sv_verify_liveness(&read_sv_lift(&args.lift)?, &args.request, &args.grant)?;
     let summary = serde_json::json!({
@@ -5215,7 +5272,7 @@ fn sv_verify_liveness_all(args: SvVerifyLivenessAllArgs) -> Result<(), String> {
     use mununu_core::adapter::sv_verify::sv_verify_liveness_all as core_sv_verify_liveness_all;
     use mununu_core::verdict::PropertyVerdict;
 
-    let file = args.lift.file.display().to_string();
+    let file = args.lift.primary_display();
     let (verdict, outcomes) =
         core_sv_verify_liveness_all(&read_sv_lift(&args.lift)?, &args.responses)?;
     let summary = serde_json::json!({
@@ -5236,7 +5293,7 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
     };
     use mununu_core::adapter::sv_verify::sv_verify_recoverability_with_predicates;
 
-    let file = args.lift.file.display().to_string();
+    let file = args.lift.primary_display();
     let extra = args
         .predicate
         .iter()
@@ -5260,7 +5317,7 @@ fn sv_check_fsm(args: SvCheckFsmArgs) -> Result<(), String> {
     use mununu_core::adapter::sv_verify::sv_check_fsm as core_sv_check_fsm;
     use mununu_core::verdict::PropertyVerdict;
 
-    let file = args.lift.file.display().to_string();
+    let file = args.lift.primary_display();
     let findings = core_sv_check_fsm(&read_sv_lift(&args.lift)?, args.max_width)?;
 
     let registers: Vec<serde_json::Value> = findings
