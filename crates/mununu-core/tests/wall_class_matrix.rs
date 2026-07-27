@@ -428,7 +428,6 @@ fn wall_class_matrix() {
     let mut soundness_violations = Vec::new();
     let mut craig_unique = Vec::new();
     let mut combined_fullspace = Vec::new(); // ⊥-singletons → combined decides with NO pins (transfers)
-    let mut combined_scoped = Vec::new(); // ⊥-singletons → combined decides but pins applied (scoped)
 
     let mut rtl_classes = std::collections::BTreeSet::new();
     let mut synthetic_classes = std::collections::BTreeSet::new();
@@ -456,15 +455,11 @@ fn wall_class_matrix() {
             &[],
             PredicateSource::CraigInterpolation,
         );
-        // The COMPOSED plan (config-pin + exact + cube + ranking + guard + Craig) — the whole
-        // point of a planner: a lever that is 0 alone can contribute in combination. A HOLDS with
-        // pins applied is SCOPED to that configuration (marked `*`).
-        let (combined, pins) = solve_recoverability_combined(&model, c.target);
-        let comb_str = if pins.is_empty() {
-            v(&combined).to_string()
-        } else {
-            format!("{}*", v(&combined).trim())
-        };
+        // The COMPOSED plan (exact-first + cube + ranking + guard + Craig) — the whole point of a
+        // planner: a lever that is 0 alone can contribute in combination. It runs only SOUND,
+        // transferable levers (the earlier unsound auto-input-pinning was removed — see
+        // `solve_recoverability_combined`), so its verdict is full-space and oracle-comparable.
+        let combined = solve_recoverability_combined(&model, c.target);
         println!(
             "{:32} {:26} {:>6} {:>6} {:>6} {:>7}",
             c.name,
@@ -472,11 +467,18 @@ fn wall_class_matrix() {
             v(&dflt),
             v(&wp),
             v(&craig),
-            comb_str
+            v(&combined)
         );
 
-        // SOUNDNESS invariant — no lever may contradict the oracle.
-        for (lever, r) in [("default", &dflt), ("cube-wp", &wp), ("cube-craig", &craig)] {
+        // SOUNDNESS invariant — no lever may contradict the oracle. The `combined` plan is included:
+        // it now returns only full-space, transferable verdicts, so a contradiction would be a real
+        // composition-soundness bug (the gap the removed input-pinning previously hid).
+        for (lever, r) in [
+            ("default", &dflt),
+            ("cube-wp", &wp),
+            ("cube-craig", &craig),
+            ("combined", &combined),
+        ] {
             let bad = match c.oracle {
                 Oracle::Holds => is_viol(r),
                 Oracle::Violated => is_holds(r),
@@ -512,10 +514,9 @@ fn wall_class_matrix() {
         }
 
         // The COMBINE-MECHANISMS hypothesis: a case EVERY singleton leaves ⊥ that the composed
-        // plan DECIDES. Split by soundness — a decision reached with NO pins is a genuine
-        // FULL-SPACE win (transfers); one reached WITH config-pins is SCOPED: recoverability
-        // (AG EF) is not monotone under input-restriction, so a config-pinned verdict answers only
-        // "recoverable under held inputs" and does NOT transfer to the full space.
+        // plan DECIDES — a genuine FULL-SPACE combination win (transfers). The composed plan now
+        // runs only SOUND, transferable levers (no unsound input-pinning), so any decision it
+        // reaches is full-space and oracle-comparable.
         let all_singletons_bottom = [&dflt, &wp, &craig]
             .iter()
             .all(|r| matches!(r, Ok(PropertyVerdict::Unknown)));
@@ -524,11 +525,7 @@ fn wall_class_matrix() {
             Ok(PropertyVerdict::Holds | PropertyVerdict::Violated)
         );
         if all_singletons_bottom && combined_decides {
-            if pins.is_empty() {
-                combined_fullspace.push(c.name);
-            } else {
-                combined_scoped.push(c.name);
-            }
+            combined_fullspace.push(c.name);
         }
     }
 
@@ -538,22 +535,25 @@ fn wall_class_matrix() {
         "SOUNDNESS VIOLATIONS (a lever contradicted the oracle): {soundness_violations:?}"
     );
 
-    // The COMBINE-MECHANISMS hypothesis (the planner's raison d'être) — measured, not assumed,
-    // split by what actually TRANSFERS. A `*` in the table = the combined verdict is config-scoped.
+    // The COMBINE-MECHANISMS hypothesis (the planner's raison d'être) — measured, not assumed. The
+    // composed plan is the union of its SOUND component levers (exact-first ∪ scalable-cube), so a
+    // win here is a case every singleton leaves ⊥ that their sound composition decides + TRANSFERS.
     if combined_fullspace.is_empty() {
         println!(
-            "MEASURED: no genuine FULL-SPACE combination win on this set. The composed plan's only \
-             ⊥→decided cases are config-SCOPED (pins applied): {combined_scoped:?} — a valid but \
-             weaker 'recoverable under held inputs' sub-question that does NOT transfer (AG EF is \
-             not monotone under input-restriction; pinning `go`/`start`=0 hides the trap). The \
-             sound verdict-PRESERVING shrinkers (F1/F2/COI) save ~0 on the data-dependent ⊥, so \
-             composition adds no full-space decision here. Combination stays the right DEFAULT; \
-             this set simply has no combination-only full-space-decidable case yet."
+            "MEASURED: no genuine FULL-SPACE combination win on this set. Among the SOUND, \
+             transferable levers the composed plan is the union of exact-first and the scalable-cube \
+             path (cube+ranking+guard+Craig): every case is decided by a single sound lever, so \
+             composition adds only union COVERAGE, no synergy. (The earlier apparent 'win' — \
+             `staller` HOLDS* / `trap_uf_w48` HOLDS* — was the removed UNSOUND auto-input-pinning \
+             producing non-transferable scoped verdicts; AG EF is not monotone under \
+             input-restriction, so those never transferred.) Combination stays the right DEFAULT for \
+             COVERAGE + the soundness cross-check (exact corroborating/overturning cube); it is not a \
+             new decidability lever on this set."
         );
     } else {
         println!(
-            "COMBINATION WIN (full-space, transfers — decided with no pins where every singleton \
-             was ⊥): {combined_fullspace:?}   [config-scoped-only: {combined_scoped:?}]"
+            "COMBINATION WIN (full-space, transfers — every singleton was ⊥, the sound composition \
+             decided): {combined_fullspace:?}"
         );
     }
 
