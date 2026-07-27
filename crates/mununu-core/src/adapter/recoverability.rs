@@ -2428,14 +2428,14 @@ mod tests {
     // st's cone-of-influence → the exact engine over-caps. busy ALWAYS returns to idle,
     // so every reachable state can reach idle ⇒ AG EF (st==0) HOLDS.
     //
-    // Width note: this MUST exceed AUTO_CAP_CEILING (64), not just the 40-bit floor. For an
-    // `AG EF (control-target)` property the EF-reachability fixpoint converges in ~2 iterations
-    // regardless of the counter's width (a free-running counter never *blocks* reaching idle),
-    // so the fixpoint iteration budget never fires — only the bit cap does. At ≤ 64 bits the
-    // auto-cap would admit the cone and exact would DECIDE (a win), defeating the "exact
-    // abstains" premise this test needs.
+    // Width note: this MUST exceed AUTO_CAP_CEILING (192, raised from 64 in P2.5-A), not just the
+    // 40-bit floor. For an `AG EF (control-target)` property the EF-reachability fixpoint converges
+    // in ~2 iterations regardless of the counter's width (a free-running counter never *blocks*
+    // reaching idle), so the fixpoint iteration budget never fires — only the bit cap does. At
+    // ≤ 192 bits the auto-cap would admit the cone and exact would DECIDE (a win), defeating the
+    // "exact abstains" premise this test needs.
     const WIDE_RECOVERABLE: &str = "\
-1 sort bitvec 80
+1 sort bitvec 300
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt
@@ -2454,12 +2454,12 @@ mod tests {
 17 next 2 9 16
 ";
 
-    // Same 80-bit counter (over the 64-bit auto-cap ceiling, per WIDE_RECOVERABLE's width note)
+    // Same 300-bit counter (over the 192-bit auto-cap ceiling, per WIDE_RECOVERABLE's width note)
     // but st's next-state is `stuck (2)` UNCONDITIONALLY — the `ite(cnt==0, 2, 2)` keeps the
     // counter syntactically in st's cone (so the exact engine over-caps) while every state moves
     // to the absorbing trap. From `stuck`, idle is unreachable ⇒ AG EF (st==0) VIOLATED.
     const WIDE_TRAP: &str = "\
-1 sort bitvec 80
+1 sort bitvec 300
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt

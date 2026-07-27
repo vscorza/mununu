@@ -481,10 +481,10 @@ mod tests {
 
     #[test]
     fn skip_note_register_dominated_says_config_value_cannot_help() {
-        // A 70-bit self-incrementing register: the property cone is 70 bits, ALL register
-        // (no in-cone inputs), so residual = 70 > the 64-bit cap — pinning inputs can't help.
+        // A 300-bit self-incrementing register: the property cone is 300 bits, ALL register
+        // (no in-cone inputs), so residual = 300 > the 192-bit cap — pinning inputs can't help.
         let btor2 = "\
-1 sort bitvec 70
+1 sort bitvec 300
 2 sort bitvec 1
 3 state 1 big
 4 one 1
@@ -513,10 +513,10 @@ mod tests {
 
     #[test]
     fn skip_note_input_inflated_points_at_config_value() {
-        // A 70-bit INPUT feeding a 1-bit register: cone = 71 (1 register + 70 input), so
-        // residual = 1 ≤ the 64-bit cap — pinning the input via --config-value decides it.
+        // A 300-bit INPUT feeding a 1-bit register: cone = 301 (1 register + 300 input), so
+        // residual = 1 ≤ the 192-bit cap — pinning the input via --config-value decides it.
         let btor2 = "\
-1 sort bitvec 70
+1 sort bitvec 300
 2 sort bitvec 1
 3 input 1 wide
 4 state 2 flag

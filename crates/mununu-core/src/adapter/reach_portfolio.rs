@@ -733,12 +733,12 @@ mod tests {
 
     #[test]
     fn native_engine_decides_beyond_the_exact_cap_in_portfolio() {
-        // An 80-bit register that stays 0, `bad = (big != 0)`: SAFE, but the 80-bit
-        // cone is over the exact engine's auto-cap ceiling (64). With no btormc/pono on
+        // An 300-bit register that stays 0, `bad = (big != 0)`: SAFE, but the 300-bit
+        // cone is over the exact engine's auto-cap ceiling (192). With no btormc/pono on
         // PATH and the exact engine abstaining, the portfolio would previously be
         // Unknown; the in-house native engine (k-induction) now proves it
         // Unreachable — the scale win, in-process, no subprocess.
-        const WIDE_SAFE: &str = "1 sort bitvec 80\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
+        const WIDE_SAFE: &str = "1 sort bitvec 300\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
                                  5 next 1 3 3\n6 sort bitvec 1\n7 neq 6 3 2\n8 bad 7\n";
         let file = parser::parse(WIDE_SAFE).expect("parse");
         let out = decide_reach_portfolio(&file);
@@ -749,21 +749,21 @@ mod tests {
         );
         assert!(
             !out.unreachable_by.contains(&"exact"),
-            "the exact engine must abstain on the over-cap 80-bit design: {out:?}"
+            "the exact engine must abstain on the over-cap 300-bit design: {out:?}"
         );
     }
 
     #[test]
     fn spacer_decides_beyond_native_k_induction_in_portfolio() {
-        // An 80-bit counter that STALLS at 0 (init 0, next = (c==0)?0:c+1), bad = (c==MAX).
+        // An 300-bit counter that STALLS at 0 (init 0, next = (c==0)?0:c+1), bad = (c==MAX).
         // Reachable set is {0} ⇒ SAFE, but:
-        //   - the exact BDD engine abstains (80-bit > its auto-cap ceiling of 64);
+        //   - the exact BDD engine abstains (300-bit > its auto-cap ceiling of 192);
         //   - native k-induction abstains — the property is not provable by *simple*
         //     k-induction: an unreachable free path MAX-k → … → MAX stays ¬bad until
         //     the last step at every depth, so it never closes below depth 2^80-1.
         // Only SPACER's invariant discovery (`c == 0`) decides it, so the portfolio
         // verdict is carried uniquely by "spacer". (btormc/pono absent in make-ci.)
-        const WIDE_STALL: &str = "1 sort bitvec 80\n2 zero 1\n3 one 1\n4 state 1 c\n5 init 1 4 2\n\
+        const WIDE_STALL: &str = "1 sort bitvec 300\n2 zero 1\n3 one 1\n4 state 1 c\n5 init 1 4 2\n\
              6 sort bitvec 1\n7 eq 6 4 2\n8 add 1 4 3\n9 ite 1 7 2 8\n\
              10 next 1 4 9\n11 ones 1\n12 eq 6 4 11\n13 bad 12\n";
         let file = parser::parse(WIDE_STALL).expect("parse");
@@ -779,7 +779,7 @@ mod tests {
         );
         assert!(
             !out.unreachable_by.contains(&"exact"),
-            "the exact engine must abstain on the over-cap 80-bit design: {out:?}"
+            "the exact engine must abstain on the over-cap 300-bit design: {out:?}"
         );
     }
 

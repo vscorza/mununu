@@ -96,7 +96,7 @@ const STALLER: &str = "\
 ";
 
 const WIDE_RECOVERABLE: &str = "\
-1 sort bitvec 80
+1 sort bitvec 300
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt
@@ -116,7 +116,7 @@ const WIDE_RECOVERABLE: &str = "\
 ";
 
 const WIDE_TRAP: &str = "\
-1 sort bitvec 80
+1 sort bitvec 300
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt
