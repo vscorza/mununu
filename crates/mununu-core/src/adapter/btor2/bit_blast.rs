@@ -7063,6 +7063,250 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT — control-automaton state/transition scaling (synthetic, explicit BFS; no
+    /// invented numbers). A synchronous controller's Kripke automaton has one STATE per register
+    /// valuation, so worst-case |S| = 2^W for W total register bits (the per-state VALUATION width);
+    /// TRANSITIONS are δ(s, input)→s' — worst-case |δ| = |S|·2^I explicit edges. The automaton is
+    /// never explicitly built: verification runs symbolic BDD fixpoints over the transition DAG.
+    /// This probe MEASURES the *reachable* |S| and |δ| of the canonical protocol-controller control
+    /// shape — a K-bit prescale counter driving an N-state FSM — to show how each register/counter
+    /// parameter drives the size (a COUNTER dimension is tight: 2^K reachable; an FSM dimension is
+    /// its state count N, independent of its bit-encoding width).
+    #[test]
+    #[ignore = "measurement — synthetic control-automaton scaling (explicit BFS)"]
+    fn measure_control_automaton_scaling() {
+        use std::collections::{HashSet, VecDeque};
+
+        // (1) An ISOLATED K-bit reloading down-counter (free-running): cnt' = (cnt==0)?MAX:cnt-1.
+        // MEASURE its reachable-state count by BFS — the empirical basis for "a counter reaches all
+        // 2^K values" (so its contribution to |S| is TIGHT: measured == worst-case).
+        fn counter_reach(k: u32) -> u64 {
+            let max = (1u64 << k) - 1;
+            let mut seen = HashSet::new();
+            let mut q = VecDeque::new();
+            seen.insert(max);
+            q.push_back(max);
+            while let Some(c) = q.pop_front() {
+                let nc = if c == 0 { max } else { c - 1 };
+                if seen.insert(nc) {
+                    q.push_back(nc);
+                }
+            }
+            seen.len() as u64
+        }
+        eprintln!("=== (1) isolated K-bit reloading down-counter — MEASURED reachable states ===");
+        eprintln!(
+            "  {:>3} {:>14} {:>16}",
+            "K", "2^K (worst)", "measured |reach|"
+        );
+        for k in [4u32, 8, 12, 16, 20] {
+            let m = counter_reach(k);
+            eprintln!("  {:>3} {:>14} {:>16}", k, 1u64 << k, m);
+            assert_eq!(
+                m,
+                1u64 << k,
+                "a reloading K-bit counter reaches EXACTLY its 2^K values"
+            );
+        }
+
+        // (2) The canonical control shape: a K-bit prescaler driving an N-state (one-hot) FSM. The
+        // counter decrements each enabled cycle; on expiry it reloads and the FSM advances; an
+        // `enable` input (nondeterministic) gates the decrement (a stall self-loop when low). State =
+        // (fsm ∈ 0..N, cnt ∈ 0..2^K). MEASURE reachable |S| + transition |δ| by BFS.
+        fn prescaler_fsm(n: u32, k: u32) -> (u64, u64) {
+            let max = (1u32 << k) - 1;
+            let init = (0u32, max);
+            let mut seen = HashSet::new();
+            let mut edges = 0u64;
+            let mut q = VecDeque::new();
+            seen.insert(init);
+            q.push_back(init);
+            while let Some((fsm, cnt)) = q.pop_front() {
+                for enable in [false, true] {
+                    let next = if !enable {
+                        (fsm, cnt) // stall (enable low)
+                    } else if cnt == 0 {
+                        ((fsm + 1) % n, max) // expiry: advance FSM, reload
+                    } else {
+                        (fsm, cnt - 1) // decrement
+                    };
+                    edges += 1;
+                    if seen.insert(next) {
+                        q.push_back(next);
+                    }
+                }
+            }
+            (seen.len() as u64, edges)
+        }
+        eprintln!(
+            "=== (2) prescaler(K) + one-hot FSM(N) — MEASURED reachable |S|, transitions |δ| ==="
+        );
+        eprintln!(
+            "  one-hot valuation width W = N+K bits; binary-encoded W = ⌈log2 N⌉+K. worst |S| = 2^W."
+        );
+        eprintln!(
+            "  {:>3} {:>3} {:>7} {:>7} {:>16} {:>14} {:>14} {:>10}",
+            "N",
+            "K",
+            "W_1hot",
+            "W_bin",
+            "worst 2^W_1hot",
+            "measured |S|",
+            "measured |δ|",
+            "|S|/2^W1h"
+        );
+        for &(n, k) in &[
+            (4u32, 4u32),
+            (4, 8),
+            (4, 12),
+            (4, 16),
+            (8, 12),
+            (16, 12),
+            (4, 18),
+        ] {
+            let (s, e) = prescaler_fsm(n, k);
+            let w_1hot = n + k;
+            let w_bin = (32 - (n - 1).leading_zeros()) + k;
+            let worst = if w_1hot < 63 {
+                1u128 << w_1hot
+            } else {
+                u128::MAX
+            };
+            eprintln!(
+                "  {:>3} {:>3} {:>7} {:>7} {:>16} {:>14} {:>14} {:>10.2e}",
+                n,
+                k,
+                w_1hot,
+                w_bin,
+                worst,
+                s,
+                e,
+                s as f64 / worst as f64
+            );
+            // The MEASURED law: |S| = N · 2^K — the counter dimension is tight (2^K), the FSM
+            // dimension is its state count N (independent of the N-bit one-hot encoding width).
+            assert_eq!(
+                s,
+                n as u64 * (1u64 << k),
+                "measured reachable |S| = N · 2^K (counter tight, FSM = its N states)"
+            );
+        }
+        eprintln!(
+            "  ⇒ MEASURED law: |S| = N·2^K. The K-bit counter multiplies |S| by 2^K (irreducible — it \
+             reaches all values); the FSM multiplies by its state count N (≪ 2^N when one-hot). So a \
+             WIDE counter, not the FSM, is what makes |S| explode: K=16 ⇒ ×65 536; K=26 ⇒ ×67 108 864."
+        );
+    }
+
+    /// MEASUREMENT — the STRUCTURAL automaton size of a real lifted design (exact, reproducible from
+    /// the btor2; no simulation). Reports the valuation width W (= total state-register bits), the
+    /// worst-case |S| = 2^W, the transition-DAG size (btor2 nodes = the *symbolic* transition
+    /// relation, which is what is actually built — the explicit automaton never is), the free-input
+    /// width I (worst-case explicit fan-out 2^I per state), and — the key number — each in-cone
+    /// down-counter's width K and range R. A counter's R reachable values are TIGHT (measured, part
+    /// 1 of `measure_control_automaton_scaling`), so `Π R_counter` is a MEASURED lower bound on the
+    /// reachable |S|. `MUNUNU_PROBE_BTOR2=<file>` (whole design).
+    #[test]
+    #[ignore = "measurement — real-design structural automaton size"]
+    fn measure_structural_automaton_size() {
+        use crate::adapter::btor2::ast::{Node, Op};
+        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let content = std::fs::read_to_string(&path).expect("read btor2");
+        let file = parser::parse(&content).expect("parse btor2");
+
+        let mut reg_bits = 0u64;
+        let mut regs = 0u64;
+        let mut input_bits = 0u64;
+        let mut nodes = 0u64;
+        for l in &file.lines {
+            match &l.node {
+                Node::State { sort, .. } => {
+                    regs += 1;
+                    reg_bits += parser::bv_width(&file, *sort).unwrap_or(0) as u64;
+                }
+                Node::Input { sort, .. } => {
+                    input_bits += parser::bv_width(&file, *sort).unwrap_or(0) as u64;
+                }
+                Node::Op { .. } => nodes += 1,
+                _ => {}
+            }
+        }
+        // measured lower bounds on reachable |S| from the down-counters. A single counter reaching R
+        // distinct values forces |S| ≥ R (SOLID — no independence assumption). The product of ranges
+        // is a STRONGER lower bound but only valid if the counters are jointly independent, so we
+        // report both, clearly separated. Degenerate range-1 counters (init resolved to 0) contribute
+        // nothing and are flagged.
+        let counters: Vec<(u32, u64)> = detect_down_counter(&file)
+            .iter()
+            .map(|c| {
+                let range = init_value_of(&file, c.nid)
+                    .and_then(|op| resolve_btor2_constant(&file, op.nid()))
+                    .map(|v| v.saturating_add(1))
+                    .unwrap_or(1u64 << c.width.min(63));
+                (c.width, range)
+            })
+            .collect();
+        let max_range = counters.iter().map(|(_, r)| *r).max().unwrap_or(1);
+        let log2_prod: f64 = counters
+            .iter()
+            .map(|(_, r)| (*r as f64).max(1.0).log2())
+            .sum();
+        let _ = Op::Add; // (Op imported for symmetry with the other probes)
+        eprintln!(
+            "=== STRUCTURAL automaton size: {} ===",
+            path.rsplit('/').next().unwrap_or(&path)
+        );
+        eprintln!("  state registers          : {regs}");
+        eprintln!("  valuation width  W        : {reg_bits} bits  (per-state label)");
+        eprintln!(
+            "  worst-case |S| = 2^W      : 2^{reg_bits}{}",
+            if reg_bits <= 40 {
+                format!(" = {}", 1u128 << reg_bits.min(40))
+            } else {
+                String::new()
+            }
+        );
+        eprintln!(
+            "  free-input width I        : {input_bits} bits  (worst-case fan-out 2^I per state)"
+        );
+        eprintln!(
+            "  transition-DAG nodes      : {nodes}  (the SYMBOLIC δ actually built; explicit automaton never is)"
+        );
+        eprintln!("  in-design down-counters   : {}", counters.len());
+        for (w, r) in &counters {
+            let note = if *r <= 1 {
+                "  (degenerate: init=0 ⇒ contributes ×1)"
+            } else {
+                ""
+            };
+            eprintln!("     width {w:>2}  range {r}  (reaches all {r} values ⇒ ×{r} to |S|){note}");
+        }
+        if max_range <= 1 {
+            eprintln!(
+                "  no non-degenerate down-counter ⇒ no counter floor; reachable |S| ≤ 2^W (exact-\
+                 feasible iff W is small — e.g. a crypto round-FSM)."
+            );
+        } else {
+            eprintln!(
+                "  SOLID measured LB   |S| ≥ max counter range = {max_range}  (= 2^{:.0}) — one counter alone",
+                (max_range as f64).log2()
+            );
+            eprintln!(
+                "  independence-assumed LB (Π ranges)          = 2^{:.1}  (≈ {}) — if the counters are jointly free",
+                log2_prod,
+                if log2_prod <= 63.0 {
+                    format!("{}", log2_prod.exp2() as u128)
+                } else {
+                    ">2^63".to_string()
+                }
+            );
+            eprintln!(
+                "  ⇒ reachable |S| ∈ [ max counter range (solid measured LB) , 2^W (worst-case UB) ]. \
+                 The wide counter sets a floor the FSM cannot reduce — why exact enumeration is infeasible."
+            );
+        }
+    }
+
     #[test]
     fn detect_enum_states_finds_fsm_rejects_counter() {
         use crate::adapter::btor2::parser::parse;

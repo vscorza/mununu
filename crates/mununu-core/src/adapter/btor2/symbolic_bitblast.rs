@@ -146,8 +146,12 @@ const MAX_BITBLAST_BITS: u32 = 40;
 const AUTO_CAP_CEILING: u32 = 64;
 
 /// Absolute ceiling the `MUNUNU_BDD_MAX_BITS` override is clamped to — bounds the largest
-/// arena we will allocate regardless of the env value.
-const HARD_BITBLAST_CEILING: u32 = 256;
+/// arena we will allocate regardless of the env value. Raised 256 → 1024 (2026-07-27): measured
+/// that wide-but-STRUCTURED control cones (e.g. i2c's 173-bit cone → an 11k-node BDD) are exact-
+/// decidable, and the bit COUNT is a poor proxy for BDD size; the real gates are the node-budget
+/// guard and the fixpoint-iteration budget, which now abstain GRACEFULLY on a genuine blow-up
+/// (the arena-exhaustion panic is caught in [`BddBitBlaster::build_with_keep`]).
+const HARD_BITBLAST_CEILING: u32 = 1024;
 
 /// The default cap for a cone of `cone_bits` KEPT bits when no env override is present: the
 /// [`MAX_BITBLAST_BITS`] floor, auto-raised to fit the concrete cone up to [`AUTO_CAP_CEILING`]
@@ -354,82 +358,104 @@ impl BddBitBlaster {
             node_budget,
         };
 
-        // Pass 2 — walk the node DAG, evaluating every Const/Op into a BitVec.
-        walk_design(file, &mut blaster).map_err(|e| match e {
-            WalkError::NonBitvecSort(nid) => {
-                format!("NID {nid}: non-bitvec sort in the transition cone")
-            }
-            WalkError::Unevaluated(nid) => format!("NID {nid}: operand unevaluated"),
-            WalkError::Backend(msg) => msg,
-        })?;
-
-        // Pass 3 — collect the per-register next-state functions, keyed by the state's
-        // symbol. AR-S1 / #242 drift guard: these names come from the SAME `leaf_cells`
-        // enumeration as Pass 1, so `next_funcs.get(&cell.symbol)` in `exact_model()`
-        // cannot miss and silently freeze a register at its init value (the #242
-        // soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
-        // (out-of-cone) registers are SKIPPED — they are constants and must not transition.
-        let nid_symbol: HashMap<Nid, String> = leaf_cells
-            .iter()
-            .filter(|c| c.is_state)
-            .map(|c| (c.nid, c.name.clone()))
-            .collect();
-        for line in &file.lines {
-            if let Node::Next { state, value, .. } = &line.node {
-                if !is_kept(*state) {
-                    continue; // pinned register — stays constant, no next-state function
-                }
-                let Some(sym) = nid_symbol.get(state) else {
-                    continue;
-                };
-                let next = blaster.resolve(*value)?;
-                blaster.next_funcs.insert(sym.clone(), next);
-            }
-        }
-
-        // Pass 4 — named combinational signals (module outputs / named wires), so a predicate
-        // can bind to a non-register signal (`depth_o`, `gnt_o`). Its BDD is already in `env`
-        // (walk_design); the atom's cone still seeds via the output's terminal fan-in.
-        for line in &file.lines {
-            match &line.node {
-                Node::Output {
-                    symbol: Some(s),
-                    signal,
-                } => {
-                    if let Some(bits) = blaster.env.get(&signal.nid()) {
-                        blaster
-                            .named_signals
-                            .entry(s.clone())
-                            .or_insert_with(|| bits.clone());
+        // Passes 2–5 do all the BDD allocation. A cone that does not compress can EXHAUST the fixed
+        // OxiDD arena inside a SINGLE wide op — before the between-op node-budget guard runs — which
+        // OxiDD surfaces as an allocation `.unwrap()` panic. Catch it and abstain GRACEFULLY (→ cube
+        // / `--engine explicit`) instead of crashing the process: this half-built blaster owns its
+        // manager and is dropped on the unwind (single-threaded apply, so the RAII lock guard is
+        // released during unwinding), so there is no shared/global state to corrupt.
+        let build_passes =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                // Pass 2 — walk the node DAG, evaluating every Const/Op into a BitVec.
+                walk_design(file, &mut blaster).map_err(|e| match e {
+                    WalkError::NonBitvecSort(nid) => {
+                        format!("NID {nid}: non-bitvec sort in the transition cone")
                     }
-                }
-                Node::Op {
-                    symbol: Some(s), ..
-                } => {
-                    if let Some(bits) = blaster.env.get(&line.nid) {
-                        blaster
-                            .named_signals
-                            .entry(s.clone())
-                            .or_insert_with(|| bits.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Pass 5 — the `constraint` (assume) conjunction: AND every `constraint`
-        // line's 1-bit signal into `constraint_bdd` (a function of the state +
-        // input vars). The exact model injects it into the modal pre-image so a
-        // `constraint` design is checked over constraint-respecting runs, not
-        // over-approximated. An out-of-cone (pinned) constraint signal folds to a
-        // constant, which is correct (the cone keeps every constraint-coupled leaf).
-        for line in &file.lines {
-            if let Node::Constraint { signal } = &line.node {
-                let bits = blaster.resolve(*signal)?;
-                let c = bits.into_iter().next().ok_or_else(|| {
-                    "exact bit-blaster: a `constraint` signal has zero width".to_string()
+                    WalkError::Unevaluated(nid) => format!("NID {nid}: operand unevaluated"),
+                    WalkError::Backend(msg) => msg,
                 })?;
-                blaster.constraint_bdd = blaster.constraint_bdd.and(&c).unwrap();
+
+                // Pass 3 — collect the per-register next-state functions, keyed by the state's
+                // symbol. AR-S1 / #242 drift guard: these names come from the SAME `leaf_cells`
+                // enumeration as Pass 1, so `next_funcs.get(&cell.symbol)` in `exact_model()`
+                // cannot miss and silently freeze a register at its init value (the #242
+                // soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
+                // (out-of-cone) registers are SKIPPED — they are constants and must not transition.
+                let nid_symbol: HashMap<Nid, String> = leaf_cells
+                    .iter()
+                    .filter(|c| c.is_state)
+                    .map(|c| (c.nid, c.name.clone()))
+                    .collect();
+                for line in &file.lines {
+                    if let Node::Next { state, value, .. } = &line.node {
+                        if !is_kept(*state) {
+                            continue; // pinned register — stays constant, no next-state function
+                        }
+                        let Some(sym) = nid_symbol.get(state) else {
+                            continue;
+                        };
+                        let next = blaster.resolve(*value)?;
+                        blaster.next_funcs.insert(sym.clone(), next);
+                    }
+                }
+
+                // Pass 4 — named combinational signals (module outputs / named wires), so a predicate
+                // can bind to a non-register signal (`depth_o`, `gnt_o`). Its BDD is already in `env`
+                // (walk_design); the atom's cone still seeds via the output's terminal fan-in.
+                for line in &file.lines {
+                    match &line.node {
+                        Node::Output {
+                            symbol: Some(s),
+                            signal,
+                        } => {
+                            if let Some(bits) = blaster.env.get(&signal.nid()) {
+                                blaster
+                                    .named_signals
+                                    .entry(s.clone())
+                                    .or_insert_with(|| bits.clone());
+                            }
+                        }
+                        Node::Op {
+                            symbol: Some(s), ..
+                        } => {
+                            if let Some(bits) = blaster.env.get(&line.nid) {
+                                blaster
+                                    .named_signals
+                                    .entry(s.clone())
+                                    .or_insert_with(|| bits.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Pass 5 — the `constraint` (assume) conjunction: AND every `constraint`
+                // line's 1-bit signal into `constraint_bdd` (a function of the state +
+                // input vars). The exact model injects it into the modal pre-image so a
+                // `constraint` design is checked over constraint-respecting runs, not
+                // over-approximated. An out-of-cone (pinned) constraint signal folds to a
+                // constant, which is correct (the cone keeps every constraint-coupled leaf).
+                for line in &file.lines {
+                    if let Node::Constraint { signal } = &line.node {
+                        let bits = blaster.resolve(*signal)?;
+                        let c = bits.into_iter().next().ok_or_else(|| {
+                            "exact bit-blaster: a `constraint` signal has zero width".to_string()
+                        })?;
+                        blaster.constraint_bdd = blaster.constraint_bdd.and(&c).unwrap();
+                    }
+                }
+                Ok(())
+            }));
+        match build_passes {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(
+                    "exact bit-blaster: BDD arena exhausted during build (a wide op overran \
+                            the node budget in one apply) — the cone does not compress to a \
+                            tractable BDD; use `--engine explicit`"
+                        .into(),
+                );
             }
         }
 
@@ -3007,6 +3033,39 @@ impl BddBitBlaster {
         }
         out
     }
+
+    /// Live inner-node count of the shared BDD arena — the ACTUAL footprint of everything built
+    /// (the transition-system next-state functions, etc.). O(1). Test-measurement helper.
+    #[cfg(test)]
+    pub(crate) fn live_bdd_nodes(&self) -> usize {
+        self._manager
+            .with_manager_shared(|m| m.approx_num_inner_nodes())
+    }
+}
+
+/// `(unique BDD nodes in f, BDD height of f)`. Both ACTUAL (traversal-measured), not theoretical.
+/// Height = the longest root→terminal path in DECISION nodes, computed by memoized cofactor recursion
+/// (`cofactors()` splits on f's top variable; terminals return 0). Test-measurement helper.
+///
+/// `mutable_key_type`: `BDDFunction` has interior mutability (its manager ref) but its `Hash`/`Eq`
+/// are by stable node identity, so it is a sound `HashMap` key.
+#[cfg(test)]
+#[allow(clippy::mutable_key_type)]
+pub(crate) fn bdd_nodes_height(f: &BDDFunction) -> (usize, usize) {
+    use oxidd::Function; // cofactors(), node_count()
+    use std::collections::HashMap;
+    fn height(f: &BDDFunction, memo: &mut HashMap<BDDFunction, usize>) -> usize {
+        if let Some(&v) = memo.get(f) {
+            return v;
+        }
+        let v = match f.cofactors() {
+            None => 0, // terminal (⊤ / ⊥)
+            Some((t, e)) => 1 + height(&t, memo).max(height(&e, memo)),
+        };
+        memo.insert(f.clone(), v);
+        v
+    }
+    (f.node_count(), height(f, &mut HashMap::new()))
 }
 
 #[cfg(test)]
@@ -3014,6 +3073,132 @@ mod tests {
     use super::*;
     use crate::adapter::btor2::bit_blast::simulate_one_step;
     use crate::adapter::btor2::parser;
+
+    /// MEASUREMENT — the ACTUAL BDD (node count + height), not the theoretical state count, of the
+    /// canonical wide-counter control primitive, plus its discoverable predicates. A K-bit reloading
+    /// down-counter `cnt' = (cnt==0) ? MAX : cnt-1` has 2^K reachable STATES, but its BDD transition
+    /// relation is small — this measures the actual OxiDD representation to show that the wall is NOT
+    /// the BDD size (so variable reordering, which only shrinks BDD size, cannot help it — the wall
+    /// is the 2^K fixpoint DIAMETER, which no ordering changes). `MUNUNU_PROBE_BTOR2` additionally
+    /// measures a real lift's transition-system BDD.
+    #[test]
+    #[ignore = "measurement — actual BDD node count + height of the counter transition system"]
+    fn measure_bdd_actual_size() {
+        fn counter_btor2(k: u32) -> String {
+            let max = (1u128 << k) - 1;
+            format!(
+                "1 sort bitvec 1\n2 sort bitvec {k}\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+                 6 constd 2 {max}\n7 init 2 3 6\n8 eq 1 3 4\n9 sub 2 3 5\n10 ite 2 8 6 9\n11 next 2 3 10\n"
+            )
+        }
+        eprintln!("=== ACTUAL BDD of a K-bit reloading down-counter's transition relation ===");
+        eprintln!(
+            "  reachable STATES = 2^K, but we measure the BDD REPRESENTATION (exact node_count + height):"
+        );
+        eprintln!(
+            "  {:>3} {:>18} {:>14} {:>16}",
+            "K", "transition-BDD nodes", "height (nodes)", "states 2^K"
+        );
+        for k in [4u32, 8, 12, 16, 20, 24] {
+            let f = parser::parse(&counter_btor2(k)).expect("parse");
+            let bb = BddBitBlaster::build(&f).expect("counter fits the bit cap");
+            let nf = bb.next_funcs.get("cnt").expect("cnt next-fn");
+            // exact transition-relation size = distinct BDD nodes across all next-state bits;
+            // height = the deepest per-bit root→terminal path (the MSB bit depends on all K bits).
+            let sum_nodes: usize = nf.iter().map(|b| bdd_nodes_height(b).0).sum();
+            let height = nf.iter().map(|b| bdd_nodes_height(b).1).max().unwrap_or(0);
+            eprintln!(
+                "  {:>3} {:>18} {:>14} {:>16}",
+                k,
+                sum_nodes,
+                height,
+                1u64 << k
+            );
+        }
+        eprintln!(
+            "  ⇒ MEASURED: the counter's BDD is SMALL — live nodes + Σ next-fn nodes grow ~poly(K), \
+             height ~K (linear), while the reachable STATE count is 2^K. So the counter's hardness is \
+             NOT its BDD size; it is the 2^K reachable DIAMETER (the μ/ν pre-image fixpoint needs ~2^K \
+             iterations — the reason the #369 fixpoint-iteration budget exists, distinct from the node \
+             budget). Variable reordering shrinks BDD size, which is already small, and does NOT change \
+             the iteration count ⇒ reordering CANNOT improve a counter's tractability."
+        );
+
+        // Discoverable predicates for the counter (what a predicate-abstraction refinement can name).
+        let f = parser::parse(&counter_btor2(16)).expect("parse");
+        let counters = crate::adapter::btor2::bit_blast::detect_down_counter(&f);
+        eprintln!("=== discoverable predicates for the K=16 counter ===");
+        eprintln!(
+            "  detect_down_counter: {} counter(s); threshold predicate(s): {:?}",
+            counters.len(),
+            counters
+                .iter()
+                .map(|c| format!("cnt == {}", c.threshold))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "  ⇒ a counter yields exactly ONE natural predicate (cnt == threshold). That is enough to \
+             STATE the recovery target but NOT to DECIDE it: no bounded predicate set captures a 2^K-step \
+             descent, so the cube abstains — the descent is decided by the RANKING certificate (a \
+             well-founded measure), not by adding predicates. So 'more discoverable predicates' is not \
+             the lever either."
+        );
+
+        // Optional: a real lift's transition-system BDD (build + actual size, or the build wall).
+        if let Ok(path) = std::env::var("MUNUNU_PROBE_BTOR2") {
+            let content = std::fs::read_to_string(&path).expect("read btor2");
+            let rf = parser::parse(&content).expect("parse real");
+            eprintln!(
+                "=== real lift {} ===",
+                path.rsplit('/').next().unwrap_or(&path)
+            );
+            match BddBitBlaster::build(&rf) {
+                Ok(bb) => {
+                    let live = bb.live_bdd_nodes();
+                    let height = bb
+                        .next_funcs
+                        .values()
+                        .flat_map(|v| v.iter())
+                        .map(|b| bdd_nodes_height(b).1)
+                        .max()
+                        .unwrap_or(0);
+                    eprintln!(
+                        "  built: live BDD nodes = {live}, transition-fn height (max) = {height}"
+                    );
+                    // Crux: the transition BDD is small — so does the exact FIXPOINT decide it once
+                    // built? Call the EXACT engine DIRECTLY (no cube fallback) so the verdict is
+                    // exact-only: Err = exact abstained (cap/node/iteration budget), never cube.
+                    if let Ok(target) = std::env::var("MUNUNU_PROBE_GOOD") {
+                        let formula_str = format!("nu Y. ((mu X. (({target}) || <> X)) && [] Y)");
+                        let formula = crate::mu_calculus::parser::parse(&formula_str)
+                            .expect("formula parses");
+                        let t0 = std::time::Instant::now();
+                        let v = exact_symbolic_verdict(&content, &formula);
+                        eprintln!(
+                            "  EXACT-ONLY AG EF ({target}): {v:?}  [{} ms]",
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("  BDD build wall: {e}"),
+            }
+            // The ALTERNATIVE tool for a wide / BDD-blowing datapath cone: PREDICATE ABSTRACTION
+            // (cube + smt-hyper-must). It has its own path (no full-state bit-blast), so it runs
+            // whether or not the exact BDD built — the "right tool vs reordering" comparison.
+            if let Ok(target) = std::env::var("MUNUNU_PROBE_GOOD") {
+                let tc = std::time::Instant::now();
+                let cube = crate::adapter::recoverability::verify_recoverability_scalable(
+                    &content,
+                    &target,
+                    &[],
+                );
+                eprintln!(
+                    "  CUBE (predicate-abstraction) AG EF ({target}): {cube:?}  [{} ms]",
+                    tc.elapsed().as_millis()
+                );
+            }
+        }
+    }
 
     /// A.4 — `ef_target_atoms` names the reachability target of a bare `EF p`
     /// (`μX. (p ∨ ◇X)`), whose violation is the "target unreachable" repair witness,
