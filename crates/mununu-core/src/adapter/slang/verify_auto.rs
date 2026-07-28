@@ -1624,21 +1624,31 @@ pub fn verify_auto(
     yosys_opts: &YosysOptions,
     opts: &VerifyAutoOptions,
 ) -> Result<AutoVerifyReport, AdapterError> {
-    // PORTFOLIO dispatch — when a portfolio mode is set, hand the task to the execution
-    // planner (verification-execution-planner P2.1a): `plan()` emits the engine-operator
-    // ladder, `execute()` lifts SV → BTOR2 ONCE (the lift-once common-IR keystone, roadmap
-    // P2.1) and drives each operator over the shared lift, merging under the runtime
-    // soundness guard. Verdict-equivalent to the former inline `verify_auto_portfolio`.
+    // PORTFOLIO dispatch — when a portfolio mode is set, run the common-IR-hub pipeline:
+    // `prepare_model` once → `plan()` (the ladder + the per-property cost RATIONALE, computed from
+    // the shared prepared model) → `execute()` (drive each operator over the shared model, merge
+    // under the runtime soundness guard, attach the rationale telemetry). Verdict-equivalent to the
+    // former inline `verify_auto_portfolio`; the routing reasoning now lives in the planner.
     if opts.portfolio.is_some() {
-        let task = crate::planner::VerificationTask {
-            sources,
-            yosys_opts,
-            opts,
+        return match prepare_model(sources, yosys_opts, opts)? {
+            Prepared::Empty(report) => Ok(report),
+            Prepared::Model(m) => {
+                let m = *m;
+                let task = crate::planner::VerificationTask {
+                    sources,
+                    yosys_opts,
+                    opts,
+                };
+                let plan = crate::planner::plan(Some(&m), opts);
+                crate::planner::execute(&plan, &m, &task)
+            }
         };
-        return crate::planner::execute(&crate::planner::plan(&task), &task);
     }
 
-    // Single-engine path: lift inline (`prelift = None`) then run the body.
+    // Single-engine path (a user-picked `--engine`): the direct `verify_auto_impl(None)` form —
+    // it checks A.6 (exact + no-reset-gating rejection) at the top, BEFORE any lift, then builds
+    // the model inline and runs the one engine. No cost rationale — the predicted engine is
+    // trivially the one the user selected. (Only the portfolio uses the plan/execute pipeline.)
     verify_auto_impl(sources, yosys_opts, opts, None)
 }
 
@@ -1774,6 +1784,19 @@ pub(crate) struct PreparedModel {
     ann_scan: AnnotationScan,
     /// The config inputs actually pinned (`--config-value`), for the per-property substitution + note.
     applied_config_values: Vec<(String, u64)>,
+}
+
+impl PreparedModel {
+    /// The `(name, mu-formula)` of each translated property — the planner's input for the routing
+    /// rationale (`plan`). Pre-substitution formulas; the class + cone the rationale reads are
+    /// substitution-invariant, so this lines up with the post-run outcomes by name.
+    pub(crate) fn properties(&self) -> Vec<(String, String)> {
+        self.extraction
+            .translated
+            .iter()
+            .map(|t| (t.name.clone(), t.formula.clone()))
+            .collect()
+    }
 }
 
 /// The result of `prepare_model`: either a design with NO translated properties (the empty report is
@@ -2517,21 +2540,9 @@ pub(crate) fn verify_auto_impl(
     }
     report.notes.extend(rescue_notes);
     report.notes.extend(exact_skip_notes);
-
-    // P2.2d — cost-annotated plan telemetry: one `plan-cost` note per property (the planner's
-    // per-property cost prediction — class × cone-vs-cap × diameter → predicted engine + why) plus
-    // one `plan-accuracy` summary (predicted-decidable vs actually-decided). Additive telemetry,
-    // verdict-equivalent. Uses the verified formulas (post config-substitution) so it lines up with
-    // the outcomes. (2a: computed here; the 2b refactor moves the prediction half into `plan()`.)
-    let plan_cost_props: Vec<(String, String)> = report
-        .properties
-        .iter()
-        .map(|p| (p.name.clone(), p.formula.clone()))
-        .collect();
-    let plan_cost_notes =
-        crate::planner::routing_telemetry_notes(&btor2, &plan_cost_props, &report);
-    report.notes.extend(plan_cost_notes);
-
+    // The cost-annotated plan telemetry (`plan-cost` / `plan-accuracy`) is NO LONGER computed here:
+    // it is the planner's job now (`plan` builds the rationale from the shared prepared model,
+    // `execute` attaches it after the merge). This body is the pure per-engine leaf.
     Ok(report)
 }
 
