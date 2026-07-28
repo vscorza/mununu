@@ -1639,7 +1639,7 @@ pub fn verify_auto(
     }
 
     // Single-engine path: lift inline (`prelift = None`) then run the body.
-    verify_auto_impl(sources, yosys_opts, opts, None, None)
+    verify_auto_impl(sources, yosys_opts, opts, None)
 }
 
 /// The SV → BTOR2 lift output (incl. the `auto_stub_flops` re-lift), factored out so the
@@ -1754,6 +1754,178 @@ pub(crate) fn extract_front(
     })
 }
 
+/// P-3b/P-4 (common-IR hub) — the operator-INDEPENDENT prepared model: the fully-prepared BTOR2
+/// (lifted + reset/init/shadow/config-pinned) plus everything the per-property loop needs that does
+/// NOT depend on the engine choice. `prepare_model` builds it ONCE; `plan` reads it (facts-aware
+/// routing rationale) and `verify_from_prepared` runs each engine operator over it. This makes the
+/// slang extraction + yosys lift + reset/pin prep run once per portfolio run, not per operator, and
+/// gives `plan()` the fully-prepared model to reason about cost. Clone so each operator owns a copy.
+#[derive(Clone)]
+pub(crate) struct PreparedModel {
+    /// The fully-prepared BTOR2 (lift + reset-init + shadow + reset/config pins).
+    pub btor2: String,
+    /// The report skeleton — carries `unsupported` + the lift/reset diagnostics.
+    report: AutoVerifyReport,
+    /// The translated properties (+ merged `@mununu_guarantee`).
+    extraction: crate::adapter::slang::translate::TranslationReport,
+    /// Abstraction-predicate hints (W1/W2).
+    predicate_hints: Vec<String>,
+    /// The `@mununu_*` annotation scan (drives the annotation note).
+    ann_scan: AnnotationScan,
+    /// The config inputs actually pinned (`--config-value`), for the per-property substitution + note.
+    applied_config_values: Vec<(String, u64)>,
+}
+
+/// The result of `prepare_model`: either a design with NO translated properties (the empty report is
+/// final) or a fully-prepared [`PreparedModel`].
+pub(crate) enum Prepared {
+    /// No properties to verify — the report (posture + annotation note) is complete.
+    Empty(AutoVerifyReport),
+    /// The prepared model, ready for `plan` + `verify_from_prepared`. Boxed — it is much larger
+    /// than the `Empty` report, and `Prepared` is returned by value.
+    Model(Box<PreparedModel>),
+}
+
+/// P-3b/P-4 — the operator-INDEPENDENT prep: extract the SVA (slang), lift to BTOR2 (yosys),
+/// reset/init/shadow/config-pin. Pure function of `(sources, yosys_opts, opts)` — identical for
+/// every precision-ladder operator — so the planner calls it ONCE. Returns [`Prepared::Empty`] for a
+/// design with no properties, else [`Prepared::Model`]. (The engine-flag-dependent A.6 check is the
+/// caller's — it belongs with the per-operator run, not the shared prep.)
+pub(crate) fn prepare_model(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    opts: &VerifyAutoOptions,
+) -> Result<Prepared, AdapterError> {
+    use crate::adapter::btor2::shadow::augment_with_past_shadows;
+
+    // 1. Extract + translate the SVA (slang) + merge `@mununu_guarantee` annotations.
+    let SharedExtraction {
+        extraction,
+        ann_scan,
+        predicate_hints,
+    } = extract_front(sources, opts)?;
+
+    let mut report = AutoVerifyReport {
+        unsupported: extraction
+            .unsupported
+            .iter()
+            .map(|u| (u.name.clone(), u.reason.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    if extraction.translated.is_empty() {
+        // No properties: the posture note is informational; reflect the engine.
+        let posture = if opts.exact_symbolic {
+            NotePosture::Exact
+        } else {
+            NotePosture::Cube
+        };
+        report.notes = build_notes(
+            &report,
+            opts.must_edge_inference,
+            &[],
+            &[],
+            &yosys_opts.cutpoint_signals,
+            &posture,
+        );
+        if let Some(n) = annotation_note(&ann_scan) {
+            report.notes.push(n);
+        }
+        return Ok(Prepared::Empty(report));
+    }
+
+    // Reset inputs to pin inactive (reset-gating). Empty when gating is off or no `disable iff`
+    // reset was recognized.
+    let mut reset_pins: Vec<(String, u64)> = if opts.gate_reset {
+        extraction
+            .reset_signals
+            .iter()
+            .map(|rs| (rs.signal.clone(), rs.inactive_value))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 2. SV → flattened BTOR2 (yosys), + auto-stub re-lift. Surfaces black-boxed modules + stubs.
+    let PreLift {
+        mut btor2,
+        blackboxed_modules,
+        auto_provided_stubs,
+    } = lift_sv(sources, yosys_opts, opts)?;
+    report.diagnostics.blackboxed_modules = blackboxed_modules;
+    report.diagnostics.auto_provided_stubs = auto_provided_stubs;
+
+    // Structural reset auto-pin: when gating is on but no `disable iff` guard was recognized, detect
+    // the async-reset input from the lifted BTOR2's reset-mux structure and pin it inactive (else a
+    // free reset-edge spuriously VIOLATES every box/AF property). `disable iff` always wins.
+    if opts.gate_reset
+        && reset_pins.is_empty()
+        && let Ok(file) = crate::adapter::btor2::parser::parse(&btor2)
+    {
+        let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+        reset_pins.extend(crate::adapter::fsm_scan::detect_resets(&file, &symbols));
+    }
+
+    // Inject `init` at the post-reset state (a reset-gated async-reset FSM starts in its real reset
+    // state, not the init-less 0). Runs on the reset-FREE BTOR2 (before the pin below).
+    btor2 = crate::adapter::btor2::reset_init::inject_reset_init(&btor2, &reset_pins)?;
+
+    // Complete the init to the `setundef -zero` power-up for a RESET-LESS design, so every engine
+    // starts from the same state (the portfolio otherwise leaves an init-less cell free → engine
+    // disagreement). Scoped to reset-less designs; a reset-based design's free-init is real behavior.
+    if opts.gate_reset && reset_pins.is_empty() {
+        btor2 = crate::adapter::btor2::reset_init::inject_zero_init(&btor2)?;
+    }
+
+    // Augment only the `__past` shadows whose base resolves to a BTOR2 state cell (a renamed base is
+    // skipped → its properties are SKIPPED below, not an abort).
+    let pre_file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
+        e.message = format!("verify_auto: parse lifted BTOR2: {}", e.message);
+        e
+    })?;
+    let shadow_bases: Vec<&str> = extraction
+        .required_shadows
+        .iter()
+        .map(|s| s.base.as_str())
+        .filter(|b| crate::adapter::btor2::parser::resolve_state_by_symbol(&pre_file, b).is_some())
+        .collect();
+    let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
+
+    // Pin recognized reset inputs inactive (the model-level half of reset-gating).
+    let (btor2, pinned_resets) =
+        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &reset_pins);
+    report.diagnostics.gated_resets = pinned_resets;
+
+    // H.J.b — pin user-supplied config inputs to constants (same mechanism as reset-gating).
+    let config_pins: Vec<(String, u64)> = {
+        let mut v: Vec<(String, u64)> = opts
+            .config_values
+            .iter()
+            .map(|(k, val)| (k.clone(), *val))
+            .collect();
+        v.sort();
+        v
+    };
+    let (btor2, pinned_configs) =
+        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &config_pins);
+    let applied_config_values: Vec<(String, u64)> = pinned_configs
+        .iter()
+        .filter_map(|s| {
+            let (n, val) = s.split_once('=')?;
+            Some((n.to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
+
+    Ok(Prepared::Model(Box::new(PreparedModel {
+        btor2,
+        report,
+        extraction,
+        predicate_hints,
+        ann_scan,
+        applied_config_values,
+    })))
+}
+
 /// The single-engine verify body: extraction → lift → reset/pin → per-property engine →
 /// replan / rescue / notes. `prelift` is `Some` when the planner supplies a shared SV → BTOR2
 /// lift (the portfolio path lifts once), `None` to lift inline (the single-engine path).
@@ -1762,24 +1934,15 @@ pub(crate) fn verify_auto_impl(
     sources: &[(String, String)],
     yosys_opts: &YosysOptions,
     opts: &VerifyAutoOptions,
-    prelift: Option<PreLift>,
-    shared_extraction: Option<SharedExtraction>,
+    prepared: Option<PreparedModel>,
 ) -> Result<AutoVerifyReport, AdapterError> {
     use crate::adapter::AdapterOptions;
     use crate::adapter::btor2::cegar::{
         CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
     };
-    use crate::adapter::btor2::shadow::augment_with_past_shadows;
     use crate::mu_calculus::Environment;
     use crate::mu_calculus::parser as mu_parser;
     use crate::mu_calculus::trit::Trit;
-
-    let (primary_name, _) = sources.first().ok_or_else(|| AdapterError {
-        kind: AdapterErrorKind::ParseError,
-        message: "adapter/slang/verify_auto: no SV sources provided".to_string(),
-        location: None,
-    })?;
-    let _ = primary_name;
 
     // A.6 (soundness-ledger, 2026-07-05) — reject `--engine exact-symbolic` with
     // `--no-gate-reset`. The exact full-state engine is built for the reset-GATED
@@ -1813,192 +1976,25 @@ pub(crate) fn verify_auto_impl(
         });
     }
 
-    // 1. Extract + translate the SVA (slang subprocess) and merge any `@mununu_guarantee`
-    // annotation properties. When reset-gating, the `disable iff` guards are dropped from the
-    // formulas and the recognized reset signals are reported (pinned inactive in the lift below).
-    // P-3 common-IR hub: `shared_extraction` is `Some` on the portfolio path (the planner extracted
-    // ONCE and shares it across the precision-ladder operators, so the slang subprocess runs once
-    // not per-engine), `None` on the single-engine path (extract inline). Verdict-equivalent either
-    // way. `predicate_hints` (W1/W2) merge in-source `@mununu_predicate` with CLI/API hints — sound
-    // by monotonicity. The merge happens BEFORE the empty-check so an annotation-only design verifies.
-    let SharedExtraction {
+    // The operator-INDEPENDENT prepared model (P-3b common-IR hub): the fully-prepared BTOR2 (slang
+    // extract + yosys lift + reset/init/shadow/config-pin) + the properties + diagnostics. Built
+    // ONCE by the planner (`prepare_model`) and shared across the precision-ladder operators (so the
+    // two subprocesses + the prep run once, not per engine); `None` on the single-engine path, where
+    // it is built inline here. A design with no properties returns its (complete) empty report.
+    let PreparedModel {
+        btor2,
+        mut report,
         extraction,
-        ann_scan,
         predicate_hints,
-    } = match shared_extraction {
-        Some(s) => s,
-        None => extract_front(sources, opts)?,
+        ann_scan,
+        applied_config_values,
+    } = match prepared {
+        Some(m) => m,
+        None => match prepare_model(sources, yosys_opts, opts)? {
+            Prepared::Empty(r) => return Ok(r),
+            Prepared::Model(m) => *m,
+        },
     };
-
-    let mut report = AutoVerifyReport {
-        unsupported: extraction
-            .unsupported
-            .iter()
-            .map(|u| (u.name.clone(), u.reason.clone()))
-            .collect(),
-        ..Default::default()
-    };
-    if extraction.translated.is_empty() {
-        // No properties: the posture note is informational; reflect the engine.
-        let posture = if opts.exact_symbolic {
-            NotePosture::Exact
-        } else {
-            NotePosture::Cube
-        };
-        report.notes = build_notes(
-            &report,
-            opts.must_edge_inference,
-            &[],
-            &[],
-            &yosys_opts.cutpoint_signals,
-            &posture,
-        );
-        if let Some(n) = annotation_note(&ann_scan) {
-            report.notes.push(n);
-        }
-        return Ok(report);
-    }
-
-    // Reset inputs to pin inactive (reset-gating) — applied to the lifted BTOR2
-    // below via `pin_inputs_to_constants`. Empty when gating is off or no
-    // `disable iff` reset was recognized.
-    let mut reset_pins: Vec<(String, u64)> = if opts.gate_reset {
-        extraction
-            .reset_signals
-            .iter()
-            .map(|rs| (rs.signal.clone(), rs.inactive_value))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // 2. SV → flattened BTOR2 (then 3. augment the `__past` shadow flops, below). Lift-once
-    // keystone (roadmap P2.1): the yosys lift is the dominant redundant cost when the
-    // portfolio runs this body once per engine operator. The planner (`execute`) lifts ONCE
-    // via `lift_sv` and threads the result in as `prelift`, so a 3-engine precision ladder
-    // does ONE yosys lift instead of up to three. On the single-engine path `prelift` is
-    // `None` and the lift runs inline — verdict-equivalent either way. The black-boxed
-    // modules + auto-injected flop stubs are surfaced in diagnostics (a cut FSM, the
-    // `prim_sparse_fsm_flop`-class root cause, is visible not silent).
-    let PreLift {
-        mut btor2,
-        blackboxed_modules,
-        auto_provided_stubs,
-    } = match prelift {
-        Some(p) => p,
-        None => lift_sv(sources, yosys_opts, opts)?,
-    };
-    report.diagnostics.blackboxed_modules = blackboxed_modules;
-    report.diagnostics.auto_provided_stubs = auto_provided_stubs;
-
-    // Structural reset auto-pin. When reset-gating is on but no `disable iff (reset)`
-    // guard was recognized (`reset_pins` empty — the common case for a plain-RTL
-    // `@mununu_guarantee` design with no SVA), detect the async-reset input from the
-    // lifted BTOR2's reset-mux structure (`next(state) = ite(reset, RESET_CONST, normal)`
-    // / active-low branch-swap) and pin it inactive. Without this the reset input stays a
-    // free primary input, so the transition relation carries a reset-edge from every
-    // state to the reset state — and every `[]`/`AF`/box-universal property is then
-    // spuriously VIOLATED (it would have to hold at the reset state too). Diamond/`EF`/
-    // `AG EF` properties are immune (existential), which is why they verified correctly
-    // even without this. The detected reset flows through `inject_reset_init` and
-    // `pin_inputs_to_constants` exactly like a `disable iff`-recognized one, and is
-    // surfaced in `diagnostics.gated_resets`. The `disable iff` path always wins (guard
-    // on `reset_pins.is_empty()`), mirroring the fsm-encoding scan's reset handling.
-    if opts.gate_reset
-        && reset_pins.is_empty()
-        && let Ok(file) = crate::adapter::btor2::parser::parse(&btor2)
-    {
-        let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
-        reset_pins.extend(crate::adapter::fsm_scan::detect_resets(&file, &symbols));
-    }
-
-    // Inject `init` lines at the post-reset state so a reset-gated async-reset
-    // FSM starts in its real reset state (e.g. an OpenTitan sparse-FSM's non-zero
-    // `MainSmIdle = 6'b110111`) rather than the init-less power-on default 0.
-    // Zero is an illegal sparse encoding: the FSM's `default` arm traps it into
-    // its error state, so without this the reset-gated model starts in a state
-    // the real design never occupies, silently corrupting every reset-dependent
-    // verdict (recoverability `AG EF idle`, liveness-from-reset). Runs on the
-    // reset-FREE BTOR2 (before the pin below) so it can assert the reset to
-    // derive the post-reset state; no-op unless reset-gating is on (`reset_pins`
-    // non-empty) and the design carries no authoritative `init` line.
-    btor2 = crate::adapter::btor2::reset_init::inject_reset_init(&btor2, &reset_pins)?;
-
-    // Complete the init to the `setundef -zero` power-up for a RESET-LESS design:
-    // every init-less bitvec state cell gets an explicit `init … 0`. A design with
-    // no reset (`reset_pins` empty) has no reset mechanism to establish its start
-    // state — its init is fixed ONLY by `initial` values plus the FPGA/`setundef
-    // -zero` power-up (0) for the rest, which is exactly what the cube and exact
-    // engines already assume (`state_cell_init_values` / `initial_state_bdd`). The
-    // reachability portfolio (native BMC / spacer / Boolector) otherwise leaves an
-    // init-less cell FREE (BTOR2's nondeterministic-init semantics), so a
-    // reset-less design with a partial `initial` (a Xilinx wrapper: `initial state
-    // = IDLE` but an init-less status flop) hands the portfolio a spurious
-    // power-up counterexample the exact engine never sees — an engine verdict
-    // disagreement. Making the 0 power-up explicit puts every engine on the same
-    // start state.
-    //
-    // Scoped to reset-LESS designs on purpose: a RESET-based design establishes
-    // its operational init through the reset (`inject_reset_init`), and the
-    // portfolio's free-init for any cell the reset does not pin is the existing,
-    // real-RTL-validated behavior (`e2e_btormc_confirms_sysrst_real_rtl_verdict`
-    // et al.) — a free-init counterexample there is a genuine run of the model, so
-    // it must not be clamped. Raw `btor2 verify` (no reset-gating) also keeps
-    // BTOR2's free-init semantics.
-    if opts.gate_reset && reset_pins.is_empty() {
-        btor2 = crate::adapter::btor2::reset_init::inject_zero_init(&btor2)?;
-    }
-
-    // Augment only the `__past` shadows whose base resolves to a BTOR2 state
-    // cell. A base the lift renamed away (the SVA name not matching the lifted
-    // register) would hard-error `augment_with_past_shadows`, aborting the whole
-    // run; instead we skip it here and the properties that need its `__past`
-    // atom are SKIPPED below (the atom finds no state cell). Graceful per-design
-    // degradation, not an abort.
-    let pre_file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
-        e.message = format!("verify_auto: parse lifted BTOR2: {}", e.message);
-        e
-    })?;
-    let shadow_bases: Vec<&str> = extraction
-        .required_shadows
-        .iter()
-        .map(|s| s.base.as_str())
-        .filter(|b| crate::adapter::btor2::parser::resolve_state_by_symbol(&pre_file, b).is_some())
-        .collect();
-    let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
-
-    // Pin recognized reset inputs inactive so the (un-guarded) bodies are
-    // verified only while not in reset (the model-level half of reset-gating).
-    // `gated_resets` records only the resets actually found + pinned in the
-    // BTOR2 — a recognized reset that the lift renamed/optimized away is left
-    // unpinned rather than misreported.
-    let (btor2, pinned_resets) =
-        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &reset_pins);
-    report.diagnostics.gated_resets = pinned_resets;
-
-    // H.J.b — pin user-supplied config inputs to constants (scope-reduced
-    // concretization; same mechanism as reset-gating). Only signals that are
-    // actual inputs are pinned; `pinned_configs` is the applied set, which drives
-    // both the per-property formula substitution below and the
-    // `config-concretization` ScopeCaveat note. Sorted for a deterministic order.
-    let config_pins: Vec<(String, u64)> = {
-        let mut v: Vec<(String, u64)> = opts
-            .config_values
-            .iter()
-            .map(|(k, val)| (k.clone(), *val))
-            .collect();
-        v.sort();
-        v
-    };
-    let (btor2, pinned_configs) =
-        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &config_pins);
-    let applied_config_values: Vec<(String, u64)> = pinned_configs
-        .iter()
-        .filter_map(|s| {
-            let (n, val) = s.split_once('=')?;
-            Some((n.to_string(), val.trim().parse::<u64>().ok()?))
-        })
-        .collect();
 
     // State-cell symbols of the augmented design — the seedable-atom universe.
     let file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {

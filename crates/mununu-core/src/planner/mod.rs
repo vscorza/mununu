@@ -21,8 +21,8 @@
 //! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
 
 use crate::adapter::slang::verify_auto::{
-    AutoVerifyReport, NoteLevel, PortfolioMode, VerificationNote, VerifyAutoOptions, VerifyOutcome,
-    escalate_bottom, extract_front, lift_sv, merge_portfolio_reports, outcome_definite,
+    AutoVerifyReport, NoteLevel, PortfolioMode, Prepared, VerificationNote, VerifyAutoOptions,
+    VerifyOutcome, escalate_bottom, merge_portfolio_reports, outcome_definite, prepare_model,
     rescue_skipped_via_exact, verify_auto_impl,
 };
 use crate::adapter::yosys::YosysOptions;
@@ -147,14 +147,15 @@ pub fn execute(
     // Lift it ONCE here and thread the shared result into each operator's `verify_auto_impl`
     // pass, so a 3-engine ladder does ONE yosys elaboration instead of re-lifting per engine.
     // Verdict-equivalent: each operator runs the identical body it did before, only reusing
-    // the lift instead of recomputing it. (The cheap Rust prep — reset/pin, parse, cube-atom
-    // classification — still re-runs per operator; the two subprocess costs are shared.)
-    let prelift = lift_sv(task.sources, task.yosys_opts, task.opts)?;
-
-    // P-3 common-IR hub: the SVA extraction (the slang subprocess) is likewise a pure function of
-    // `(sources, opts)` — identical for every operator — so extract it ONCE and share it, so a
-    // 3-engine ladder runs slang once, not per engine (the second subprocess, after the yosys lift).
-    let shared_extraction = extract_front(task.sources, task.opts)?;
+    // the prep instead of recomputing it. P-3b common-IR hub: build the operator-INDEPENDENT model
+    // ONCE — the slang extract + yosys lift + reset/init/shadow/config-pin — and share it across the
+    // precision-ladder operators (`mk_opts` only flips the engine flags, which the prep ignores), so
+    // a 3-engine ladder runs both subprocesses + the prep ONCE, not per engine. A design with no
+    // properties returns its complete empty report here.
+    let prepared = match prepare_model(task.sources, task.yosys_opts, task.opts)? {
+        Prepared::Empty(report) => return Ok(report),
+        Prepared::Model(m) => *m,
+    };
 
     match plan.mode {
         PortfolioMode::Sequential => {
@@ -166,8 +167,7 @@ pub fn execute(
                         task.sources,
                         task.yosys_opts,
                         &mk_opts(op),
-                        Some(prelift.clone()),
-                        Some(shared_extraction.clone()),
+                        Some(prepared.clone()),
                     ),
                 ));
                 // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
@@ -193,18 +193,11 @@ pub fn execute(
                         .iter()
                         .map(|op| {
                             let o = mk_opts(op);
-                            let pl = prelift.clone();
-                            let se = shared_extraction.clone();
+                            let pm = prepared.clone();
                             (
                                 op.label,
                                 scope.spawn(move || {
-                                    verify_auto_impl(
-                                        task.sources,
-                                        task.yosys_opts,
-                                        &o,
-                                        Some(pl),
-                                        Some(se),
-                                    )
+                                    verify_auto_impl(task.sources, task.yosys_opts, &o, Some(pm))
                                 }),
                             )
                         })
