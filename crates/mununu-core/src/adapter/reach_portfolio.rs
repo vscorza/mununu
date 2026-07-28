@@ -615,15 +615,37 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
             Err(_) => break,
         }
     }
-    // A definite verdict is in — grab any members that ALSO already finished (so a
-    // co-completed contradiction is still surfaced) but do NOT wait for slow stragglers
-    // (e.g. the non-interruptible exact BDD engine on a wide datapath).
+    // A definite verdict is in. Give the OTHER members a SHORT bounded grace to finish so a
+    // co-completing CONTRADICTION (the inter-engine safety-net — one engine Reachable, another
+    // Unreachable ⇒ a latent single-engine bug) is still surfaced. We do NOT wait for the full
+    // deadline: a slow, non-interruptible straggler (the exact BDD engine on a wide datapath)
+    // would defeat the owned early-return. The grace catches the fast members (native / interp /
+    // boolector), which co-complete within ms; a genuinely-slow engine is simply not waited on.
+    // Bounded — the added latency past first-definite is at most `STRAGGLER_GRACE` (and the
+    // overall `deadline` still caps it). Was a non-blocking `try_recv` only, which missed a
+    // straggler that hadn't landed at the exact instant the first verdict arrived (DET-2).
     if definite {
-        while let Ok((name, v)) = rx.try_recv() {
-            match v {
-                Some(true) => reachable_by.push(name),
-                Some(false) => unreachable_by.push(name),
-                None => {}
+        const STRAGGLER_GRACE: Duration = Duration::from_millis(250);
+        let grace_deadline = (Instant::now() + STRAGGLER_GRACE).min(deadline);
+        while reports < N_MEMBERS {
+            let now = Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            match rx.recv_timeout(grace_deadline - now) {
+                Ok((name, v)) => {
+                    reports += 1;
+                    match v {
+                        Some(true) => reachable_by.push(name),
+                        Some(false) => unreachable_by.push(name),
+                        None => {}
+                    }
+                    // Safety-net fired — a contradiction is now present; report it immediately.
+                    if !reachable_by.is_empty() && !unreachable_by.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => break, // grace elapsed or all members disconnected
             }
         }
     }

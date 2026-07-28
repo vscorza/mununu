@@ -28,10 +28,33 @@ const MAX_CACHE_SIZE: usize = 64;
 /// One cache entry: the parsed input documents AND the realized result.
 /// Caching both means the handler can read context_doc.automata without
 /// re-parsing, even though only the realized portion drives evaluation.
+///
+/// `context_src` / `sidecar_srcs` retain the RAW input strings so a lookup can
+/// verify the full content on a hit — the `u64` key alone (a 64-bit hash) could
+/// collide across two different designs and return the wrong realized model
+/// (a wrong-verdict path); the content check turns any collision into a miss.
 pub struct CacheEntry {
     pub context_doc: Arc<crate::context_dsl::ast::ContextDoc>,
     pub sidecar_docs: Arc<Vec<crate::context_dsl::ast::ContextDoc>>,
     pub realized: Arc<RealizedContext>,
+    /// The raw context source this entry was realized from (collision guard).
+    context_src: Arc<str>,
+    /// The raw sidecar sources, in order (collision guard).
+    sidecar_srcs: Arc<Vec<String>>,
+}
+
+impl CacheEntry {
+    /// True iff this entry was realized from EXACTLY these inputs — the guard
+    /// against a 64-bit-hash collision handing back a different design's model.
+    fn matches(&self, context: &str, sidecars: &[&str]) -> bool {
+        *self.context_src == *context
+            && self.sidecar_srcs.len() == sidecars.len()
+            && self
+                .sidecar_srcs
+                .iter()
+                .zip(sidecars.iter())
+                .all(|(a, b)| a.as_str() == *b)
+    }
 }
 
 impl Clone for CacheEntry {
@@ -40,6 +63,8 @@ impl Clone for CacheEntry {
             context_doc: Arc::clone(&self.context_doc),
             sidecar_docs: Arc::clone(&self.sidecar_docs),
             realized: Arc::clone(&self.realized),
+            context_src: Arc::clone(&self.context_src),
+            sidecar_srcs: Arc::clone(&self.sidecar_srcs),
         }
     }
 }
@@ -76,7 +101,12 @@ pub fn get_or_realize(context: &str, sidecars: &[&str]) -> Result<(CacheEntry, b
         let cache_guard = cache()
             .lock()
             .map_err(|e| format!("cache mutex poisoned: {e}"))?;
-        if let Some(entry) = cache_guard.get(&key) {
+        if let Some(entry) = cache_guard.get(&key)
+            && entry.matches(context, sidecars)
+        {
+            // Content-verified hit — the key AND the raw inputs match. A key-only
+            // match with differing content (a 64-bit-hash collision) falls through
+            // to a fresh realize below, which overwrites the colliding entry.
             return Ok((entry.clone(), true));
         }
     }
@@ -92,6 +122,8 @@ pub fn get_or_realize(context: &str, sidecars: &[&str]) -> Result<(CacheEntry, b
         context_doc: Arc::new(context_doc),
         sidecar_docs: Arc::new(sidecar_docs),
         realized: Arc::new(realized),
+        context_src: Arc::from(context),
+        sidecar_srcs: Arc::new(sidecars.iter().map(|s| s.to_string()).collect()),
     };
 
     {
@@ -155,6 +187,29 @@ context cache_test_same {
         let (_, hit_b2) = get_or_realize(ctx_b, &[]).unwrap();
         assert!(hit_a2, "ctx_a should hit on re-fetch");
         assert!(hit_b2, "ctx_b should hit on re-fetch");
+    }
+
+    #[test]
+    fn hash_collision_falls_through_to_realize() {
+        // Simulate a 64-bit-hash collision: force a DIFFERENT design's entry under the
+        // key that `ctx_correct` hashes to, then verify the lookup rejects it (content
+        // check) and realizes the CORRECT design instead — the GAP-1 guard.
+        let ctx_correct = r#"context cache_test_collision_correct { automata { automaton C { states { state s0 initial; } transitions {} } } }"#;
+        let ctx_other = r#"context cache_test_collision_other { automata { automaton O { states { state s0 initial; } transitions {} } } }"#;
+        let (other_entry, _) = get_or_realize(ctx_other, &[]).unwrap();
+        // Force the collision: the other design's entry stored under ctx_correct's key.
+        let key = cache_key(ctx_correct, &[]);
+        cache().lock().unwrap().insert(key, other_entry);
+        // The key hits the wrong entry, but `matches` must reject it and realize correctly.
+        let (got, _) = get_or_realize(ctx_correct, &[]).unwrap();
+        assert!(
+            got.matches(ctx_correct, &[]),
+            "must return the entry for ctx_correct, not the collided one"
+        );
+        assert!(
+            !got.matches(ctx_other, &[]),
+            "must NOT return ctx_other's realized model"
+        );
     }
 
     #[test]
