@@ -1047,7 +1047,7 @@ fn counter_registers_in(seeded: &Seeded) -> std::collections::BTreeSet<String> {
 /// own SVA — recoverability, realizability, assume-guarantee liveness). The
 /// `guarantees` are appended to the translated property set and verified uniformly;
 /// `assumes` and `skipped` are surfaced as a provenance note.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AnnotationScan {
     /// `@mununu_guarantee <mu-calculus>` properties that parsed, as
     /// `TranslatedAssertion`s ready to merge into `extraction.translated`.
@@ -1639,7 +1639,7 @@ pub fn verify_auto(
     }
 
     // Single-engine path: lift inline (`prelift = None`) then run the body.
-    verify_auto_impl(sources, yosys_opts, opts, None)
+    verify_auto_impl(sources, yosys_opts, opts, None, None)
 }
 
 /// The SV → BTOR2 lift output (incl. the `auto_stub_flops` re-lift), factored out so the
@@ -1709,6 +1709,51 @@ pub(crate) fn lift_sv(
     })
 }
 
+/// P-3 (common-IR hub) — the SVA + annotation extraction result, factored out so the execution
+/// planner can run the slang `extract_sva` subprocess ONCE and share it across the precision-ladder
+/// operators — exactly as [`PreLift`] does for the yosys lift. Without this the portfolio
+/// re-extracts per engine operator (a slang subprocess apiece). Clone so each operator owns a copy.
+#[derive(Clone)]
+pub(crate) struct SharedExtraction {
+    /// The translated SVA with the `@mununu_guarantee` properties merged in.
+    extraction: crate::adapter::slang::translate::TranslationReport,
+    /// The `@mununu_*` annotation scan (drives the annotation note).
+    ann_scan: AnnotationScan,
+    /// Abstraction-predicate hints (in-source `@mununu_predicate` + CLI/API `--predicate`).
+    predicate_hints: Vec<String>,
+}
+
+/// Run the SVA + annotation extraction (the slang subprocess + the source annotation scan), merging
+/// the `@mununu_guarantee` properties into the translated set. Pure function of `(sources, opts)` —
+/// the same inputs every precision-ladder operator shares — so the planner calls it once and threads
+/// the [`SharedExtraction`] into each [`verify_auto_impl`].
+pub(crate) fn extract_front(
+    sources: &[(String, String)],
+    opts: &VerifyAutoOptions,
+) -> Result<SharedExtraction, AdapterError> {
+    let mut extraction = extract_sva_with_options(
+        sources,
+        &TranslateOptions {
+            gate_reset: opts.gate_reset,
+        },
+    )?;
+    let ann_scan = scan_annotation_properties(sources);
+    let predicate_hints: Vec<String> = ann_scan
+        .predicates
+        .iter()
+        .chain(opts.predicate_hints.iter())
+        .cloned()
+        .collect();
+    extraction
+        .translated
+        .extend(ann_scan.guarantees.iter().cloned());
+    Ok(SharedExtraction {
+        extraction,
+        ann_scan,
+        predicate_hints,
+    })
+}
+
 /// The single-engine verify body: extraction → lift → reset/pin → per-property engine →
 /// replan / rescue / notes. `prelift` is `Some` when the planner supplies a shared SV → BTOR2
 /// lift (the portfolio path lifts once), `None` to lift inline (the single-engine path).
@@ -1718,6 +1763,7 @@ pub(crate) fn verify_auto_impl(
     yosys_opts: &YosysOptions,
     opts: &VerifyAutoOptions,
     prelift: Option<PreLift>,
+    shared_extraction: Option<SharedExtraction>,
 ) -> Result<AutoVerifyReport, AdapterError> {
     use crate::adapter::AdapterOptions;
     use crate::adapter::btor2::cegar::{
@@ -1767,34 +1813,22 @@ pub(crate) fn verify_auto_impl(
         });
     }
 
-    // 1. Extract + translate the SVA. When reset-gating, the `disable iff`
-    // guards are dropped from the formulas and the recognized reset signals are
-    // reported (we pin them inactive in the lift below).
-    let mut extraction = extract_sva_with_options(
-        sources,
-        &TranslateOptions {
-            gate_reset: opts.gate_reset,
-        },
-    )?;
-
-    // H.5-GR1 — merge any `@mununu_guarantee` annotation properties (the
-    // mununu-exclusive properties an author adds beyond the design's own SVA)
-    // into the translated set, so they are verified through the same pipeline.
-    // Merged BEFORE the empty-check so a design with no SVA but annotation-only
-    // properties still verifies.
-    let ann_scan = scan_annotation_properties(sources);
-    // W1/W2 — the abstraction-predicate hints seeded into every property's cube:
-    // in-source `@mununu_predicate` annotations MERGED with CLI `--predicate` / API
-    // `predicate` hints. Sound by monotonicity (a hint only refines the cube).
-    let predicate_hints: Vec<String> = ann_scan
-        .predicates
-        .iter()
-        .chain(opts.predicate_hints.iter())
-        .cloned()
-        .collect();
-    extraction
-        .translated
-        .extend(ann_scan.guarantees.iter().cloned());
+    // 1. Extract + translate the SVA (slang subprocess) and merge any `@mununu_guarantee`
+    // annotation properties. When reset-gating, the `disable iff` guards are dropped from the
+    // formulas and the recognized reset signals are reported (pinned inactive in the lift below).
+    // P-3 common-IR hub: `shared_extraction` is `Some` on the portfolio path (the planner extracted
+    // ONCE and shares it across the precision-ladder operators, so the slang subprocess runs once
+    // not per-engine), `None` on the single-engine path (extract inline). Verdict-equivalent either
+    // way. `predicate_hints` (W1/W2) merge in-source `@mununu_predicate` with CLI/API hints — sound
+    // by monotonicity. The merge happens BEFORE the empty-check so an annotation-only design verifies.
+    let SharedExtraction {
+        extraction,
+        ann_scan,
+        predicate_hints,
+    } = match shared_extraction {
+        Some(s) => s,
+        None => extract_front(sources, opts)?,
+    };
 
     let mut report = AutoVerifyReport {
         unsupported: extraction

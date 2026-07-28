@@ -22,8 +22,8 @@
 
 use crate::adapter::slang::verify_auto::{
     AutoVerifyReport, NoteLevel, PortfolioMode, VerificationNote, VerifyAutoOptions, VerifyOutcome,
-    escalate_bottom, lift_sv, merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact,
-    verify_auto_impl,
+    escalate_bottom, extract_front, lift_sv, merge_portfolio_reports, outcome_definite,
+    rescue_skipped_via_exact, verify_auto_impl,
 };
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -147,9 +147,14 @@ pub fn execute(
     // Lift it ONCE here and thread the shared result into each operator's `verify_auto_impl`
     // pass, so a 3-engine ladder does ONE yosys elaboration instead of re-lifting per engine.
     // Verdict-equivalent: each operator runs the identical body it did before, only reusing
-    // the lift instead of recomputing it. (The cheap Rust prep — extraction, reset/pin, parse,
-    // cube-atom classification — still re-runs per operator; only the yosys lift is shared.)
+    // the lift instead of recomputing it. (The cheap Rust prep — reset/pin, parse, cube-atom
+    // classification — still re-runs per operator; the two subprocess costs are shared.)
     let prelift = lift_sv(task.sources, task.yosys_opts, task.opts)?;
+
+    // P-3 common-IR hub: the SVA extraction (the slang subprocess) is likewise a pure function of
+    // `(sources, opts)` — identical for every operator — so extract it ONCE and share it, so a
+    // 3-engine ladder runs slang once, not per engine (the second subprocess, after the yosys lift).
+    let shared_extraction = extract_front(task.sources, task.opts)?;
 
     match plan.mode {
         PortfolioMode::Sequential => {
@@ -162,6 +167,7 @@ pub fn execute(
                         task.yosys_opts,
                         &mk_opts(op),
                         Some(prelift.clone()),
+                        Some(shared_extraction.clone()),
                     ),
                 ));
                 // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
@@ -188,10 +194,17 @@ pub fn execute(
                         .map(|op| {
                             let o = mk_opts(op);
                             let pl = prelift.clone();
+                            let se = shared_extraction.clone();
                             (
                                 op.label,
                                 scope.spawn(move || {
-                                    verify_auto_impl(task.sources, task.yosys_opts, &o, Some(pl))
+                                    verify_auto_impl(
+                                        task.sources,
+                                        task.yosys_opts,
+                                        &o,
+                                        Some(pl),
+                                        Some(se),
+                                    )
                                 }),
                             )
                         })
