@@ -1,29 +1,29 @@
-//! Verification execution planner (verification-execution-planner Phase 3 / roadmap P2.1).
+//! Verification execution planner (verification-execution-planner Phase 3 / roadmap P2.1–P2.2).
 //!
-//! **P2.1a — the planner seam.** A [`VerificationTask`] is turned by [`plan`] into a
-//! [`PhysicalPlan`] (an ordered set of engine operators + a scheduling mode), which
-//! [`execute`] drives — delegating each operator to the existing single-engine
-//! [`verify_auto`](crate::adapter::slang::verify_auto::verify_auto) pass and merging under
-//! the existing runtime soundness guard
-//! ([`merge_portfolio_reports`](crate::adapter::slang::verify_auto::merge_portfolio_reports)).
+//! The portfolio `verify-auto` path runs a four-stage pipeline (the common-IR hub):
 //!
-//! This re-expresses today's `verify_auto` portfolio dispatch as an explicit plan/execute
-//! pair **without changing any verdict** — it is verdict-equivalent by construction (same
-//! operators, same precision order, same merge, same early-exit; the driver body is
-//! relocated verbatim from the former `verify_auto_portfolio`). What it buys is the *seam*:
-//! one place where the "which engines, in what order/mode" decision lives, ready for the
-//! later phases to make cost-based.
+//! 1. [`prepare_model`](crate::adapter::slang::verify_auto::prepare_model) — build the shared
+//!    prepared model ONCE (slang extract + yosys lift + reset/pin), an operator-independent IR.
+//! 2. [`plan`] — the ladder (exact → cube → explicit) **plus** the per-property COST RATIONALE:
+//!    from the model's facts (`property_class` × cone-vs-cap × diameter proxy) predict which engine
+//!    will decide each property, and why (the decision table). This is where the planner's
+//!    reasoning lives.
+//! 3. [`execute`] — drive each operator over the shared model, merge under the runtime soundness
+//!    guard ([`merge_portfolio_reports`](crate::adapter::slang::verify_auto::merge_portfolio_reports)),
+//!    and attach the rationale as `plan-cost` / `plan-accuracy` telemetry ONCE (never a verdict change).
+//! 4. `verify_auto_impl` — the pure per-engine leaf; runs one engine, no planning.
 //!
-//! Not yet here (deliberately): cost-based operator selection off `ModelFacts` (P2.2), the
-//! ⊥-reactive re-plan edges that generalise `escalate_bottom` (P2.1b), and the soundness
-//! plan-invariants — cube-νμ exact-corroboration, property-class transfer gating (P2.1c).
+//! **Verdict-equivalent by construction:** the plan is a fixed precision ladder + reactive rescue
+//! (`escalate_bottom`) + early-exit; the rationale is a telemetry hint, not a dispatch decision (a
+//! sound faster-abstain on the diameter case is un-achievable — see the plan doc). The single-engine
+//! path (a user-picked `--engine`) skips plan/execute and runs `verify_auto_impl` directly.
 //!
-//! See `.claude/plans/verification-execution-planner.md` §4.2/§4.5.
+//! See `.claude/plans/verification-execution-planner.md` + `.claude/plans/cost-annotated-plan-telemetry.md`.
 
 use crate::adapter::slang::verify_auto::{
-    AutoVerifyReport, NoteLevel, PortfolioMode, VerificationNote, VerifyAutoOptions, VerifyOutcome,
-    escalate_bottom, lift_sv, merge_portfolio_reports, outcome_definite, rescue_skipped_via_exact,
-    verify_auto_impl,
+    AutoVerifyReport, NoteLevel, PortfolioMode, PreparedModel, VerificationNote, VerifyAutoOptions,
+    VerifyOutcome, escalate_bottom, merge_portfolio_reports, outcome_definite,
+    rescue_skipped_via_exact, verify_auto_impl,
 };
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -43,7 +43,10 @@ pub struct EngineOp {
     pub exact_symbolic: bool,
 }
 
-/// The physical plan — the ordered engine operators plus how to schedule them.
+/// The physical plan — the ordered engine operators, how to schedule them, and the per-property
+/// COST RATIONALE (which engine the planner predicts will decide each property, and why). The
+/// rationale is the planner's reasoning made explicit; it is attached as `plan-cost` /
+/// `plan-accuracy` telemetry by [`execute`], never a verdict change.
 #[derive(Debug, Clone)]
 pub struct PhysicalPlan {
     /// Operators in precision order (exact first).
@@ -52,6 +55,9 @@ pub struct PhysicalPlan {
     /// budget win); `Parallel` = run all concurrently, merge once. A single-op plan runs the
     /// same under either mode.
     pub mode: PortfolioMode,
+    /// Per-property routing rationale (empty when the plan was built without a prepared model —
+    /// e.g. the plan unit-tests). Computed by [`plan`] from the prepared model's facts.
+    pub rationale: Vec<RoutingRationale>,
 }
 
 /// The logical verification task — the planner's input.
@@ -96,20 +102,28 @@ const PRECISION_LADDER: [EngineOp; 3] = [
 /// emits the full precision ladder in the requested mode; a single-engine intent emits just
 /// that operator. (P2.2 makes this cost-based off `ModelFacts` — cone-vs-cap, property-class
 /// → verdict requirement.)
-pub fn plan(task: &VerificationTask) -> PhysicalPlan {
-    match task.opts.portfolio {
-        Some(mode) => PhysicalPlan {
-            ops: PRECISION_LADDER.to_vec(),
-            mode,
-        },
-        None => PhysicalPlan {
-            ops: vec![EngineOp {
-                label: single_engine_label(task.opts),
-                symbolic_engine: task.opts.symbolic_engine,
-                exact_symbolic: task.opts.exact_symbolic,
+pub(crate) fn plan(prepared: Option<&PreparedModel>, opts: &VerifyAutoOptions) -> PhysicalPlan {
+    let (ops, mode) = match opts.portfolio {
+        Some(mode) => (PRECISION_LADDER.to_vec(), mode),
+        None => (
+            vec![EngineOp {
+                label: single_engine_label(opts),
+                symbolic_engine: opts.symbolic_engine,
+                exact_symbolic: opts.exact_symbolic,
             }],
-            mode: PortfolioMode::Sequential,
-        },
+            PortfolioMode::Sequential,
+        ),
+    };
+    // The planner's cost reasoning, made explicit: from the prepared model's facts, predict the
+    // deciding engine + why for each property (the decision table). Empty when no model is supplied
+    // (the plan unit-tests build the ladder alone). This is what `execute` attaches as telemetry.
+    let rationale = prepared
+        .map(|m| annotate_routing(&m.btor2, &m.properties()))
+        .unwrap_or_default();
+    PhysicalPlan {
+        ops,
+        mode,
+        rationale,
     }
 }
 
@@ -126,8 +140,9 @@ fn single_engine_label(opts: &VerifyAutoOptions) -> &'static str {
 /// Execute the plan: run each engine operator as a single-engine [`verify_auto`] pass and
 /// merge under the runtime soundness guard. Relocated verbatim from the former
 /// `verify_auto_portfolio` — behaviour-identical, so the portfolio's verdicts are unchanged.
-pub fn execute(
+pub(crate) fn execute(
     plan: &PhysicalPlan,
+    prepared: &PreparedModel,
     task: &VerificationTask,
 ) -> Result<AutoVerifyReport, AdapterError> {
     // A single-engine option set derived from `task.opts` with the portfolio disabled and the
@@ -141,15 +156,20 @@ pub fn execute(
         o
     };
 
-    // Lift-once common-IR keystone (roadmap P2.1): the SV → BTOR2 lift (yosys) is a pure
-    // function of `(sources, yosys_opts, opts)` — identical for every precision-ladder
-    // operator (`mk_opts` only flips the portfolio + engine flags, which the lift ignores).
-    // Lift it ONCE here and thread the shared result into each operator's `verify_auto_impl`
-    // pass, so a 3-engine ladder does ONE yosys elaboration instead of re-lifting per engine.
-    // Verdict-equivalent: each operator runs the identical body it did before, only reusing
-    // the lift instead of recomputing it. (The cheap Rust prep — extraction, reset/pin, parse,
-    // cube-atom classification — still re-runs per operator; only the yosys lift is shared.)
-    let prelift = lift_sv(task.sources, task.yosys_opts, task.opts)?;
+    // Attach the plan's cost RATIONALE as telemetry on the final report — one `plan-cost` note per
+    // property + one `plan-accuracy` self-check. The precision ladder + reactive rescue decided the
+    // verdicts; this only explains + checks the routing (never a verdict change). Computed ONCE by
+    // `plan()` from the shared prepared model, so it is not recomputed per operator (the reasoning
+    // lives in the planner now, not in `verify_auto_impl`).
+    let attach = |mut rep: AutoVerifyReport| -> AutoVerifyReport {
+        for r in &plan.rationale {
+            rep.notes.push(routing_rationale_note(r));
+        }
+        if let Some(a) = plan_accuracy_note(&plan.rationale, &rep) {
+            rep.notes.push(a);
+        }
+        rep
+    };
 
     match plan.mode {
         PortfolioMode::Sequential => {
@@ -161,7 +181,7 @@ pub fn execute(
                         task.sources,
                         task.yosys_opts,
                         &mk_opts(op),
-                        Some(prelift.clone()),
+                        Some(prepared.clone()),
                     ),
                 ));
                 // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
@@ -172,14 +192,14 @@ pub fn execute(
                         .iter()
                         .all(|p| outcome_definite(&p.outcome).is_some())
                 {
-                    return merged;
+                    return merged.map(&attach);
                 }
             }
-            merge_portfolio_reports(&runs, plan.mode)
+            merge_portfolio_reports(&runs, plan.mode).map(&attach)
         }
         PortfolioMode::Parallel => {
             // Scoped threads borrow the task's sources / yosys_opts; each owns its option clone
-            // AND its own clone of the shared lift (so no engine re-runs yosys).
+            // AND its own clone of the shared prepared model (so no engine re-runs the prep).
             let runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> =
                 std::thread::scope(|scope| {
                     let handles: Vec<(&str, _)> = plan
@@ -187,11 +207,11 @@ pub fn execute(
                         .iter()
                         .map(|op| {
                             let o = mk_opts(op);
-                            let pl = prelift.clone();
+                            let pm = prepared.clone();
                             (
                                 op.label,
                                 scope.spawn(move || {
-                                    verify_auto_impl(task.sources, task.yosys_opts, &o, Some(pl))
+                                    verify_auto_impl(task.sources, task.yosys_opts, &o, Some(pm))
                                 }),
                             )
                         })
@@ -210,7 +230,7 @@ pub fn execute(
                         })
                         .collect()
                 });
-            merge_portfolio_reports(&runs, plan.mode)
+            merge_portfolio_reports(&runs, plan.mode).map(&attach)
         }
     }
 }
@@ -666,22 +686,6 @@ fn plan_accuracy_note(
     })
 }
 
-/// P2.2d entry — the full cost telemetry for a run: one `plan-cost` note per property plus one
-/// `plan-accuracy` summary. Additive telemetry (verdict-equivalent). Called from `verify_auto_impl`
-/// after the verdicts are in; in the 2b architecture the prediction half moves into `plan()`.
-pub fn routing_telemetry_notes(
-    design_btor2: &str,
-    properties: &[(String, String)],
-    report: &AutoVerifyReport,
-) -> Vec<VerificationNote> {
-    let rationales = annotate_routing(design_btor2, properties);
-    let mut notes: Vec<VerificationNote> = rationales.iter().map(routing_rationale_note).collect();
-    if let Some(acc) = plan_accuracy_note(&rationales, report) {
-        notes.push(acc);
-    }
-    notes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,14 +702,8 @@ mod tests {
     #[test]
     fn plan_portfolio_sequential_emits_the_precision_ladder() {
         let o = opts_with(Some(PortfolioMode::Sequential), false, false);
-        let sources: Vec<(String, String)> = vec![];
-        let yopts = YosysOptions::default();
-        let task = VerificationTask {
-            sources: &sources,
-            yosys_opts: &yopts,
-            opts: &o,
-        };
-        let p = plan(&task);
+        // No prepared model in the unit test → the ladder alone (empty rationale).
+        let p = plan(None, &o);
         assert_eq!(p.mode, PortfolioMode::Sequential);
         assert_eq!(
             p.ops.iter().map(|e| e.label).collect::<Vec<_>>(),
@@ -717,35 +715,20 @@ mod tests {
     #[test]
     fn plan_portfolio_parallel_keeps_the_ladder_and_mode() {
         let o = opts_with(Some(PortfolioMode::Parallel), false, false);
-        let sources: Vec<(String, String)> = vec![];
-        let yopts = YosysOptions::default();
-        let task = VerificationTask {
-            sources: &sources,
-            yosys_opts: &yopts,
-            opts: &o,
-        };
-        let p = plan(&task);
+        let p = plan(None, &o);
         assert_eq!(p.mode, PortfolioMode::Parallel);
         assert_eq!(p.ops.len(), 3);
     }
 
     #[test]
     fn plan_single_engine_emits_one_op() {
-        // exact-symbolic
-        let sources: Vec<(String, String)> = vec![];
-        let yopts = YosysOptions::default();
         for (sym, exact, label) in [
             (false, true, "exact-symbolic"),
             (true, false, "symbolic"),
             (false, false, "explicit"),
         ] {
             let o = opts_with(None, sym, exact);
-            let task = VerificationTask {
-                sources: &sources,
-                yosys_opts: &yopts,
-                opts: &o,
-            };
-            let p = plan(&task);
+            let p = plan(None, &o);
             assert_eq!(p.ops.len(), 1, "single-engine intent → one operator");
             assert_eq!(p.ops[0].label, label);
         }
