@@ -347,8 +347,16 @@ fn skip_over_cap_notes(report: &AutoVerifyReport, design_btor2: &str) -> Vec<Ver
         let atoms = formula_seed_atoms(&formula);
         let (cone_bits, cap) = facts.cone_vs_cap(&atoms);
         if cone_bits <= cap {
-            // Skipped for another reason (atom-less cube, unsupported op) — not a cap issue;
-            // leave it to the existing Skip provenance.
+            // Not a bit-CAP issue (the cone fits). Consult the DIAMETER proxy (P2.2c): an in-cone
+            // down-counter of width W means the fixpoint may need ~2^W iterations, so exact
+            // abstains on the ITERATION budget rather than the bit cap — a different, and more
+            // actionable, Skip reason than "cone too wide". Emit a diameter-bound note when the
+            // proxy can tell (it covers the reload-at-threshold down-counter shape only — up-
+            // counters and non-counter diameters are honestly out of its reach); otherwise leave
+            // it to the existing Skip provenance (atom-less cube, unsupported op).
+            if let Some(w) = facts.cone_counter_diameter_log2(&atoms) {
+                notes.push(diameter_bound_skip_note(&prop.name, w));
+            }
             continue;
         }
         let inputs = facts.pinnable_cone_inputs(&atoms);
@@ -405,6 +413,33 @@ fn skip_over_cap_notes(report: &AutoVerifyReport, design_btor2: &str) -> Vec<Ver
         });
     }
     notes
+}
+
+/// P2.2c — the diameter-proxy Skip note: a property Skipped with its cone UNDER the bit cap, whose
+/// cone carries a `W`-bit down-counter (⟹ up to 2^W fixpoint iterations). It tells the user the
+/// abstention was the ITERATION budget (the reachable DIAMETER), not the bit cap — the sound lever
+/// here is a well-founded RANKING certificate (a `verify-recoverability` escalation / the
+/// recoverability rescue), not register reduction. Advisory only (a note, never a verdict change).
+fn diameter_bound_skip_note(name: &str, counter_log2: u32) -> VerificationNote {
+    VerificationNote {
+        kind: "skip-diameter-bound".into(),
+        level: NoteLevel::ScopeCaveat,
+        summary: format!(
+            "`{name}`: Skipped — the cone fits the bit cap, but an in-cone {counter_log2}-bit \
+             counter gives a ~2^{counter_log2} state-space DIAMETER, so the exact fixpoint \
+             abstains on the iteration budget (not the bit cap)."
+        ),
+        detail: "The exact μ-engine decides by fixpoint iteration; its cost is the reachable \
+                 DIAMETER, which bit-count cannot see (`bit-count ≠ tractability`). A wide in-cone \
+                 down-counter bounds a descent of up to 2^W steps past the iteration budget, so the \
+                 engine abstains after grinding rather than on admission. The decidable lever for a \
+                 well-founded descent is a RANKING certificate (a `verify-recoverability` \
+                 escalation / the recoverability rescue), not register reduction or input \
+                 concretization — and if the descent is not well-founded toward the target, the \
+                 property is a genuine diameter wall (an honest ⊥)."
+            .into(),
+        items: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +595,56 @@ mod tests {
             n.detail.contains("--config-value") && n.detail.contains("INPUT-inflated"),
             "detail must point at --config-value on an input-inflated cone: {}",
             n.detail
+        );
+    }
+
+    // ---- P2.2c: the diameter-proxy Skip note --------------------------------------------------
+
+    #[test]
+    fn skip_note_diameter_bound_flags_in_cone_down_counter() {
+        // A recoverability property Skipped whose cone FITS the cap (an 8-bit counter) but carries
+        // a down-counter → the abstention is attributed to the ITERATION budget (2^8 diameter),
+        // NOT the bit cap. This is the compute_engine_drain shape (proxy fires, exact abstained).
+        let btor2 = "\
+1 sort bitvec 8
+2 sort bitvec 1
+3 state 1 cnt
+4 ones 1
+5 zero 1
+6 one 1
+7 eq 2 3 5
+8 sub 1 3 6
+9 ite 1 7 4 8
+10 next 1 3 9
+11 init 1 3 4
+";
+        let report = skipped_report("p_drain", "nu Y.((mu X.(cnt == 0 || <> X)) && [] Y)");
+        let notes = skip_over_cap_notes(&report, btor2);
+        assert_eq!(notes.len(), 1, "the diameter-bound note fires: {notes:?}");
+        assert_eq!(notes[0].kind, "skip-diameter-bound");
+        assert!(
+            notes[0].summary.contains("DIAMETER") && notes[0].summary.contains("8-bit"),
+            "summary must attribute the Skip to the 8-bit-counter diameter: {}",
+            notes[0].summary
+        );
+        assert!(
+            notes[0].detail.contains("RANKING"),
+            "detail must point at the ranking lever, not register reduction: {}",
+            notes[0].detail
+        );
+    }
+
+    #[test]
+    fn skip_note_no_diameter_claim_without_a_counter() {
+        // A Skipped property over a plain toggle (no counter, cone under cap) gets NO diameter
+        // note — the proxy honestly says nothing when it cannot tell (no over-claiming).
+        let btor2 =
+            "1 sort bitvec 1\n2 state 1 flag\n3 not 1 2\n4 next 1 2 3\n5 zero 1\n6 init 1 2 5\n";
+        let report = skipped_report("p_flag", "nu Y.((mu X.(flag == 1 || <> X)) && [] Y)");
+        let notes = skip_over_cap_notes(&report, btor2);
+        assert!(
+            notes.is_empty(),
+            "no counter in cone ⇒ no diameter note (honest silence): {notes:?}"
         );
     }
 }
