@@ -1772,6 +1772,23 @@ pub struct ExactModel {
     deadline: Option<std::time::Instant>,
 }
 
+/// P2.2c #4 — the outcome of the SOUND diameter pre-pass ([`ExactModel::reach_diameter_to`]).
+/// It MEASURES the exact engine's own bounded fixpoint, so it neither over-predicts (a near
+/// target saturates fast) nor under-predicts (a wide diameter of ANY counter shape ExceedsBound) —
+/// the failure modes of the structural [`ModelFacts::cone_counter_diameter_log2`] proxy.
+///
+/// [`ModelFacts::cone_counter_diameter_log2`]: crate::adapter::btor2::model_facts::ModelFacts::cone_counter_diameter_log2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiameterEstimate {
+    /// The `EF(target)` preimage fixpoint saturated at this depth (≤ `k_max`) — the exact
+    /// distance the farthest state needs to reach `target`. The full exact fixpoint converges
+    /// here, so the property is cheap for the exact engine.
+    Saturated(usize),
+    /// Still growing at `k_max` ⇒ the backward-reach diameter to `target` EXCEEDS `k_max`; the
+    /// exact fixpoint needs > `k_max` iterations (the measured diameter signal).
+    ExceedsBound(usize),
+}
+
 /// The exact-engine fixpoint iteration budget: `MUNUNU_BDD_ITER_BUDGET` or a default sized to
 /// catch a wide-counter diameter (`2^W`) while admitting any control fixpoint (small diameter).
 fn fixpoint_iter_budget() -> usize {
@@ -2105,6 +2122,42 @@ impl ExactModel {
             }
             x = next;
         }
+    }
+
+    /// P2.2c #4 — the SOUND diameter PRE-PASS. Iterate the `EF(target)` least fixpoint
+    /// (`μX.(target ∨ ◇X)`) from `⊥` for up to `k_max` diamond-preimage steps and report where it
+    /// saturates. This runs the exact engine's OWN inner reachability fixpoint, bounded — so it
+    /// *measures* the backward-reach diameter to `target` rather than guessing it from structure.
+    ///
+    /// It is the sound superset of [`ModelFacts::cone_counter_diameter_log2`]: a near target
+    /// saturates in a few steps (`Saturated(small)`), and a wide-diameter recovery of ANY shape —
+    /// an up-counter, a down-drain, a deep sequential chain — `ExceedsBound(k_max)`, with no
+    /// over- or under-prediction (the counter proxy misses up-counters and over-fires on a
+    /// counter-in-cone whose property does not traverse it; this cannot, because it evaluates the
+    /// real transitions). Cheap: `k_max` preimages on the already-built relation, `k_max` small.
+    ///
+    /// USE: routing on the result is still a heuristic *cutoff* — `ExceedsBound(k_max)` soundly
+    /// means the diameter > `k_max`, but concluding "the exact engine will not decide" requires
+    /// `k_max` above the largest *decidable* diameter (empirically small; grinds run to the
+    /// `1<<20` budget). So it is a sound estimator + a deadline/early-abort input, and — because
+    /// `Saturated` means the `EF(target)` reach-set is now known — a decision short-cut on the
+    /// cheap path. Not memoized (varies per target).
+    ///
+    /// [`ModelFacts::cone_counter_diameter_log2`]: crate::adapter::btor2::model_facts::ModelFacts::cone_counter_diameter_log2
+    pub fn reach_diameter_to(&self, target: &BDDFunction, k_max: usize) -> DiameterEstimate {
+        let mut x = self.ff.clone();
+        for depth in 0..k_max {
+            // ◇x under the exact modal preimage (∃ inputs, constraint-respecting), then
+            // `target ∨ ◇x` — the monotone `EF(target)` step. Saturation `next == x` is exact
+            // (ROBDDs are canonical), and the depth at saturation IS the reach diameter.
+            let pre = self.diamond_pre(&x);
+            let next = target.or(&pre).unwrap();
+            if next == x {
+                return DiameterEstimate::Saturated(depth);
+            }
+            x = next;
+        }
+        DiameterEstimate::ExceedsBound(k_max)
     }
 }
 
@@ -3267,6 +3320,44 @@ mod tests {
                     tc.elapsed().as_millis()
                 );
             }
+        }
+    }
+
+    /// P2.2c #4 — the SOUND diameter pre-pass MEASURES the backward-reach distance to the target,
+    /// so it neither over- nor under-predicts (the two failure modes of the structural counter
+    /// proxy). On a K-bit reloading down-counter draining to 0, the diameter to `cnt == 0` is
+    /// 2^K − 1: a `k_max` below it reports `ExceedsBound`; above it, `Saturated` at the true depth.
+    #[test]
+    fn reach_diameter_measures_the_true_counter_distance() {
+        // 4-bit reloading down-counter (init = 15, drains to 0, reloads) — diameter to cnt==0 = 15.
+        let src = "1 sort bitvec 1\n2 sort bitvec 4\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+                   6 constd 2 15\n7 init 2 3 6\n8 eq 1 3 4\n9 sub 2 3 5\n10 ite 2 8 6 9\n11 next 2 3 10\n";
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let target = bb
+            .predicate_bdd(&PredicateExpr::Cmp {
+                register: "cnt".into(),
+                op: CmpOp::Eq,
+                value: 0,
+            })
+            .expect("target bdd");
+        let model = bb.exact_model();
+
+        // k_max BELOW the diameter → ExceedsBound (the measured diameter signal — this is what the
+        // structural counter proxy could only GUESS, and got wrong for up-counters / near targets).
+        assert_eq!(
+            model.reach_diameter_to(&target, 8),
+            DiameterEstimate::ExceedsBound(8),
+            "an 8-step bound cannot reach cnt==0 from the far end of a 4-bit drain"
+        );
+        // k_max ABOVE the diameter → Saturated at the TRUE distance (~15), and it is measured, not
+        // assumed — the pre-pass ran the exact engine's own EF fixpoint, bounded.
+        match model.reach_diameter_to(&target, 64) {
+            DiameterEstimate::Saturated(d) => assert!(
+                (12..=17).contains(&d),
+                "a 4-bit drain saturates at diameter ~15, measured: {d}"
+            ),
+            e => panic!("expected Saturated within the generous bound, got {e:?}"),
         }
     }
 

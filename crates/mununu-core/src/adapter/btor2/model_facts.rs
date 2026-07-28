@@ -48,6 +48,7 @@ pub(crate) struct ModelFacts<'m> {
     theory: OnceLock<Theory>,
     total_bits: OnceLock<u32>,
     free_inputs: OnceLock<Vec<InputFact>>,
+    counters: OnceLock<Vec<crate::adapter::btor2::bit_blast::DownCounterMeta>>,
 }
 
 impl<'m> ModelFacts<'m> {
@@ -58,6 +59,7 @@ impl<'m> ModelFacts<'m> {
             theory: OnceLock::new(),
             total_bits: OnceLock::new(),
             free_inputs: OnceLock::new(),
+            counters: OnceLock::new(),
         }
     }
 
@@ -98,6 +100,44 @@ impl<'m> ModelFacts<'m> {
     pub(crate) fn cone_vs_cap(&self, seed_atoms: &[String]) -> (u32, u32) {
         let cb = self.cone_bits(seed_atoms);
         (cb, effective_bitblast_cap(cb))
+    }
+
+    /// Detected down-counters of the model (`detect_down_counter`), computed once.
+    pub(crate) fn counters(&self) -> &[crate::adapter::btor2::bit_blast::DownCounterMeta] {
+        self.counters
+            .get_or_init(|| crate::adapter::btor2::bit_blast::detect_down_counter(self.model))
+    }
+
+    /// P2.2c (2026-07-28) — the CHEAP **diameter proxy**. The exact μ-engine's fixpoint cost is
+    /// the state-space DIAMETER, not the cone bit-count: `compute_engine_wide` has a ~34-bit cone
+    /// (well under the cap, so `cone_vs_cap` says "admit, cheap") yet a 2³² diameter that grinds
+    /// ~20 s then abstains. Bit-count cannot see the diameter — `bit-count ≠ tractability`
+    /// (P2.5-A) — with ONE cheap exception: a detected **down-counter** of width `W` in the
+    /// property's cone bounds a reachable descent of up to 2^W steps. Returns the widest such
+    /// in-cone counter width (= log₂ of the diameter estimate); `None` when the cone carries no
+    /// detected counter.
+    ///
+    /// **SOUNDNESS / USE — this is a HEURISTIC upper bound, NOT a sound hard-skip predicate.** A
+    /// wide in-cone counter does *not* guarantee the engine grinds: a property whose target is a
+    /// NEARBY value (`EF(cnt == reachable_soon)`) converges in a few iterations regardless of `W`,
+    /// so the proxy OVER-predicts that case. It answers "*could* this fixpoint be diameter-bound?"
+    /// (yes iff a wide counter feeds the cone) — sound as an ADVISORY note and as a
+    /// deadline-shortening input (a genuine decision still finishes under a short deadline; only a
+    /// real grind is cut sooner), but UNSOUND as a hard skip. See `cone_counter_diameter_log2_*`.
+    pub(crate) fn cone_counter_diameter_log2(&self, seed_atoms: &[String]) -> Option<u32> {
+        let counters = self.counters();
+        if counters.is_empty() {
+            return None;
+        }
+        if seed_atoms.is_empty() {
+            return counters.iter().map(|c| c.width).max();
+        }
+        let cone = cone_leaf_nids(self.model, seed_atoms);
+        counters
+            .iter()
+            .filter(|c| cone.contains(&c.nid))
+            .map(|c| c.width)
+            .max()
     }
 
     /// The pinnable primary-input surface — all free `input` leaves, widest first. Memoized.
@@ -249,5 +289,71 @@ mod tests {
             vec!["cfg".to_string()]
         );
         assert!(facts.pinnable_cone_inputs(&["ctrl".to_string()]).is_empty());
+    }
+
+    // An 8-bit down-counter `cnt` (reload-at-0) plus an INDEPENDENT 1-bit toggle `flag`. The
+    // diameter proxy must return the counter width for a cone that reaches `cnt`, and `None` for
+    // one that does not (`flag`), and must ignore the sub-2-bit toggle (not a counter).
+    const COUNTER_FIXTURE: &str = "\
+1 sort bitvec 8
+2 sort bitvec 1
+3 state 1 cnt
+4 ones 1
+5 zero 1
+6 one 1
+7 eq 2 3 5
+8 sub 1 3 6
+9 ite 1 7 4 8
+10 next 1 3 9
+11 init 1 3 4
+12 state 2 flag
+13 not 2 12
+14 next 2 12 13
+15 zero 2
+16 init 2 12 15
+";
+
+    #[test]
+    fn cone_counter_diameter_log2_flags_in_cone_counter() {
+        let file = parser::parse(COUNTER_FIXTURE).expect("parse");
+        let facts = ModelFacts::new(&file);
+        // The 8-bit down-counter is detected and lies in its own cone ⇒ diameter proxy = 8.
+        assert_eq!(
+            facts.cone_counter_diameter_log2(&["cnt".to_string()]),
+            Some(8)
+        );
+        // Whole-design (empty atoms) also sees it.
+        assert_eq!(facts.cone_counter_diameter_log2(&[]), Some(8));
+        // Memoized detection agrees on a second read.
+        assert_eq!(facts.counters().len(), 1);
+    }
+
+    #[test]
+    fn cone_counter_diameter_log2_excludes_out_of_cone_counter() {
+        let file = parser::parse(COUNTER_FIXTURE).expect("parse");
+        let facts = ModelFacts::new(&file);
+        // `flag` toggles independently of `cnt`, so the counter is NOT in its cone ⇒ None.
+        // (The cone filter is what keeps the proxy property-specific, not design-global.)
+        assert_eq!(
+            facts.cone_counter_diameter_log2(&["flag".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn cone_counter_diameter_log2_none_without_counter() {
+        // COST_FIXTURE's `ctrl` is a free-running `+1` up-counter with no reload/threshold — not
+        // a `detect_down_counter` match — so the diameter proxy is None (the proxy only covers
+        // the reload-at-threshold down-counter shape, honestly not every wide register).
+        let file = parser::parse(COST_FIXTURE).expect("parse");
+        let facts = ModelFacts::new(&file);
+        assert_eq!(
+            facts.cone_counter_diameter_log2(&["ctrl".to_string()]),
+            None
+        );
+        assert_eq!(
+            facts.cone_counter_diameter_log2(&["other".to_string()]),
+            None
+        );
     }
 }
