@@ -442,6 +442,246 @@ fn diameter_bound_skip_note(name: &str, counter_log2: u32) -> VerificationNote {
     }
 }
 
+// ---- P2.2d: cost-annotated plan telemetry (per-property routing rationale) --------------------
+//
+// The planner's per-property cost reasoning, made explicit: from the measured facts
+// (property-class × cone-vs-cap × diameter proxy) predict WHICH engine will decide each property
+// and WHY. Telemetry — a `plan-cost` note per property + one `plan-accuracy` summary — NEVER a
+// verdict change (the precision ladder + reactive rescue still decide). See
+// `.claude/plans/cost-annotated-plan-telemetry.md` (P-1 / option 2a). This is the article's
+// "watch the planner reason about cost" spine and the agent/PWA loop's actionable "why + what next".
+
+/// One property's predicted routing + rationale (P2.2d). A prediction, not a verdict.
+#[derive(Debug, Clone)]
+pub struct RoutingRationale {
+    /// Property name.
+    pub property: String,
+    /// Fixpoint class (safety / reachability / liveness-νμ / mixed / propositional).
+    pub class: crate::mu_calculus::PropertyClass,
+    /// The exact engine's cone-of-influence bit width for the property's atoms.
+    pub cone_bits: u32,
+    /// The exact engine's effective bit cap for that cone.
+    pub cap: u32,
+    /// The structural diameter proxy — the widest in-cone down-counter (`Some(W)` ⇒ ~2^W
+    /// diameter), or `None`. Free/static (`ModelFacts::cone_counter_diameter_log2`).
+    pub diameter_log2: Option<u32>,
+    /// The engine the planner predicts will decide this property.
+    pub predicted_engine: &'static str,
+    /// The one-line rationale.
+    pub why: String,
+}
+
+/// The DECISION TABLE — the measured engine-routing classification, made explicit. Pure function of
+/// the facts; returns `(predicted_engine, why)`. `"⊥"` means no engine is predicted to decide it.
+fn predict_engine(
+    class: crate::mu_calculus::PropertyClass,
+    cone_bits: u32,
+    cap: u32,
+    diameter_log2: Option<u32>,
+) -> (&'static str, String) {
+    use crate::mu_calculus::PropertyClass;
+    let fits = cone_bits <= cap;
+    match class {
+        PropertyClass::Safety | PropertyClass::Reachability => {
+            if fits {
+                (
+                    "exact-symbolic",
+                    format!(
+                        "safety/reachability, cone {cone_bits}b ≤ {cap}b cap → exact decides \
+                         `bad`-reachability definitely"
+                    ),
+                )
+            } else {
+                (
+                    "reach-portfolio",
+                    format!(
+                        "safety/reachability, cone {cone_bits}b > {cap}b cap → exact over-cap; the \
+                         reachability portfolio (native BMC / spacer) decides wide `bad`-reachability"
+                    ),
+                )
+            }
+        }
+        PropertyClass::Liveness => match (fits, diameter_log2) {
+            (true, None) => (
+                "exact-symbolic",
+                format!(
+                    "recoverability/liveness, small control cone {cone_bits}b ≤ {cap}b cap, no wide \
+                     counter → exact decides the branching fixpoint"
+                ),
+            ),
+            (true, Some(w)) => (
+                "ranking",
+                format!(
+                    "recoverability/liveness, cone fits but a {w}-bit in-cone counter (~2^{w} \
+                     diameter) → exact abstains on the iteration budget; a ranking certificate \
+                     decides a well-founded descent, else an honest ⊥"
+                ),
+            ),
+            (false, _) => (
+                "cube",
+                format!(
+                    "recoverability/liveness, cone {cone_bits}b > {cap}b cap → exact over-cap; cube \
+                     predicate-abstraction (a register-dominated / value-dependent recovery is an \
+                     honest ⊥)"
+                ),
+            ),
+        },
+        PropertyClass::Mixed | PropertyClass::Propositional => (
+            "exact-symbolic",
+            format!("{class:?} property, cone {cone_bits}b → exact-symbolic decides directly"),
+        ),
+    }
+}
+
+/// Compute the routing rationale for each `(name, mu-formula)` property from the design's facts —
+/// the planner's cost reasoning, made explicit. Pure over `(btor2, formulas)`; runs NO engine (the
+/// diameter is the free structural proxy). A formula that fails to parse is skipped (its own Skip
+/// provenance covers it).
+pub fn annotate_routing(
+    design_btor2: &str,
+    properties: &[(String, String)],
+) -> Vec<RoutingRationale> {
+    use crate::adapter::btor2::model_facts::ModelFacts;
+    use crate::adapter::btor2::symbolic_bitblast::formula_seed_atoms;
+    use crate::mu_calculus::parser as mu_parser;
+
+    let Ok(file) = crate::adapter::btor2::parser::parse(design_btor2) else {
+        return Vec::new();
+    };
+    let facts = ModelFacts::new(&file);
+    let mut out = Vec::new();
+    for (name, formula_str) in properties {
+        let Ok(formula) = mu_parser::parse(formula_str) else {
+            continue;
+        };
+        let class = formula.property_class();
+        let atoms = formula_seed_atoms(&formula);
+        let (cone_bits, cap) = facts.cone_vs_cap(&atoms);
+        let diameter_log2 = facts.cone_counter_diameter_log2(&atoms);
+        let (predicted_engine, why) = predict_engine(class, cone_bits, cap, diameter_log2);
+        out.push(RoutingRationale {
+            property: name.clone(),
+            class,
+            cone_bits,
+            cap,
+            diameter_log2,
+            predicted_engine,
+            why,
+        });
+    }
+    out
+}
+
+/// Render one rationale as a `plan-cost` telemetry note.
+fn routing_rationale_note(r: &RoutingRationale) -> VerificationNote {
+    let cmp = if r.cone_bits <= r.cap { "≤" } else { ">" };
+    let diam = r
+        .diameter_log2
+        .map(|w| format!(", {w}-bit in-cone counter"))
+        .unwrap_or_default();
+    VerificationNote {
+        kind: "plan-cost".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{}` ({:?}, cone {}b {} {}b cap{}) → predicted `{}`: {}",
+            r.property, r.class, r.cone_bits, cmp, r.cap, diam, r.predicted_engine, r.why
+        ),
+        detail: format!(
+            "The planner's per-property cost prediction (telemetry, NOT a verdict): from the \
+             measured facts — property class, cone-of-influence bits vs the exact engine's bit cap, \
+             and the in-cone diameter proxy — the operator most likely to decide this property is \
+             `{}`. The precision ladder + reactive rescue still run unchanged; this only explains \
+             the expected routing.",
+            r.predicted_engine
+        ),
+        items: Vec::new(),
+    }
+}
+
+/// P2.2d self-check — compare each property's PREDICTED decidability to its ACTUAL outcome (a
+/// property with per-property engine provenance is not recorded, so the check is predicted-decidable
+/// vs actually-decided: `Holds`/`Violated` = decided; `Unknown`/`Skipped` = not). A telemetry
+/// signal (and a regression guard against decision-table drift), never an error.
+fn plan_accuracy_note(
+    rationales: &[RoutingRationale],
+    report: &AutoVerifyReport,
+) -> Option<VerificationNote> {
+    if rationales.is_empty() {
+        return None;
+    }
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    let mut divergences: Vec<String> = Vec::new();
+    for r in rationales {
+        let Some(prop) = report.properties.iter().find(|p| p.name == r.property) else {
+            continue;
+        };
+        total += 1;
+        let predicted_decidable = r.predicted_engine != "⊥";
+        let actually_decided = matches!(
+            prop.outcome,
+            VerifyOutcome::Holds | VerifyOutcome::Violated { .. }
+        );
+        if predicted_decidable == actually_decided {
+            matched += 1;
+        } else {
+            divergences.push(format!(
+                "{}: predicted `{}` ({}), outcome {}",
+                r.property,
+                r.predicted_engine,
+                if predicted_decidable {
+                    "decidable"
+                } else {
+                    "⊥"
+                },
+                match &prop.outcome {
+                    VerifyOutcome::Holds => "HOLDS".to_string(),
+                    VerifyOutcome::Violated { .. } => "VIOLATED".to_string(),
+                    VerifyOutcome::Unknown { .. } => "⊥".to_string(),
+                    VerifyOutcome::Skipped { .. } => "Skipped".to_string(),
+                }
+            ));
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(VerificationNote {
+        kind: "plan-accuracy".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "planner cost prediction: {matched}/{total} properties matched (predicted-decidable vs \
+             actually-decided)"
+        ),
+        detail: if divergences.is_empty() {
+            "Every property's predicted routing matched its outcome — the cost model's decision \
+             table agrees with the engines on this design."
+                .to_string()
+        } else {
+            "Divergences below (a telemetry signal, not an error — the prediction is a hint the \
+             engines are free to beat)."
+                .to_string()
+        },
+        items: divergences,
+    })
+}
+
+/// P2.2d entry — the full cost telemetry for a run: one `plan-cost` note per property plus one
+/// `plan-accuracy` summary. Additive telemetry (verdict-equivalent). Called from `verify_auto_impl`
+/// after the verdicts are in; in the 2b architecture the prediction half moves into `plan()`.
+pub fn routing_telemetry_notes(
+    design_btor2: &str,
+    properties: &[(String, String)],
+    report: &AutoVerifyReport,
+) -> Vec<VerificationNote> {
+    let rationales = annotate_routing(design_btor2, properties);
+    let mut notes: Vec<VerificationNote> = rationales.iter().map(routing_rationale_note).collect();
+    if let Some(acc) = plan_accuracy_note(&rationales, report) {
+        notes.push(acc);
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +886,72 @@ mod tests {
             notes.is_empty(),
             "no counter in cone ⇒ no diameter note (honest silence): {notes:?}"
         );
+    }
+
+    // ---- P2.2d: cost-annotated plan telemetry -------------------------------------------------
+
+    #[test]
+    fn predict_engine_decision_table() {
+        use crate::mu_calculus::PropertyClass::*;
+        // safety, cone fits the cap → exact decides.
+        assert_eq!(predict_engine(Safety, 40, 192, None).0, "exact-symbolic");
+        // safety, over cap → the reachability portfolio (BMC/spacer) decides wide safety.
+        assert_eq!(predict_engine(Safety, 300, 192, None).0, "reach-portfolio");
+        // reachability, fits → exact.
+        assert_eq!(
+            predict_engine(Reachability, 10, 192, None).0,
+            "exact-symbolic"
+        );
+        // liveness/νμ-recoverability, small control cone, no counter → exact.
+        assert_eq!(predict_engine(Liveness, 20, 192, None).0, "exact-symbolic");
+        // liveness, cone fits BUT a wide in-cone counter → exact abstains on the diameter → ranking.
+        assert_eq!(predict_engine(Liveness, 40, 192, Some(24)).0, "ranking");
+        // liveness, over cap (value/register-dominated) → cube (→ honest ⊥).
+        assert_eq!(predict_engine(Liveness, 300, 192, None).0, "cube");
+    }
+
+    #[test]
+    fn annotate_routing_reads_the_facts_and_predicts_ranking_for_a_counter_recovery() {
+        // A down-counter recoverability: the cone FITS the cap (8-bit) but carries an in-cone
+        // counter → the diameter proxy fires → the planner predicts `ranking` (exact will abstain).
+        let btor2 = "1 sort bitvec 8\n2 sort bitvec 1\n3 state 1 cnt\n4 ones 1\n5 zero 1\n\
+                     6 one 1\n7 eq 2 3 5\n8 sub 1 3 6\n9 ite 1 7 4 8\n10 next 1 3 9\n11 init 1 3 4\n";
+        let props = vec![(
+            "p_drain".to_string(),
+            "nu Y.((mu X.(cnt == 0 || <> X)) && [] Y)".to_string(),
+        )];
+        let r = annotate_routing(btor2, &props);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].class, crate::mu_calculus::PropertyClass::Liveness);
+        assert_eq!(
+            r[0].diameter_log2,
+            Some(8),
+            "the 8-bit in-cone counter is seen"
+        );
+        assert_eq!(r[0].predicted_engine, "ranking");
+        // The rendered note carries the measured facts inline (article material).
+        let note = routing_rationale_note(&r[0]);
+        assert_eq!(note.kind, "plan-cost");
+        assert!(note.summary.contains("in-cone counter") && note.summary.contains("ranking"));
+    }
+
+    #[test]
+    fn plan_accuracy_flags_a_predicted_decidable_that_did_not_decide() {
+        // Predicted decidable (exact) but the property came back Skipped ⇒ a 0/1 divergence — a
+        // telemetry signal, never an error.
+        let rationales = vec![RoutingRationale {
+            property: "p_drain".into(),
+            class: crate::mu_calculus::PropertyClass::Safety,
+            cone_bits: 40,
+            cap: 192,
+            diameter_log2: None,
+            predicted_engine: "exact-symbolic",
+            why: "x".into(),
+        }];
+        let report = skipped_report("p_drain", "nu Y.((mu X.(cnt == 0 || <> X)) && [] Y)");
+        let note = plan_accuracy_note(&rationales, &report).expect("accuracy note");
+        assert_eq!(note.kind, "plan-accuracy");
+        assert!(note.summary.contains("0/1"), "summary: {}", note.summary);
+        assert_eq!(note.items.len(), 1, "one divergence recorded");
     }
 }

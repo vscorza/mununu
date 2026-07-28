@@ -2487,6 +2487,21 @@ pub(crate) fn verify_auto_impl(
     }
     report.notes.extend(rescue_notes);
     report.notes.extend(exact_skip_notes);
+
+    // P2.2d — cost-annotated plan telemetry: one `plan-cost` note per property (the planner's
+    // per-property cost prediction — class × cone-vs-cap × diameter → predicted engine + why) plus
+    // one `plan-accuracy` summary (predicted-decidable vs actually-decided). Additive telemetry,
+    // verdict-equivalent. Uses the verified formulas (post config-substitution) so it lines up with
+    // the outcomes. (2a: computed here; the 2b refactor moves the prediction half into `plan()`.)
+    let plan_cost_props: Vec<(String, String)> = report
+        .properties
+        .iter()
+        .map(|p| (p.name.clone(), p.formula.clone()))
+        .collect();
+    let plan_cost_notes =
+        crate::planner::routing_telemetry_notes(&btor2, &plan_cost_props, &report);
+    report.notes.extend(plan_cost_notes);
+
     Ok(report)
 }
 
