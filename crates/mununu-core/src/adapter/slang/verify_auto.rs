@@ -1624,21 +1624,11 @@ pub fn verify_auto(
     yosys_opts: &YosysOptions,
     opts: &VerifyAutoOptions,
 ) -> Result<AutoVerifyReport, AdapterError> {
-    use crate::adapter::AdapterOptions;
-    use crate::adapter::btor2::cegar::{
-        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
-    };
-    use crate::adapter::btor2::shadow::augment_with_past_shadows;
-    use crate::adapter::yosys::sv_to_btor2_with_blackboxes;
-    use crate::mu_calculus::Environment;
-    use crate::mu_calculus::parser as mu_parser;
-    use crate::mu_calculus::trit::Trit;
-
     // PORTFOLIO dispatch — when a portfolio mode is set, hand the task to the execution
     // planner (verification-execution-planner P2.1a): `plan()` emits the engine-operator
-    // ladder, `execute()` drives it, delegating each single-engine pass back here (each with
-    // `portfolio: None`, so no recursion) and merging under the runtime soundness guard.
-    // Verdict-equivalent to the former inline `verify_auto_portfolio`.
+    // ladder, `execute()` lifts SV → BTOR2 ONCE (the lift-once common-IR keystone, roadmap
+    // P2.1) and drives each operator over the shared lift, merging under the runtime
+    // soundness guard. Verdict-equivalent to the former inline `verify_auto_portfolio`.
     if opts.portfolio.is_some() {
         let task = crate::planner::VerificationTask {
             sources,
@@ -1648,7 +1638,97 @@ pub fn verify_auto(
         return crate::planner::execute(&crate::planner::plan(&task), &task);
     }
 
-    let (primary_name, primary_content) = sources.first().ok_or_else(|| AdapterError {
+    // Single-engine path: lift inline (`prelift = None`) then run the body.
+    verify_auto_impl(sources, yosys_opts, opts, None)
+}
+
+/// The SV → BTOR2 lift output (incl. the `auto_stub_flops` re-lift), factored out so the
+/// execution planner ([`crate::planner::execute`]) can run the lift **once** and share it
+/// across the precision-ladder operators. The yosys lift is the dominant redundant cost of
+/// the per-operator portfolio body — a 3-engine ladder otherwise re-elaborates the identical
+/// SV up to three times. The cheap Rust prep (SVA extraction, reset detection / pinning,
+/// BTOR2 parse, cube-atom classification) still re-runs per operator; only the lift is shared.
+#[derive(Clone)]
+pub(crate) struct PreLift {
+    /// The lifted BTOR2 (pre reset-pin / shadow / config-pin — those stay per-operator).
+    pub btor2: String,
+    /// Modules the lift black-boxed (instantiated, no body) — surfaced in diagnostics.
+    pub blackboxed_modules: Vec<String>,
+    /// Flop-primitive stubs auto-injected on the H.C re-lift (empty when none).
+    pub auto_provided_stubs: Vec<String>,
+}
+
+/// Run the SV → BTOR2 lift (yosys) with the `auto_stub_flops` re-lift. Pure function of
+/// `(sources, yosys_opts, opts)` — the same inputs every precision-ladder operator shares —
+/// so the planner calls it once and threads the [`PreLift`] into each [`verify_auto_impl`].
+pub(crate) fn lift_sv(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    opts: &VerifyAutoOptions,
+) -> Result<PreLift, AdapterError> {
+    use crate::adapter::yosys::sv_to_btor2_with_blackboxes;
+    let (_, primary_content) = sources.first().ok_or_else(|| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: "adapter/slang/verify_auto: no SV sources provided".to_string(),
+        location: None,
+    })?;
+    // 2. SV → flattened BTOR2. The lift reports modules it black-boxed (instantiated, no
+    // body) — surfaced in `diagnostics.blackboxed_modules` so a cut FSM (the
+    // `prim_sparse_fsm_flop`-class root cause) is visible, not silent.
+    let (mut btor2, mut blackboxed_modules) =
+        sv_to_btor2_with_blackboxes(primary_content, yosys_opts).map_err(|mut e| {
+            e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
+            e
+        })?;
+    // H.C — if the first lift cut a known flop primitive, inject a behavioral stub for it and
+    // re-lift so the register survives (e.g. OpenTitan's `prim_sparse_fsm_flop`). Only stubs
+    // ACTUALLY-cut modules (no collision with designs that provide their own body).
+    let mut auto_provided_stubs = Vec::new();
+    if opts.auto_stub_flops {
+        let stubs = crate::adapter::slang::prim_stubs::stubs_for_cut_modules(&blackboxed_modules);
+        if !stubs.is_empty() {
+            let mut yopts2 = yosys_opts.clone();
+            yopts2.additional_sources.extend(stubs.iter().cloned());
+            let (b2, bb2) =
+                sv_to_btor2_with_blackboxes(primary_content, &yopts2).map_err(|mut e| {
+                    e.message = format!("verify_auto: SV → BTOR2 (with flop stubs): {}", e.message);
+                    e
+                })?;
+            btor2 = b2;
+            blackboxed_modules = bb2;
+            auto_provided_stubs = stubs
+                .iter()
+                .map(|(name, _)| name.trim_end_matches(".sv").to_string())
+                .collect();
+        }
+    }
+    Ok(PreLift {
+        btor2,
+        blackboxed_modules,
+        auto_provided_stubs,
+    })
+}
+
+/// The single-engine verify body: extraction → lift → reset/pin → per-property engine →
+/// replan / rescue / notes. `prelift` is `Some` when the planner supplies a shared SV → BTOR2
+/// lift (the portfolio path lifts once), `None` to lift inline (the single-engine path).
+/// Verdict-equivalent either way — the only difference is whether the yosys lift is reused.
+pub(crate) fn verify_auto_impl(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    opts: &VerifyAutoOptions,
+    prelift: Option<PreLift>,
+) -> Result<AutoVerifyReport, AdapterError> {
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::cegar::{
+        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
+    use crate::adapter::btor2::shadow::augment_with_past_shadows;
+    use crate::mu_calculus::Environment;
+    use crate::mu_calculus::parser as mu_parser;
+    use crate::mu_calculus::trit::Trit;
+
+    let (primary_name, _) = sources.first().ok_or_else(|| AdapterError {
         kind: AdapterErrorKind::ParseError,
         message: "adapter/slang/verify_auto: no SV sources provided".to_string(),
         location: None,
@@ -1758,38 +1838,24 @@ pub fn verify_auto(
         Vec::new()
     };
 
-    // 2. SV → flattened BTOR2, then 3. augment the `__past` shadow flops. The
-    // lift also reports modules it black-boxed (instantiated, no body) — those
-    // are surfaced in `diagnostics.blackboxed_modules` so a cut FSM (the
-    // `prim_sparse_fsm_flop`-class root cause) is visible, not silent.
-    let (mut btor2, mut blackboxed_modules) =
-        sv_to_btor2_with_blackboxes(primary_content, yosys_opts).map_err(|mut e| {
-            e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
-            e
-        })?;
-    // H.C — if the first lift cut a known flop primitive, inject a behavioral
-    // stub for it and re-lift so the register survives (e.g. OpenTitan's
-    // `prim_sparse_fsm_flop`). Only stubs ACTUALLY-cut modules (no collision
-    // with designs that provide their own body).
-    if opts.auto_stub_flops {
-        let stubs = crate::adapter::slang::prim_stubs::stubs_for_cut_modules(&blackboxed_modules);
-        if !stubs.is_empty() {
-            let mut yopts2 = yosys_opts.clone();
-            yopts2.additional_sources.extend(stubs.iter().cloned());
-            let (b2, bb2) =
-                sv_to_btor2_with_blackboxes(primary_content, &yopts2).map_err(|mut e| {
-                    e.message = format!("verify_auto: SV → BTOR2 (with flop stubs): {}", e.message);
-                    e
-                })?;
-            btor2 = b2;
-            blackboxed_modules = bb2;
-            report.diagnostics.auto_provided_stubs = stubs
-                .iter()
-                .map(|(name, _)| name.trim_end_matches(".sv").to_string())
-                .collect();
-        }
-    }
+    // 2. SV → flattened BTOR2 (then 3. augment the `__past` shadow flops, below). Lift-once
+    // keystone (roadmap P2.1): the yosys lift is the dominant redundant cost when the
+    // portfolio runs this body once per engine operator. The planner (`execute`) lifts ONCE
+    // via `lift_sv` and threads the result in as `prelift`, so a 3-engine precision ladder
+    // does ONE yosys lift instead of up to three. On the single-engine path `prelift` is
+    // `None` and the lift runs inline — verdict-equivalent either way. The black-boxed
+    // modules + auto-injected flop stubs are surfaced in diagnostics (a cut FSM, the
+    // `prim_sparse_fsm_flop`-class root cause, is visible not silent).
+    let PreLift {
+        mut btor2,
+        blackboxed_modules,
+        auto_provided_stubs,
+    } = match prelift {
+        Some(p) => p,
+        None => lift_sv(sources, yosys_opts, opts)?,
+    };
     report.diagnostics.blackboxed_modules = blackboxed_modules;
+    report.diagnostics.auto_provided_stubs = auto_provided_stubs;
 
     // Structural reset auto-pin. When reset-gating is on but no `disable iff (reset)`
     // guard was recognized (`reset_pins` empty — the common case for a plain-RTL
