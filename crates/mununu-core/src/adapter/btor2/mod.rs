@@ -20,6 +20,7 @@
 //! - Multi-clock designs.
 
 pub mod abs_safety;
+pub mod array_prophecy;
 pub mod ast;
 pub mod bad_monitor;
 pub mod bit_blast;

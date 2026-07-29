@@ -1424,8 +1424,37 @@ pub fn verify_recoverability_scalable_with_source(
 
     // Parse the design early — needed both for the reset valuation and for the auto-seed candidate
     // values below.
-    let file = crate::adapter::btor2::parser::parse(btor2_content)
+    let file0 = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("recoverability cube path: parsing BTOR2: {}", e.message))?;
+
+    // SPCR (shot ①b) — Selective Prophecy-Cell Registerization. If every in-cone array matches the
+    // sound P-A1 shape (single unconditional full-width write, read at stable/move-to-write indices),
+    // eliminate the arrays by registerizing exactly the accessed cells (a prophecy register + exact
+    // frame). The result is array-FREE, so the must-edge ∀∃ becomes pure QF_BV (decidable) instead of
+    // the undecidable AUFBV+∀-array that leaves the νµ at ⊥. Verdict-preserving reformulation, so a
+    // definite exact verdict on the array-free design transfers. `None` ⇒ no array / not the sound
+    // shape ⇒ keep the original (honest ⊥ downstream). See `array_prophecy` + the plan doc.
+    let spcr_src;
+    let (file, btor2_content): (crate::adapter::btor2::ast::Btor2File, &str) =
+        match crate::adapter::btor2::array_prophecy::spcr(&file0) {
+            Some(af) => {
+                spcr_src = crate::adapter::btor2::emit::emit_btor2(&af);
+                // The array-free cone often now bit-blasts — retry the EXACT ROBDD first (a small
+                // array-free design decides definitively; the array-gated recovery the wall blocked).
+                let formula_str = format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)");
+                if let Ok(formula) = mu_parser::parse(&formula_str)
+                    && let Ok(v) = crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(
+                        &spcr_src, &formula,
+                    )
+                {
+                    return Ok(PropertyVerdict::from(v));
+                }
+                // Cone still too wide for exact even array-free → fall through to the cube on the
+                // array-free design (the guard `pv == K` is now a plain BV predicate; QF_BV must).
+                (af, spcr_src.as_str())
+            }
+            None => (file0, btor2_content),
+        };
     let init_values: BTreeMap<String, u128> =
         crate::adapter::btor2::concrete_oracle::init_valuation(&file);
 
@@ -3847,40 +3876,37 @@ mod tests {
 ";
 
     #[test]
-    fn p1a_array_gated_recovery_hits_must_edge_quantifier_wall() {
-        // (b) THE WALL (P1-a finding): the array-content `Select` seed IS discovered, resolves
-        //     (`array_name_nid`), and CONSTRAINS the may-relation — but the cube still ABSTAINS
-        //     (`Unknown`) on `AG EF(busy==0)`. Why: a definite recoverability verdict needs the
-        //     diamond `<>X` to be True, which needs a MUST (hyper) edge. The must-edge is a ∀∃
-        //     query — `∀ s ⊨ src. ∃ inputs, s'. (T(s,in,s') ∧ s' ⊨ tgt)` — whose negation
-        //     universally quantifies EVERY next-state component, including the next-state ARRAY
-        //     (`universal_bound_arrays`). That puts it in quantified array logic (AUFBV + ∀
-        //     over an array), which Z3 cannot decide → it returns `Unknown` → NO must-edges →
-        //     the νμ stays `Unknown`. The MAY side (∃, QF_AUFBV) is decidable and works.
-        //
-        //     ⇒ An array-content cube predicate is NECESSARY but NOT SUFFICIENT: the array axis
-        //     needs a dedicated abstraction (prophecy à la Mann TACAS'21 / array-aware IC3-CEG)
-        //     that ELIMINATES the universally-quantified array from the must-query. This test
-        //     locks in the honest wall; a future engine that decides it should flip this to
-        //     `Holds` (matching the registerized ROBDD oracle) — a real capability gain.
+    fn p1a_spcr_decides_array_gated_recovery_holds() {
+        // (b) THE WALL, REMOVED by SPCR (shot ①b). BACKGROUND: a definite recoverability verdict
+        //     needs the diamond `<>X` = True, hence a MUST (hyper) edge; the must-edge ∀∃ —
+        //     `∀ s ⊨ src. ∃ in, s'. (T ∧ s' ⊨ tgt)` — universally quantifies EVERY next-state
+        //     component including the next-state ARRAY (`universal_bound_arrays`), which is
+        //     quantified array logic (AUFBV + ∀-over-array), UNDECIDABLE for Z3 → no must-edges →
+        //     the raw cube abstains. FIX: SPCR (`array_prophecy`) registerizes the property-
+        //     ACCESSED cell (`pv = mem[key]`, exact frame) and DROPS the array, so the must-query
+        //     is pure QF_BV (decidable). The design is then array-free and the exact ROBDD decides.
+        //     Verdict-preserving reformulation ⇒ the `Holds` transfers (Bruns–Godefroid), matching
+        //     the whole-array-registerized ROBDD oracle — but at O(#accessed-cells), the scaling
+        //     that beats whole-array registerization (see `array_gates_recovery_large`).
         use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
-        // Discovery fires on the clean fixture (direct symbol, no see-through needed).
+        // Discovery still fires on the array-bearing form (the SPCR read-set detector).
         let file = crate::adapter::btor2::parser::parse(AGR_CLEAN).expect("parse");
         assert!(
             select_guard_atoms(&file).contains(&("mem".to_string(), "key".to_string(), 3)),
             "clean fixture must discover mem[key]==3"
         );
         let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        // The ARRAY-BEARING design makes the exact ROBDD SKIP (in-cone array) — the raw wall.
         assert!(
             exact_symbolic_verdict(AGR_CLEAN, &f).is_err(),
-            "the in-cone array must make the exact ROBDD SKIP (else the cube path is untested)"
+            "the in-cone array must make the raw exact ROBDD SKIP"
         );
+        // SPCR eliminates it → the escalating scalable entry now DECIDES Holds.
         assert_eq!(
-            verify_recoverability_scalable(AGR_CLEAN, "busy == 0", &[]).expect("scalable runs"),
-            PropertyVerdict::Unknown,
-            "array-gated recovery: the ∀∃ must-query over a universally-bound array is undecidable \
-             for Z3 → no must-edges → cube abstains (the array-must wall; needs a dedicated \
-             array abstraction, not a cube predicate)"
+            verify_recoverability_scalable(AGR_CLEAN, "busy == 0", &[]).expect("scalable decides"),
+            PropertyVerdict::Holds,
+            "SPCR removes the array-must wall: registerize the accessed cell, drop the array, \
+             the QF_BV must-query decides AG EF(busy==0) = Holds"
         );
     }
 }
