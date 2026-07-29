@@ -223,16 +223,25 @@ impl Elim<'_> {
     /// `mem'[value-of(E)]` — the NEXT-cycle memory content at index expression `E`. Substitutes
     /// `mem'[leaf]` recursively: a state/const leaf → [`Elim::leaf_frame`]; the write address (under
     /// an unconditional write) → `wdata`; an `ite` → the reconstructed `ite`. Clears `ok` otherwise.
-    fn mem_next_at(&mut self, nid: Nid) -> Operand {
+    ///
+    /// `we_on_path` (P-B.1) tracks whether the path from a registerized index-state's next-value to
+    /// THIS node passed through the THEN-branch of an `ite` guarded by (a conjunction including) the
+    /// write-enable `write_cond`. When it did, a `waddr` leaf resolves to `wdata` even under a
+    /// conditional write — the "latch the last-written address" pattern `idx' = ite(we, waddr, idx)`
+    /// — because on every reachable path to that leaf the write fired, so `mem'[waddr] = wdata`.
+    fn mem_next_at(&mut self, nid: Nid, we_on_path: bool) -> Operand {
         if !self.ok || self.depth > Self::DEPTH_CAP {
             self.ok = false;
             return Operand(0);
         }
         let nid = self.see_through(nid);
         if nid == self.waddr.nid() {
-            if self.write_cond.is_none() {
+            // mem'[waddr] = wdata when the write fires: unconditional, or the path guarantees `we`.
+            if self.write_cond.is_none() || we_on_path {
                 return self.wdata;
             }
+            // conditional write with no guarantee ⇒ mem'[waddr] = ite(we, wdata, mem[waddr]) and the
+            // old mem[waddr] is input-indexed (un-registerizable) ⇒ abstain (P-B.2 / index-prophecy).
             self.ok = false;
             return Operand(0);
         }
@@ -245,9 +254,12 @@ impl Elim<'_> {
                 op: Op::Ite, args, ..
             }) if args.len() == 3 => {
                 let (c, a, b) = (args[0], args[1].nid(), args[2].nid());
+                // Descending into the THEN branch under a guard that implies `write_cond` guarantees
+                // the write fired on that sub-path.
+                let then_we = we_on_path || self.guard_implies_write_cond(c);
                 self.depth += 1;
-                let ma = self.mem_next_at(a);
-                let mb = self.mem_next_at(b);
+                let ma = self.mem_next_at(a, then_we);
+                let mb = self.mem_next_at(b, we_on_path);
                 self.depth -= 1;
                 Operand(self.push(Node::Op {
                     sort: self.elem_sort,
@@ -262,6 +274,22 @@ impl Elim<'_> {
                 Operand(0)
             }
         }
+    }
+
+    /// SOUND sufficient check that an `ite` condition `c` (taken positively) implies the write-enable
+    /// `write_cond`: `c` is syntactically `write_cond` (same nid, same sign), or `c = and(.., write_cond, ..)`.
+    fn guard_implies_write_cond(&self, c: Operand) -> bool {
+        let Some(wc) = self.write_cond else {
+            return false;
+        };
+        if c.0 == wc.0 {
+            return true; // same node, same sign
+        }
+        // `c = and(x, y, …)` where some conjunct is exactly `write_cond`.
+        matches!(
+            self.file.lookup(c.nid()).map(|l| &l.node),
+            Some(Node::Op { op: Op::And, args, .. }) if c.0 >= 0 && args.iter().any(|a| a.0 == wc.0)
+        )
     }
 }
 
@@ -450,7 +478,7 @@ fn eliminate_array(
                 let nn = find_next_value_operand(file, s)
                     .map(|o| o.nid())
                     .unwrap_or(s);
-                elim.mem_next_at(nn)
+                elim.mem_next_at(nn, false)
             }
         };
         let pv = elim.pv_of[&cell];
@@ -1291,6 +1319,59 @@ mod tests {
             .filter(|l| matches!(&l.node, Node::State { symbol: Some(s), .. } if s.starts_with("spcr_pv_")))
             .count();
         assert_eq!(pvs, 2, "reset-mux index registerizes mem[key] AND mem[0]");
+    }
+
+    /// P-B.1 — "latch the last-written address under `we`": `key' = ite(we, waddr, key)` with a
+    /// CONDITIONAL write `mem' = ite(we, write, mem)`. The move-to-`waddr` guard IS `we`, so on every
+    /// reachable path where `key` moves to `waddr` the write fired ⇒ `mem'[waddr] = wdata`. The
+    /// path-condition tracking (`we_on_path`) makes SPCR decide this (P-A1b's plain moving+conditional
+    /// case correctly abstains because there the move guard `arm ≠ we`).
+    const AGR_LATCH_WE: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 input 1 we
+8 state 1 busy
+9 state 2 key
+10 state 3 mem
+11 const 1 0
+12 init 1 8 11
+13 const 2 00
+14 init 2 9 13
+15 const 2 11
+16 read 2 10 9
+17 eq 1 16 15
+18 not 1 8
+19 and 1 4 18
+20 const 1 1
+21 and 1 8 17
+22 ite 1 21 11 8
+23 ite 1 19 20 22
+24 next 1 8 23
+25 ite 2 7 5 9
+26 next 2 9 25
+27 write 3 10 5 6
+28 ite 3 7 27 10
+29 next 3 10 28
+";
+
+    #[test]
+    fn spcr_pb1_latch_last_written_addr_under_we_decides_holds() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        use crate::mu_calculus::parser as mu_parser;
+        let file = crate::adapter::btor2::parser::parse(AGR_LATCH_WE).expect("parse");
+        let out = super::spcr(&file)
+            .expect("P-B.1: move-to-waddr guard implies write-enable ⇒ SPCR applies");
+        assert!(!has_array(&out), "array-free");
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        let src = crate::adapter::btor2::emit::emit_btor2(&out);
+        assert_eq!(
+            exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
+            ExactVerdict::Holds,
+        );
     }
 
     #[test]
