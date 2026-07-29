@@ -818,6 +818,11 @@ impl BddBitBlaster {
                 Ok(self.predicate_bdd(a)?.or(&self.predicate_bdd(b)?).unwrap())
             }
             PredicateExpr::Not(a) => Ok(self.predicate_bdd(a)?.not().unwrap()),
+            PredicateExpr::Select { .. } => Err(
+                "exact-symbolic ROBDD cannot bit-blast an array-content (Select) predicate — it is \
+                 SMT-only (predicate-cube path); the exact engine abstains on it"
+                    .to_string(),
+            ),
         }
     }
 
@@ -2214,6 +2219,17 @@ fn resolve_predicate_expr_registers(
             Box::new(resolve_predicate_expr_registers(a, resolve)),
             Box::new(resolve_predicate_expr_registers(b, resolve)),
         ),
+        PredicateExpr::Select {
+            array,
+            index,
+            op,
+            value,
+        } => PredicateExpr::Select {
+            array: resolve(array),
+            index: resolve(index),
+            op: *op,
+            value: *value,
+        },
         PredicateExpr::Not(a) => {
             PredicateExpr::Not(Box::new(resolve_predicate_expr_registers(a, resolve)))
         }
@@ -2239,6 +2255,11 @@ pub(crate) fn collect_predicate_registers(
         PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
             collect_predicate_registers(a, out);
             collect_predicate_registers(b, out);
+        }
+        PredicateExpr::Select { array, index, .. } => {
+            // Both the array cell AND the index register must be kept in-cone.
+            out.insert(array.clone());
+            out.insert(index.clone());
         }
         PredicateExpr::Not(a) => collect_predicate_registers(a, out),
     }

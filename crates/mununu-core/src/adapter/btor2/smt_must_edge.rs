@@ -310,7 +310,21 @@ fn build_pred_constraint<P: PredicateLike>(
                 };
                 Some(bv.clone())
             };
-            let raw = e.build_constraint(&lookup)?;
+            // SEL — array-content lookup: array cells are absent from the BV
+            // `nid_map` (not cube dimensions), so resolve by name via
+            // `array_name_nid` to the curr/next Z3 `Array` handle, so a `Select`
+            // seed's `select(arr, idx)` binds against the same source/target frame
+            // as the BV atoms.
+            let arr_lookup = |arr: &str| -> Option<z3::ast::Array> {
+                let nid = *view.array_name_nid.get(arr)?;
+                let a = if slot_next {
+                    view.state_next_arr.get(&nid)?
+                } else {
+                    view.state_curr_arr.get(&nid)?
+                };
+                Some(a.clone())
+            };
+            let raw = e.build_constraint_arr(&lookup, &arr_lookup)?;
             Some(if polarity { raw } else { raw.not() })
         }
     }
@@ -412,7 +426,19 @@ fn build_pred_constraint_uniform<P: PredicateLike>(
                     term_source_bv(view, nid).cloned()
                 }
             };
-            let raw = e.build_constraint(&term_bv)?;
+            // SEL — array-content lookup. Array cells are absent from the BV `nid_map`
+            // (not cube dimensions), so resolve the array by name via `array_name_nid`;
+            // arrays have no primed cache, so the next-cycle array is `state_next_arr`.
+            let arr_lookup = |arr: &str| -> Option<z3::ast::Array> {
+                let nid = *view.array_name_nid.get(arr)?;
+                let a = if slot_next {
+                    view.state_next_arr.get(&nid)?
+                } else {
+                    view.state_curr_arr.get(&nid)?
+                };
+                Some(a.clone())
+            };
+            let raw = e.build_constraint_arr(&term_bv, &arr_lookup)?;
             Some(if polarity { raw } else { raw.not() })
         }
     }
@@ -547,6 +573,19 @@ fn universal_bound_bvs(view: &Btor2SmtView) -> Vec<z3::ast::BV> {
     bvs
 }
 
+/// SEL — the next-step ARRAY handles that must ALSO be universally bound in the ∀∃
+/// must-edge check. The transition constrains each memory cell's next value
+/// (`s_next_arr == write(s_arr, …)` / `ite(…)`), so the `state_next_arr` variable is a
+/// next-state component exactly like a `state_next` BV. Omitting it leaves the array's
+/// next-state FREE under the `∀`, which lets the solver pick an array that falsifies the
+/// transition — trivially satisfying `¬(transition ∧ tgt)` and spuriously reporting
+/// `NotMust` for EVERY array-bearing source. Binding it makes the `∀` range over the full
+/// next-state (a sound completeness fix: it can only turn spurious `NotMust` into a
+/// Z3-proven `Must`). Empty under `Theory::BvOnly`.
+fn universal_bound_arrays(view: &Btor2SmtView) -> Vec<z3::ast::Array> {
+    view.state_next_arr.values().cloned().collect()
+}
+
 /// R.2.5b session-2 follow-up (2026-06-09) — standard ∀∃ form of
 /// the SMT must-edge query for one (source-cube, target-cube) pair.
 ///
@@ -603,8 +642,10 @@ where
     // universally quantifying over both is equivalent semantically
     // and is the cleanest encoding given the view's BV vocabulary.
     let bound_bvs = universal_bound_bvs(view);
-    let bound_refs: Vec<&dyn z3::ast::Ast> =
+    let bound_arrs = universal_bound_arrays(view);
+    let mut bound_refs: Vec<&dyn z3::ast::Ast> =
         bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    bound_refs.extend(bound_arrs.iter().map(|a| a as &dyn z3::ast::Ast));
     let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
 
     let solver = z3::Solver::new();
@@ -695,8 +736,10 @@ where
     let inner_body = z3::ast::Bool::and(&[&view.transition, &any_tgt]).not();
 
     let bound_bvs = universal_bound_bvs(view);
-    let bound_refs: Vec<&dyn z3::ast::Ast> =
+    let bound_arrs = universal_bound_arrays(view);
+    let mut bound_refs: Vec<&dyn z3::ast::Ast> =
         bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    bound_refs.extend(bound_arrs.iter().map(|a| a as &dyn z3::ast::Ast));
     let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
 
     let solver = z3::Solver::new();
@@ -926,8 +969,10 @@ where
     let tgt_conj = conj_bool(&tgt_constraints);
     let inner_body = z3::ast::Bool::and(&[&view.transition, &tgt_conj]).not();
     let bound_bvs = universal_bound_bvs(view);
-    let bound_refs: Vec<&dyn z3::ast::Ast> =
+    let bound_arrs = universal_bound_arrays(view);
+    let mut bound_refs: Vec<&dyn z3::ast::Ast> =
         bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    bound_refs.extend(bound_arrs.iter().map(|a| a as &dyn z3::ast::Ast));
     let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
 
     let solver = z3::Solver::new();
@@ -987,8 +1032,10 @@ where
     let any_tgt = z3::ast::Bool::or(&tgt_disjuncts_refs);
     let inner_body = z3::ast::Bool::and(&[&view.transition, &any_tgt]).not();
     let bound_bvs = universal_bound_bvs(view);
-    let bound_refs: Vec<&dyn z3::ast::Ast> =
+    let bound_arrs = universal_bound_arrays(view);
+    let mut bound_refs: Vec<&dyn z3::ast::Ast> =
         bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    bound_refs.extend(bound_arrs.iter().map(|a| a as &dyn z3::ast::Ast));
     let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
 
     let solver = z3::Solver::new();
@@ -1170,7 +1217,13 @@ pub fn smt_combinational_label<P: PredicateLike>(
             let lookup = |reg: &str| -> Option<z3::ast::BV> {
                 derived_source_bv(view, nid_map, reg).cloned()
             };
-            match e.build_constraint(&lookup) {
+            // SEL — current-cycle array lookup for a derived Select predicate.
+            // Array cells resolve by name via `array_name_nid` (absent from `nid_map`).
+            let arr_lookup = |arr: &str| -> Option<z3::ast::Array> {
+                let nid = *view.array_name_nid.get(arr)?;
+                view.state_curr_arr.get(&nid).cloned()
+            };
+            match e.build_constraint_arr(&lookup, &arr_lookup) {
                 Some(b) => b,
                 None => return Tristate::KleeneBot,
             }

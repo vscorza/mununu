@@ -101,6 +101,30 @@ pub enum PredicateExpr {
         /// `width == 0` leaf is a caller error (production never evals it).
         width: u32,
     },
+    /// SEL (P1-a, shot ①b) — an **array-content** predicate
+    /// `array[index] <op> value`: a Z3 `select` over an array-sorted state cell,
+    /// compared to a literal. `array` names an in-cone `$mem` state cell; `index`
+    /// is a BV register whose value chooses the cell; `value` is the literal.
+    ///
+    /// **SMT-ONLY** (like [`PredicateExpr::CmpReg`] / [`PredicateExpr::CmpRegAddend`]):
+    /// the concrete sampler tracks BV registers only, not array *contents*, so
+    /// this leaf can never be [`eval`]'d — it is gated to `SmtAllPairs` via
+    /// [`has_select`]. It is realised only by [`build_constraint_arr`], which
+    /// emits `select(arr, idx) <op> value` over Z3's **exact** array theory
+    /// (QF_AUFBV). Soundness therefore rests on the exactness of `select`, NOT on
+    /// an eval/SMT agreement (there is no eval counterpart) — the array image is
+    /// the precise must-side oracle (`btor2_encode` §Phase 10), so a definite
+    /// verdict transfers.
+    ///
+    /// [`eval`]: PredicateExpr::eval
+    /// [`has_select`]: PredicateExpr::has_select
+    /// [`build_constraint_arr`]: PredicateExpr::build_constraint_arr
+    Select {
+        array: String,
+        index: String,
+        op: CmpOp,
+        value: u64,
+    },
     And(Box<PredicateExpr>, Box<PredicateExpr>),
     Or(Box<PredicateExpr>, Box<PredicateExpr>),
     Not(Box<PredicateExpr>),
@@ -154,9 +178,46 @@ impl PredicateExpr {
     pub fn has_addend(&self) -> bool {
         match self {
             PredicateExpr::CmpRegAddend { .. } => true,
-            PredicateExpr::Cmp { .. } | PredicateExpr::CmpReg { .. } => false,
+            PredicateExpr::Cmp { .. }
+            | PredicateExpr::CmpReg { .. }
+            | PredicateExpr::Select { .. } => false,
             PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => a.has_addend() || b.has_addend(),
             PredicateExpr::Not(a) => a.has_addend(),
+        }
+    }
+
+    /// SEL — true if the expression contains an array-content leaf
+    /// ([`PredicateExpr::Select`]). Like [`has_addend`], such an expression is
+    /// routed **SMT-only** (`SmtAllPairs`): the literal-based sampler cannot read
+    /// array content, so [`eval`] must never see it — only
+    /// [`build_constraint_arr`] realises it, over Z3's exact array theory.
+    ///
+    /// [`has_addend`]: PredicateExpr::has_addend
+    /// [`eval`]: PredicateExpr::eval
+    /// [`build_constraint_arr`]: PredicateExpr::build_constraint_arr
+    pub fn has_select(&self) -> bool {
+        match self {
+            PredicateExpr::Select { .. } => true,
+            PredicateExpr::Cmp { .. }
+            | PredicateExpr::CmpReg { .. }
+            | PredicateExpr::CmpRegAddend { .. } => false,
+            PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => a.has_select() || b.has_select(),
+            PredicateExpr::Not(a) => a.has_select(),
+        }
+    }
+
+    /// SEL — an array-content atom `array[index] <op> value`. SMT-only.
+    pub fn select(
+        array: impl Into<String>,
+        index: impl Into<String>,
+        op: CmpOp,
+        value: u64,
+    ) -> Self {
+        PredicateExpr::Select {
+            array: array.into(),
+            index: index.into(),
+            op,
+            value,
         }
     }
 
@@ -203,6 +264,18 @@ impl PredicateExpr {
                 };
                 cmp_apply(*op, l, sum)
             }
+            PredicateExpr::Select { .. } => {
+                // SMT-only: the concrete sampler tracks BV registers, not array
+                // contents. `has_select` gates a Select-bearing predicate to
+                // `SmtAllPairs`, so this is never reached in production — a
+                // debug-assert catches a mis-route; release returns `false`
+                // (a conservative label, not relied upon).
+                debug_assert!(
+                    false,
+                    "eval on a Select leaf (array-content, SMT-only) — production must use build_constraint_arr"
+                );
+                false
+            }
             PredicateExpr::And(a, b) => a.eval(regs) && b.eval(regs),
             PredicateExpr::Or(a, b) => a.eval(regs) || b.eval(regs),
             PredicateExpr::Not(a) => !a.eval(regs),
@@ -228,11 +301,42 @@ impl PredicateExpr {
                 out.insert(lhs.clone());
                 out.insert(rhs.clone());
             }
+            PredicateExpr::Select { index, .. } => {
+                // The BV INDEX register (resolved via the BV lookup); the array
+                // itself is resolved separately via the array lookup (see
+                // `arrays()` / `build_constraint_arr`).
+                out.insert(index.clone());
+            }
             PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
                 a.collect_registers(out);
                 b.collect_registers(out);
             }
             PredicateExpr::Not(a) => a.collect_registers(out),
+        }
+    }
+
+    /// SEL — all distinct ARRAY names referenced by [`PredicateExpr::Select`]
+    /// leaves, sorted. The caller resolves each to an array-sorted state cell
+    /// (via the encoded view's `state_curr_arr`) and confirms it is in-cone.
+    pub fn arrays(&self) -> Vec<String> {
+        let mut set = BTreeSet::new();
+        self.collect_arrays(&mut set);
+        set.into_iter().collect()
+    }
+
+    fn collect_arrays(&self, out: &mut BTreeSet<String>) {
+        match self {
+            PredicateExpr::Select { array, .. } => {
+                out.insert(array.clone());
+            }
+            PredicateExpr::Cmp { .. }
+            | PredicateExpr::CmpReg { .. }
+            | PredicateExpr::CmpRegAddend { .. } => {}
+            PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
+                a.collect_arrays(out);
+                b.collect_arrays(out);
+            }
+            PredicateExpr::Not(a) => a.collect_arrays(out),
         }
     }
 
@@ -247,18 +351,42 @@ impl PredicateExpr {
     where
         F: Fn(&str) -> Option<z3::ast::BV>,
     {
+        // No array lookup supplied — a `Select` (array-content) leaf therefore
+        // resolves to `None`, which the caller treats as an `Unknown` must-edge
+        // (the conservative direction). Array-aware callers use
+        // [`build_constraint_arr`].
+        self.build_constraint_arr(lookup, &|_: &str| None)
+    }
+
+    /// SEL — the array-aware SMT encoding. Identical to [`build_constraint`] for
+    /// every BV leaf, and additionally realises [`PredicateExpr::Select`] as
+    /// `select(arr_lookup(array), bv_lookup(index)) <op> value` over Z3's exact
+    /// array theory (QF_AUFBV). `arr_lookup` maps an array-sorted state-cell name
+    /// to its `state_curr`/`state_next` [`z3::ast::Array`] from the encoded view.
+    /// Returns `None` (⇒ conservative `Unknown`) if any referenced register OR
+    /// array is absent from the view, matching the missing-register behaviour of
+    /// the simple-atom path.
+    ///
+    /// **Caller must hold a [`z3::with_z3_config`] scope.**
+    ///
+    /// [`build_constraint`]: PredicateExpr::build_constraint
+    pub fn build_constraint_arr<F, G>(&self, bv_lookup: &F, arr_lookup: &G) -> Option<z3::ast::Bool>
+    where
+        F: Fn(&str) -> Option<z3::ast::BV>,
+        G: Fn(&str) -> Option<z3::ast::Array>,
+    {
         match self {
             PredicateExpr::Cmp {
                 register,
                 op,
                 value,
             } => {
-                let bv = lookup(register)?;
+                let bv = bv_lookup(register)?;
                 Some(cmp_constraint(&bv, *op, *value))
             }
             PredicateExpr::CmpReg { lhs, op, rhs } => {
-                let lbv = lookup(lhs)?;
-                let rbv = lookup(rhs)?;
+                let lbv = bv_lookup(lhs)?;
+                let rbv = bv_lookup(rhs)?;
                 Some(cmp_constraint_bv(&lbv, *op, &rbv))
             }
             PredicateExpr::CmpRegAddend {
@@ -271,25 +399,40 @@ impl PredicateExpr {
                 // `lhs <op> (rhs + addend)` in BV — `bvadd` wraps at `rhs`'s real
                 // width (the RTL semantics). `width` is the eval-side modulus
                 // only; here the operand BVs carry the authoritative width.
-                let lbv = lookup(lhs)?;
-                let rbv = lookup(rhs)?;
+                let lbv = bv_lookup(lhs)?;
+                let rbv = bv_lookup(rhs)?;
                 let w = rbv.get_size();
                 let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                 let addend_bv = z3::ast::BV::from_u64(*addend & mask, w);
                 let sum = rbv.bvadd(&addend_bv);
                 Some(cmp_constraint_bv(&lbv, *op, &sum))
             }
+            PredicateExpr::Select {
+                array,
+                index,
+                op,
+                value,
+            } => {
+                // SEL — `select(arr, idx) <op> value`. Exact array read (mirrors
+                // the encoder's `Op::Read`, `btor2_encode.rs:762`). `None` (⇒
+                // conservative Unknown) if the array/index is absent from the view
+                // or the element is not a bit-vector.
+                let arr = arr_lookup(array)?;
+                let idx = bv_lookup(index)?;
+                let elem = arr.select(&idx).as_bv()?;
+                Some(cmp_constraint(&elem, *op, *value))
+            }
             PredicateExpr::And(a, b) => {
-                let ca = a.build_constraint(lookup)?;
-                let cb = b.build_constraint(lookup)?;
+                let ca = a.build_constraint_arr(bv_lookup, arr_lookup)?;
+                let cb = b.build_constraint_arr(bv_lookup, arr_lookup)?;
                 Some(z3::ast::Bool::and(&[&ca, &cb]))
             }
             PredicateExpr::Or(a, b) => {
-                let ca = a.build_constraint(lookup)?;
-                let cb = b.build_constraint(lookup)?;
+                let ca = a.build_constraint_arr(bv_lookup, arr_lookup)?;
+                let cb = b.build_constraint_arr(bv_lookup, arr_lookup)?;
                 Some(z3::ast::Bool::or(&[&ca, &cb]))
             }
-            PredicateExpr::Not(a) => Some(a.build_constraint(lookup)?.not()),
+            PredicateExpr::Not(a) => Some(a.build_constraint_arr(bv_lookup, arr_lookup)?.not()),
         }
     }
 }
@@ -400,6 +543,10 @@ enum Token {
     Plus,
     LParen,
     RParen,
+    /// SEL — `[` / `]` delimiting the index of an array-content atom
+    /// `array[index] <op> value`.
+    LBracket,
+    RBracket,
 }
 
 fn tokenize(s: &str) -> Result<Vec<Token>, PredicateExprParseError> {
@@ -419,6 +566,14 @@ fn tokenize(s: &str) -> Result<Vec<Token>, PredicateExprParseError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
                 i += 1;
             }
             '&' if chars.get(i + 1) == Some(&'&') => {
@@ -580,6 +735,50 @@ impl Parser<'_> {
             Some(Token::Ident(s)) => s,
             other => return Err(perr(format!("expected a register name, found {other:?}"))),
         };
+        // SEL — `array[index] <op> value` (array-content atom). An `[` after the
+        // first identifier means it names an array; parse the index register + `]`,
+        // then a comparison against an integer literal → `PredicateExpr::Select`.
+        if matches!(self.peek(), Some(Token::LBracket)) {
+            self.pos += 1; // consume `[`
+            let index = match self.next() {
+                Some(Token::Ident(s)) => s,
+                other => {
+                    return Err(perr(format!(
+                        "expected an index register in `{register}[…]`, found {other:?}"
+                    )));
+                }
+            };
+            match self.next() {
+                Some(Token::RBracket) => {}
+                other => {
+                    return Err(perr(format!(
+                        "expected `]` after `{register}[{index}`, found {other:?}"
+                    )));
+                }
+            }
+            let op = match self.next() {
+                Some(Token::Op(o)) => o,
+                other => {
+                    return Err(perr(format!(
+                        "expected a comparison operator after `{register}[{index}]`, found {other:?}"
+                    )));
+                }
+            };
+            let value = match self.next() {
+                Some(Token::Int(v)) => v,
+                other => {
+                    return Err(perr(format!(
+                        "expected an integer value after `{register}[{index}] <op>`, found {other:?}"
+                    )));
+                }
+            };
+            return Ok(PredicateExpr::Select {
+                array: register,
+                index,
+                op,
+                value,
+            });
+        }
         let op = match self.next() {
             Some(Token::Op(o)) => o,
             other => {
