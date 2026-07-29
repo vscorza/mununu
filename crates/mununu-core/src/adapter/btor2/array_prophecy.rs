@@ -8,20 +8,29 @@
 //! `recoverability::tests::p1a_array_gated_recovery_hits_must_edge_quantifier_wall`).
 //! Plan: `.claude/plans/spcr-selective-prophecy-cell-registerization.md`.
 //!
-//! **P-A1 scope (SOUND, conservative — abstains (returns `None`) otherwise).** For EVERY array
-//! state in the design: a single UNCONDITIONAL full-width write `mem' = write(mem, waddr, wdata)`,
-//! read only at bare-register indices whose next-value moves only within `{itself, waddr}`
-//! (stable / move-to-write-address). Under that shape the frame
+//! **Scope (SOUND, conservative — abstains (returns `None`) otherwise).** For EVERY array state in
+//! the design, the next-state is a write to `waddr`/`wdata` (P-A1 an UNCONDITIONAL
+//! `mem' = write(mem, waddr, wdata)`; P-A1b a write-ENABLE mux `ite(cond, write, mem)`, with a
+//! tautological `cond` collapsing to unconditional), read only at bare-register indices. The frame
 //!
 //! ```text
-//! pv' = ite(waddr == idx', wdata, pv)          (idx' = the index register's next-value)
+//! pv' = ite(cond ∧ (waddr == idx'), wdata, pv)   (idx' = the index register's next-value)
 //! ```
 //!
-//! reproduces `mem'[idx']` EXACTLY: when `idx' = idx` (held) the else-branch is `mem[idx] = pv`;
-//! when `idx' = waddr` (moved to the written cell) the `waddr == idx'` guard is true so it is
-//! `wdata = mem'[waddr]`. So SPCR is a verdict-PRESERVING reformulation (not an abstraction): the
-//! KMTS of the SPCR'd design has the same may/must edges as the original on the property-relevant
-//! projection ⇒ definite νµ verdicts transfer at every alternation depth (Bruns–Godefroid).
+//! reproduces `mem'[idx']` EXACTLY under two sound, checkable index disciplines:
+//!   - **(U) unconditional / tautological write** — `idx'` may MOVE within `{idx, waddr}`: when
+//!     `idx' = idx` the else-branch is `mem[idx] = pv`; when `idx' = waddr` the write always fires
+//!     so the guard is true and it is `wdata = mem'[waddr]`.
+//!   - **(S) conditional write** — `idx'` must be STABLE (`= idx` always): then `mem'[idx] =
+//!     ite(cond ∧ waddr==idx, wdata, mem[idx]) = ite(cond ∧ waddr==idx, wdata, pv)`, exact for any
+//!     `cond`. (A moving index under a conditional write is UNSOUND — the index could move to
+//!     `waddr` while the write is disabled, leaving `mem[waddr] ≠ pv` — so it abstains.)
+//!
+//! So SPCR is a verdict-PRESERVING reformulation (not an abstraction): the KMTS of the SPCR'd design
+//! has the same may/must edges as the original on the property-relevant projection ⇒ definite νµ
+//! verdicts transfer at every alternation depth (Bruns–Godefroid). Residual (abstain): a
+//! read-modify-write / input-indexed read (needs the array or a dead-code fold), a moving index
+//! under a conditional write, write-chains, or a non-register index.
 
 use crate::adapter::btor2::ast::{Btor2File, Line, Nid, Node, Op, Operand, Sort};
 use crate::adapter::btor2::parser::find_next_value_operand;
@@ -42,12 +51,43 @@ struct ArrayPlan {
     array_next_nid: Option<Nid>,
     array_init_nid: Option<Nid>,
     write_nid: Nid,
+    /// The write-enable mux node `ite(cond, write, array)` (P-A1b), if the write is conditional.
+    mux_nid: Option<Nid>,
+    /// The write-enable condition (`None` = unconditional / a tautological enable). When `Some`,
+    /// the write only fires under `cond`, so the frame guards `wdata` by `cond ∧ (waddr==idx')`
+    /// AND the index is required to be STABLE (never moves) — see the soundness note in
+    /// [`plan_for_array`].
+    write_cond: Option<Operand>,
 }
 
 fn sort_of(file: &Btor2File, nid: Nid) -> Option<Sort> {
     match &file.lookup(nid)?.node {
         Node::Sort { sort } => Some(sort.clone()),
         _ => None,
+    }
+}
+
+/// A syntactic tautology — a write-enable that always fires, so the mux is really an
+/// unconditional write (`const 1`, `redor(nonzero const)`, `not(const 0)`). Yosys emits e.g.
+/// `ite(redor(K), write, mem)` for a `for`-style always-write; treating it as unconditional
+/// lets the moving-index (P-A1) frame apply.
+fn is_tautology(file: &Btor2File, nid: Nid) -> bool {
+    use crate::adapter::btor2::bit_blast::resolve_btor2_constant;
+    if resolve_btor2_constant(file, nid).is_some_and(|v| v != 0) {
+        return true;
+    }
+    match file.lookup(nid).map(|l| &l.node) {
+        Some(Node::Op {
+            op: Op::Redor,
+            args,
+            ..
+        }) if args.len() == 1 => {
+            resolve_btor2_constant(file, args[0].nid()).is_some_and(|v| v != 0)
+        }
+        Some(Node::Op {
+            op: Op::Not, args, ..
+        }) if args.len() == 1 => resolve_btor2_constant(file, args[0].nid()) == Some(0),
+        _ => false,
     }
 }
 
@@ -77,22 +117,48 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
     };
     let elem_sort = element;
 
-    // The array's next MUST be a single unconditional Write(array, waddr, wdata).
+    // The array's next is either a single unconditional `Write(array, waddr, wdata)` (P-A1) or a
+    // write-ENABLE mux `ite(cond, write(array, …), array)` (P-A1b). A tautological `cond` collapses
+    // to unconditional. Anything else (write-chain, write in the else-branch, nested mux) abstains.
     let next_op = find_next_value_operand(file, array_nid)?;
     let array_next_nid = file.lines.iter().find_map(|l| match &l.node {
         Node::Next { state, .. } if *state == array_nid => Some(l.nid),
         _ => None,
     });
-    let write_line = file.lookup(next_op.nid())?;
-    let (waddr, wdata, write_nid) = match &write_line.node {
+    let next_line = file.lookup(next_op.nid())?;
+    let (write_nid, mux_nid, write_cond): (Nid, Option<Nid>, Option<Operand>) =
+        match &next_line.node {
+            Node::Op { op: Op::Write, .. } => (next_op.nid(), None, None),
+            Node::Op {
+                op: Op::Ite, args, ..
+            } if args.len() == 3 && args[2].nid() == array_nid => {
+                // ite(cond, write(array,…), array) — write in the THEN branch, hold in the else.
+                let cond = args[0];
+                let eff_cond = if is_tautology(file, cond.nid()) {
+                    None
+                } else {
+                    Some(cond)
+                };
+                (args[1].nid(), Some(next_op.nid()), eff_cond)
+            }
+            _ => return None,
+        };
+    let write_line = file.lookup(write_nid)?;
+    let (waddr, wdata) = match &write_line.node {
         Node::Op {
             op: Op::Write,
             args,
             ..
-        } if args.len() == 3 && args[0].nid() == array_nid => (args[1], args[2], write_line.nid),
-        // write-mux / chain / non-write next → P-A1 abstains.
+        } if args.len() == 3 && args[0].nid() == array_nid => (args[1], args[2]),
         _ => return None,
     };
+    // SOUNDNESS: the frame `pv' = ite(cond ∧ waddr==idx', wdata, pv)` is exact iff `idx' ≠ idx ⟹
+    // cond` (the index moves to `waddr` only when the write fires). Two sound, checkable cases:
+    //   (U) `write_cond == None` (unconditional / tautological) ⇒ the move-to-`waddr` guard is
+    //       trivially satisfied ⇒ a MOVING index (`idx' ∈ {idx, waddr}`) is fine.
+    //   (S) `write_cond == Some` (a real enable) ⇒ require a STABLE index (never moves), so the
+    //       `idx' = waddr` case never arises and the frame is exact for any `cond`.
+    let allow_waddr = write_cond.is_none();
 
     // Broadcast init (a const operand) if present.
     let (init_value, array_init_nid) = file
@@ -125,6 +191,14 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
     if reads.is_empty() {
         return None;
     }
+    // The write-enable condition must not itself BE an array read (else the frame's guard would
+    // dangle when the read is dropped). A cond that merely CONTAINS a read via an op node is fine
+    // — that op is kept and remapped to `pv`. Direct-read-as-enable is bizarre; abstain.
+    if let Some(cond) = write_cond
+        && reads.iter().any(|&(r, _)| r == cond.nid())
+    {
+        return None;
+    }
 
     // Stability: each index register's next-value moves only within {itself, waddr}.
     let mut index_next: HashMap<Nid, Option<Operand>> = HashMap::new();
@@ -140,8 +214,16 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
                 if !vis.insert(n) {
                     continue;
                 }
-                if n == idx || n == waddr.nid() {
-                    continue; // an allowed leaf (hold / move-to-write-address)
+                if n == idx {
+                    continue; // held — always allowed
+                }
+                if n == waddr.nid() {
+                    // move-to-write-address — allowed ONLY for an unconditional/tautological write
+                    // (case U); a conditional write requires a stable index (case S).
+                    if allow_waddr {
+                        continue;
+                    }
+                    return None;
                 }
                 match &file.lookup(n)?.node {
                     Node::Op {
@@ -159,9 +241,12 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
         index_next.insert(idx, nx);
     }
 
-    // No OTHER reference to the array beyond the reads + the write + next-array + init-array.
+    // No OTHER reference to the array beyond the reads + the write + the enable-mux + next + init.
     let mut expected: HashSet<Nid> = reads.iter().map(|&(r, _)| r).collect();
     expected.insert(write_nid);
+    if let Some(n) = mux_nid {
+        expected.insert(n);
+    }
     if let Some(n) = array_next_nid {
         expected.insert(n);
     }
@@ -185,6 +270,8 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
         array_next_nid,
         array_init_nid,
         write_nid,
+        mux_nid,
+        write_cond,
     })
 }
 
@@ -291,6 +378,9 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
     for plan in &plans {
         drop_nodes.insert(plan.array_nid);
         drop_nodes.insert(plan.write_nid);
+        if let Some(n) = plan.mux_nid {
+            drop_nodes.insert(n);
+        }
         if let Some(n) = plan.array_next_nid {
             drop_nodes.insert(n);
         }
@@ -328,7 +418,9 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
                     source_line: 0,
                 });
             }
-            // frame: pv' = ite(eq(waddr, idx'), wdata, pv). A never-written index holds (idx' = idx).
+            // frame: pv' = ite(GUARD, wdata, pv), GUARD = (waddr == idx') [∧ write_cond].
+            // Unconditional/tautological write ⇒ GUARD = eq (index may move). Conditional write ⇒
+            // GUARD = write_cond ∧ eq, and the index is stable (idx' = idx) by the plan gate.
             let idx_next_op = idx_next.unwrap_or(Operand(idx));
             let eq = alloc();
             tail.push(Line {
@@ -342,13 +434,31 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
                 immediates: Vec::new(),
                 source_line: 0,
             });
+            let guard = match plan.write_cond {
+                None => Operand(eq),
+                Some(cond) => {
+                    let and = alloc();
+                    tail.push(Line {
+                        nid: and,
+                        node: Node::Op {
+                            sort: bool_sort,
+                            op: Op::And,
+                            args: vec![cond, Operand(eq)],
+                            symbol: None,
+                        },
+                        immediates: Vec::new(),
+                        source_line: 0,
+                    });
+                    Operand(and)
+                }
+            };
             let ite = alloc();
             tail.push(Line {
                 nid: ite,
                 node: Node::Op {
                     sort: plan.elem_sort,
                     op: Op::Ite,
-                    args: vec![Operand(eq), plan.wdata, Operand(pv)],
+                    args: vec![guard, plan.wdata, Operand(pv)],
                     symbol: None,
                 },
                 immediates: Vec::new(),
@@ -538,6 +648,104 @@ mod tests {
         assert_eq!(
             exact_symbolic_verdict(&src, &f).expect("array-free 17-bit cone ⇒ exact decides"),
             ExactVerdict::Holds,
+        );
+    }
+
+    /// P-A1b — write-ENABLE mux `mem' = ite(we, write(mem,waddr,wdata), mem)` with a STABLE
+    /// (never-moving) config index `key`. Recovery via the env asserting `we ∧ waddr==key ∧
+    /// wdata==3`; `AG EF(busy==0)` HOLDS. SPCR frame = `pv' = ite(we ∧ waddr==key, wdata, pv)`.
+    const AGR_SPCR_WE: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 input 1 we
+8 state 1 busy
+9 state 2 key
+10 state 3 mem
+11 const 1 0
+12 init 1 8 11
+13 const 2 00
+14 init 2 9 13
+15 const 2 11
+16 read 2 10 9
+17 eq 1 16 15
+18 not 1 8
+19 and 1 4 18
+20 const 1 1
+21 and 1 8 17
+22 ite 1 21 11 8
+23 ite 1 19 20 22
+24 next 1 8 23
+25 write 3 10 5 6
+26 ite 3 7 25 10
+27 next 3 10 26
+";
+
+    #[test]
+    fn spcr_pa1b_write_enable_mux_stable_index_decides_holds() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        use crate::mu_calculus::parser as mu_parser;
+        let file = crate::adapter::btor2::parser::parse(AGR_SPCR_WE).expect("parse");
+        let out =
+            super::spcr(&file).expect("SPCR applies to the write-enable + stable-index shape");
+        assert!(!has_array(&out), "SPCR output must be array-free");
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        assert!(
+            exact_symbolic_verdict(AGR_SPCR_WE, &f).is_err(),
+            "the array-bearing design must SKIP on the exact ROBDD"
+        );
+        let src = crate::adapter::btor2::emit::emit_btor2(&out);
+        assert_eq!(
+            exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
+            ExactVerdict::Holds,
+            "write-enable SPCR (guard we ∧ waddr==key) must decide AG EF(busy==0) = Holds"
+        );
+    }
+
+    /// SOUNDNESS gate: a MOVING index (`key' = ite(arm, waddr, key)`) under a CONDITIONAL write
+    /// must ABSTAIN — the index could move to `waddr` while `we` is low, leaving `mem[waddr] ≠ pv`
+    /// (the frame would be unsound). `AGR_SPCR_WE` + a move-to-waddr `next` for `key`.
+    const AGR_SPCR_WE_MOVING: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 input 1 we
+8 state 1 busy
+9 state 2 key
+10 state 3 mem
+11 const 1 0
+12 init 1 8 11
+13 const 2 00
+14 init 2 9 13
+15 const 2 11
+16 read 2 10 9
+17 eq 1 16 15
+18 not 1 8
+19 and 1 4 18
+20 const 1 1
+21 and 1 8 17
+22 ite 1 21 11 8
+23 ite 1 19 20 22
+24 next 1 8 23
+25 write 3 10 5 6
+26 ite 3 7 25 10
+27 next 3 10 26
+28 ite 2 19 5 9
+29 next 2 9 28
+";
+
+    #[test]
+    fn spcr_pa1b_conditional_write_moving_index_abstains_soundly() {
+        let file = crate::adapter::btor2::parser::parse(AGR_SPCR_WE_MOVING).expect("parse");
+        assert!(
+            super::spcr(&file).is_none(),
+            "moving index under a conditional write is unsound to registerize ⇒ SPCR must abstain"
         );
     }
 
