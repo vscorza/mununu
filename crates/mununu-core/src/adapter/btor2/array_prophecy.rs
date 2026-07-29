@@ -312,13 +312,240 @@ fn remap_node(node: &Node, f: &impl Fn(Operand) -> Operand) -> Node {
     }
 }
 
-/// SPCR entry: if EVERY in-cone array matches the sound P-A1 shape, return the array-FREE
-/// equivalent design (prophecy registers + exact frames, arrays dropped); else `None`
-/// (the caller keeps the original and falls through to its honest abstain).
+/// P-A1c — a small SOUND constant-fold + dead-code-elimination pass, run BEFORE SPCR. Its purpose
+/// is to collapse the yosys per-bit-write-ENABLE modeling of a plain full write:
+///
+/// ```text
+/// mem' = write(mem, a, (wdata & mask) | (mem[a] & ~mask))     with mask = all-ones
+/// ```
+///
+/// With `mask` all-ones, `mem[a] & ~mask = mem[a] & 0 = 0`, so the read-modify-write read `mem[a]`
+/// is DEAD. Folding `not(allones)→0`, `and(x,0)→0`, `or(x,0)→x`, `and(x,allones)→x` collapses the
+/// value to `wdata` and DCE removes the dead read — so SPCR (`plan_for_array`) then sees a single
+/// clean `write(mem, a, wdata)`. Every fold is width-aware and semantics-preserving; DCE removes
+/// only nodes unreachable from the roots (next/init/bad/constraint/fair/justice/output). Nodes
+/// wider than 64 bits are left un-folded (conservative — SPCR then simply abstains).
+fn fold_and_dce(file: &Btor2File) -> Btor2File {
+    use crate::adapter::btor2::ast::ConstValue;
+    use crate::adapter::btor2::bit_blast::resolve_btor2_constant;
+    use crate::adapter::btor2::parser::bv_width;
+
+    // Phase 1 — constant values (u64 fixpoint over not/and/or/xor + and-0 / or-allones).
+    let mut cval: HashMap<Nid, u64> = HashMap::new();
+    for l in &file.lines {
+        if let Some(v) = resolve_btor2_constant(file, l.nid) {
+            cval.insert(l.nid, v);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for l in &file.lines {
+            let Node::Op { op, args, sort, .. } = &l.node else {
+                continue;
+            };
+            if cval.contains_key(&l.nid) {
+                continue;
+            }
+            let Some(w) = bv_width(file, *sort) else {
+                continue;
+            };
+            if w > 64 {
+                continue;
+            }
+            let m: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let a = args.first().and_then(|o| cval.get(&o.nid()).copied());
+            let b = args.get(1).and_then(|o| cval.get(&o.nid()).copied());
+            let r = match op {
+                Op::Not => a.map(|x| !x & m),
+                Op::And => {
+                    if a == Some(0) || b == Some(0) {
+                        Some(0)
+                    } else if let (Some(x), Some(y)) = (a, b) {
+                        Some(x & y)
+                    } else {
+                        None
+                    }
+                }
+                Op::Or => {
+                    if a == Some(m) || b == Some(m) {
+                        Some(m)
+                    } else if let (Some(x), Some(y)) = (a, b) {
+                        Some(x | y)
+                    } else {
+                        None
+                    }
+                }
+                Op::Xor => match (a, b) {
+                    (Some(x), Some(y)) => Some(x ^ y),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(v) = r {
+                cval.insert(l.nid, v);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Phase 2 — replacement operands: a const-folded op → a materialized const; a structural
+    // identity `and(x, allones)→x` / `or(x, 0)→x` → the surviving operand.
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut extra_consts: Vec<Line> = Vec::new();
+    let mut const_of: HashMap<(u64, Nid), Nid> = HashMap::new();
+    let mut repl: HashMap<Nid, Operand> = HashMap::new();
+    for l in &file.lines {
+        let Node::Op { op, args, sort, .. } = &l.node else {
+            continue;
+        };
+        // A non-Const op that resolved to a constant → materialize / reuse a const node.
+        if let Some(&v) = cval.get(&l.nid) {
+            let nid = *const_of.entry((v, *sort)).or_insert_with(|| {
+                let n = next_nid;
+                next_nid += 1;
+                extra_consts.push(Line {
+                    nid: n,
+                    node: Node::Const {
+                        sort: *sort,
+                        value: ConstValue::Dec(v as i128),
+                    },
+                    immediates: Vec::new(),
+                    source_line: 0,
+                });
+                n
+            });
+            repl.insert(l.nid, Operand(nid));
+            continue;
+        }
+        let Some(w) = bv_width(file, *sort) else {
+            continue;
+        };
+        if w > 64 || args.len() != 2 {
+            continue;
+        }
+        let m: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let (av, bv) = (
+            cval.get(&args[0].nid()).copied(),
+            cval.get(&args[1].nid()).copied(),
+        );
+        let pass = match op {
+            Op::And => {
+                if av == Some(m) {
+                    Some(args[1])
+                } else if bv == Some(m) {
+                    Some(args[0])
+                } else {
+                    None
+                }
+            }
+            Op::Or => {
+                if av == Some(0) {
+                    Some(args[1])
+                } else if bv == Some(0) {
+                    Some(args[0])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(o) = pass {
+            repl.insert(l.nid, o);
+        }
+    }
+
+    // Resolve a (non-negated) operand through the replacement chain. Negated operands are left
+    // untouched (yosys emits explicit `not` nodes, not operand negation — conservative + sound).
+    let resolve = |o: Operand| -> Operand {
+        if o.0 < 0 {
+            return o;
+        }
+        let mut cur = o;
+        for _ in 0..=file.lines.len() {
+            match repl.get(&cur.nid()) {
+                Some(&r) if r.0 >= 0 => cur = r,
+                _ => break,
+            }
+        }
+        cur
+    };
+
+    // Rewrite every operand through `resolve`, then append the fresh const nodes.
+    let mut rewritten: Vec<Line> = file
+        .lines
+        .iter()
+        .map(|l| Line {
+            nid: l.nid,
+            node: remap_node(&l.node, &resolve),
+            immediates: l.immediates.clone(),
+            source_line: l.source_line,
+        })
+        .collect();
+    rewritten.extend(extra_consts);
+
+    // Phase 3 — DCE. Keep sorts/states/inputs + the root lines always; keep Op/Const iff reachable
+    // from a root (next/init/bad/constraint/fair/justice/output) through op args.
+    let by_nid: HashMap<Nid, usize> = rewritten
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.nid, i))
+        .collect();
+    let mut reachable: HashSet<Nid> = HashSet::new();
+    let mut stack: Vec<Nid> = Vec::new();
+    for l in &rewritten {
+        match &l.node {
+            Node::Next { state, value, .. } | Node::Init { state, value, .. } => {
+                stack.push(*state);
+                stack.push(value.nid());
+            }
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => stack.push(signal.nid()),
+            Node::Justice { signals } => stack.extend(signals.iter().map(|s| s.nid())),
+            _ => {}
+        }
+    }
+    while let Some(n) = stack.pop() {
+        if !reachable.insert(n) {
+            continue;
+        }
+        if let Some(&i) = by_nid.get(&n)
+            && let Node::Op { args, .. } = &rewritten[i].node
+        {
+            stack.extend(args.iter().map(|a| a.nid()));
+        }
+    }
+    let out: Vec<Line> = rewritten
+        .into_iter()
+        .filter(|l| match &l.node {
+            Node::Op { .. } | Node::Const { .. } => reachable.contains(&l.nid),
+            _ => true, // sorts, states, inputs, and root lines are always kept
+        })
+        .collect();
+    let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
+    Btor2File { lines: out, by_nid }
+}
+
+/// SPCR entry: if EVERY in-cone array matches the sound P-A1 shape (after the P-A1c fold), return
+/// the array-FREE equivalent design (prophecy registers + exact frames, arrays dropped); else
+/// `None` (the caller keeps the original and falls through to its honest abstain).
 ///
 /// **Engine:** owned BTOR2→BTOR2 rewrite (no solver). The result is consumed by the array-free
 /// deciders — `exact-symbolic` ROBDD (small cone) or the `symbolic` predicate-cube (QF_BV must).
 pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
+    // Cheap guard: SPCR (and the fold) are only for array-bearing designs.
+    if !file.lines.iter().any(|l| {
+        matches!(&l.node, Node::State { sort, .. } if matches!(sort_of(file, *sort), Some(Sort::Array { .. })))
+    }) {
+        return None;
+    }
+    // P-A1c: fold the yosys write-mask RMW into a clean write so `plan_for_array` can apply.
+    let folded = fold_and_dce(file);
+    let file = &folded;
     let array_states: Vec<Nid> = file
         .lines
         .iter()
@@ -747,6 +974,87 @@ mod tests {
             super::spcr(&file).is_none(),
             "moving index under a conditional write is unsound to registerize ⇒ SPCR must abstain"
         );
+    }
+
+    /// P-A1c — the yosys per-bit-write-ENABLE modeling of a plain full write `mem[waddr] <= wdata`:
+    /// `write(mem, waddr, (wdata & allones) | (mem[waddr] & ~allones))`. The `mem[waddr]` read is
+    /// DEAD (`& ~allones = & 0`). Without the fold, SPCR abstains (the RMW read's index is the INPUT
+    /// `waddr`, not a register). `fold_and_dce` collapses it to a clean `write(mem, waddr, wdata)`
+    /// and DCE removes the dead read, so SPCR applies and decides HOLDS.
+    const AGR_MASKED: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 5 8
+25 next 2 8 24
+26 read 2 9 5
+27 not 2 14
+28 and 2 26 27
+29 and 2 6 14
+30 or 2 29 28
+31 write 3 9 5 30
+32 next 3 9 31
+";
+
+    #[test]
+    fn spcr_pa1c_fold_removes_dead_rmw_read_then_decides_holds() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        use crate::mu_calculus::parser as mu_parser;
+        let file = crate::adapter::btor2::parser::parse(AGR_MASKED).expect("parse");
+        // Without folding, the raw shape has the masked-RMW read at an INPUT index → SPCR would
+        // see a non-register read index. `fold_and_dce` inside `spcr` collapses it first.
+        let out = super::spcr(&file).expect("SPCR applies after the P-A1c fold");
+        assert!(!has_array(&out), "SPCR output must be array-free");
+        assert!(
+            !out.lines
+                .iter()
+                .any(|l| matches!(&l.node, Node::Op { op: Op::Read, .. })),
+            "the dead RMW read must be folded + DCE'd away"
+        );
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        let src = crate::adapter::btor2::emit::emit_btor2(&out);
+        assert_eq!(
+            exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
+            ExactVerdict::Holds,
+        );
+    }
+
+    #[test]
+    fn spcr_pa1c_fold_is_verdict_preserving_on_masked_vs_clean() {
+        // The masked-write fixture and the clean-write fixture (`AGR_SPCR`) are the SAME design —
+        // SPCR must give the same array-free structure (both decide Holds via exact).
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        use crate::mu_calculus::parser as mu_parser;
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        for src in [AGR_MASKED, AGR_SPCR] {
+            let file = crate::adapter::btor2::parser::parse(src).expect("parse");
+            let out = super::spcr(&file).expect("SPCR applies");
+            let emitted = crate::adapter::btor2::emit::emit_btor2(&out);
+            assert_eq!(
+                exact_symbolic_verdict(&emitted, &f).expect("decides"),
+                ExactVerdict::Holds,
+            );
+        }
     }
 
     #[test]
