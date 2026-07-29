@@ -21,7 +21,8 @@
 13. [Available Agents and Skills](#available-agents-and-skills) `[REFERENCE]`
 14. [Private Files Policy](#private-files-policy) `[RULE]`
 15. [Reasoning & Recommendation Honesty](#reasoning--recommendation-honesty) `[RULE]`
-16. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
+16. [Engine Specificity in Proposals](#engine-specificity-in-proposals) `[RULE]`
+17. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
 
 ---
 
@@ -399,6 +400,20 @@ Sensitive or unpublished materials live in the sibling private repo, not here: `
 - **Intrinsic task difficulty / soundness-criticality** — some work (e.g. SMT quantifier placement) demands care *regardless of when it is done*. The correct response is procedural rigor (differential tests, oracles, validation), not postponement. "This is hard and must be validated" is a real reason; "this is hard and the session is long" is not.
 
 **How to apply.** When tempted to defer or hedge, state the *actual* reason. If the only reason is genuinely "the user should make this call," say exactly that — do not pad it with a fabricated fatigue rationale. Build/cache state (warm `target/`, warm docker volumes) typically *improves* over a session, so longer-running work is often cheaper to iterate, not riskier.
+
+## Engine Specificity in Proposals
+
+**Rule.** Whenever you propose a solution — an experiment, an approach, a design, or an implementation — state in **brief, explicit prose which engine(s) it uses and how**. Never write "the verifier decides it" or "the engine handles it": name the concrete engine and, for each, its structure, technique, and configuration.
+
+- **Name the engine.** `exact-symbolic` (full-state ROBDD, OxiDD) · `symbolic` / `explicit` (predicate-cube KMTS) · native BMC / k-induction · McMillan interpolation · SPACER · btormc / pono · ranking certificate.
+- **Structure** — the IR/abstraction it runs over: full-state ROBDD · predicate cube + may/must KMTS · QF_BV / QF_AUFBV relation · CHC.
+- **Technique** — bit-blast μ-fixpoint · 3-valued modal-μ + CEGAR · k-induction · CEG-prophecy (arrays) · well-founded ranking.
+- **Configuration** — bit cap (40→192→1024), theory (BvOnly / BvUfArray), must-edge inference (`SmtHyperMust`), timeout / rlimit / BDD deadline, owned vs subprocess.
+- **Role** — decider · differential oracle · cross-check.
+
+**Why.** mununu is a portfolio and "engine" spans three unrelated axes (reachability / μ-calculus / safety-abstraction). An unnamed engine makes a proposal unreviewable: the reader cannot judge **soundness** (which engine transfers for which property class — see [Soundness Guarantees](#soundness-guarantees)), **scale** (ROBDD bit-cap vs SMT), or even **applicability** (arrays go to the SMT predicate-cube, never to ROBDD). Naming the engine + config makes the soundness posture and the cost checkable at a glance, and ties the proposal to the engine roster (`docs/design/engine-routing.md`, `verification-execution-planner.md`).
+
+**How to apply.** One `engine:` line per step, kept succinct. Example: *"shot ②: `symbolic` predicate-cube KMTS — 3-valued may/must, `SmtHyperMust` (Z3 QF_AUFBV must-side), CEGAR-refined; `exact-symbolic` ROBDD is the differential oracle where the cone fits the cap."* Applies to plan docs under `.claude/plans/`, design notes, experiment writeups, and any recommendation you give the user.
 
 ## Reference Docs Index
 
