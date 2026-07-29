@@ -859,6 +859,18 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
     }
     out.extend(rest);
     let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
+    // Observability (attribution): report that SPCR fired + its O(#accessed-cells) footprint.
+    let pvs = out
+        .iter()
+        .filter(
+            |l| matches!(&l.node, Node::State { symbol: Some(s), .. } if s.starts_with("spcr_pv_")),
+        )
+        .count();
+    tracing::info!(
+        arrays = array_states.len(),
+        prophecy_registers = pvs,
+        "SPCR: eliminated array(s) via selective prophecy-cell registerization"
+    );
     Some(Btor2File { lines: out, by_nid })
 }
 
