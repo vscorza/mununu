@@ -36,28 +36,233 @@ use crate::adapter::btor2::ast::{Btor2File, Line, Nid, Node, Op, Operand, Sort};
 use crate::adapter::btor2::parser::find_next_value_operand;
 use std::collections::{HashMap, HashSet};
 
-/// A per-array elimination plan (the sound P-A1 shape, or `None` from [`plan_for_array`]).
-struct ArrayPlan {
+/// P-A1d — an index LEAF: a state cell (a moving index, tracked by its current value) or a
+/// constant index. SPCR registerizes one prophecy register `pv = mem[Cell]` per distinct cell.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Cell {
+    State(Nid),
+    Const(u64),
+}
+
+/// P-A1d — the recursive array-elimination context for ONE array. Registerizes `pv_L = mem[L]`
+/// for every index leaf `L` reachable from a read index or (transitively) the next-value of a
+/// registerized index-state. A read `mem[E]` is reconstructed as [`Elim::read_at`] (the index
+/// `ite`-tree rebuilt over the `pv`s); each frame `pv_L' = mem'[L']` is built by
+/// [`Elim::mem_next_at`], substituting `mem'[leaf]` recursively. `ok` is cleared (⇒ SPCR abstains)
+/// on any leaf that is not a state / const / (the write address under an UNCONDITIONAL write) —
+/// e.g. an input-indexed read or an RMW read in a next-value. This subsumes P-A1/A1b/A1c (the
+/// single-state-leaf special case) and adds reset-mux `ite(rst, key, 0)` indices (P-A1d).
+struct Elim<'a> {
+    file: &'a Btor2File,
     array_nid: Nid,
     elem_sort: Nid,
+    bool_sort: Nid,
     waddr: Operand,
     wdata: Operand,
-    /// Broadcast init value (a const operand) if the array is initialised; else free at reset.
-    init_value: Option<Operand>,
-    /// `(read node nid, index register nid)` for every read of this array.
-    reads: Vec<(Nid, Nid)>,
-    /// distinct index register nid → its next-value operand (`None` = a never-written index).
-    index_next: HashMap<Nid, Option<Operand>>,
-    array_next_nid: Option<Nid>,
-    array_init_nid: Option<Nid>,
-    write_nid: Nid,
-    /// The write-enable mux node `ite(cond, write, array)` (P-A1b), if the write is conditional.
-    mux_nid: Option<Nid>,
-    /// The write-enable condition (`None` = unconditional / a tautological enable). When `Some`,
-    /// the write only fires under `cond`, so the frame guards `wdata` by `cond ∧ (waddr==idx')`
-    /// AND the index is required to be STABLE (never moves) — see the soundness note in
-    /// [`plan_for_array`].
+    /// `None` = unconditional write (so `mem'[waddr] = wdata`); `Some(cond)` = write-enable
+    /// (guards each cell frame, and forbids a `waddr` leaf in a next-value — that would need the
+    /// un-registerizable `mem[waddr]`).
     write_cond: Option<Operand>,
+    /// Broadcast init value (a const operand) if the array is initialised; else pv is free at reset.
+    init_value: Option<Operand>,
+    next_nid: &'a mut Nid,
+    new_nodes: &'a mut Vec<Line>,
+    const_of: &'a mut HashMap<(u64, Nid), Nid>,
+    pv_of: HashMap<Cell, Nid>,
+    frame_done: HashSet<Cell>,
+    ok: bool,
+    depth: u32,
+}
+
+impl Elim<'_> {
+    /// A hard recursion bound (index `ite`-trees are shallow; a runaway ⇒ abstain).
+    const DEPTH_CAP: u32 = 64;
+
+    fn alloc(&mut self) -> Nid {
+        let n = *self.next_nid;
+        *self.next_nid += 1;
+        n
+    }
+
+    fn push(&mut self, node: Node) -> Nid {
+        let n = self.alloc();
+        self.new_nodes.push(Line {
+            nid: n,
+            node,
+            immediates: Vec::new(),
+            source_line: 0,
+        });
+        n
+    }
+
+    fn const_node(&mut self, v: u64) -> Nid {
+        if let Some(&n) = self.const_of.get(&(v, self.elem_sort)) {
+            return n;
+        }
+        let n = self.push(Node::Const {
+            sort: self.elem_sort,
+            value: crate::adapter::btor2::ast::ConstValue::Dec(v as i128),
+        });
+        self.const_of.insert((v, self.elem_sort), n);
+        n
+    }
+
+    /// The prophecy register for a cell (lazily created, with the array's broadcast init if any).
+    fn pv_for(&mut self, cell: Cell) -> Nid {
+        if let Some(&n) = self.pv_of.get(&cell) {
+            return n;
+        }
+        let symbol = match cell {
+            Cell::State(s) => format!("spcr_pv_{}_{}", self.array_nid, s),
+            Cell::Const(c) => format!("spcr_pv_{}_c{}", self.array_nid, c),
+        };
+        let pv = self.push(Node::State {
+            sort: self.elem_sort,
+            symbol: Some(symbol),
+        });
+        self.pv_of.insert(cell, pv);
+        if let Some(iv) = self.init_value {
+            self.push(Node::Init {
+                sort: self.elem_sort,
+                state: pv,
+                value: iv,
+            });
+        }
+        pv
+    }
+
+    /// The index VALUE operand of a cell (for `waddr == cell`): a state's current value, or a const.
+    fn cell_value(&mut self, cell: Cell) -> Operand {
+        match cell {
+            Cell::State(s) => Operand(s),
+            Cell::Const(c) => Operand(self.const_node(c)),
+        }
+    }
+
+    /// The write guard for a cell: `(waddr == cell)` [∧ write_cond].
+    fn write_guard(&mut self, cell: Cell) -> Operand {
+        let idxval = self.cell_value(cell);
+        let eq = self.push(Node::Op {
+            sort: self.bool_sort,
+            op: Op::Eq,
+            args: vec![self.waddr, idxval],
+            symbol: None,
+        });
+        match self.write_cond {
+            None => Operand(eq),
+            Some(cond) => Operand(self.push(Node::Op {
+                sort: self.bool_sort,
+                op: Op::And,
+                args: vec![cond, Operand(eq)],
+                symbol: None,
+            })),
+        }
+    }
+
+    /// `mem'[cell]` = `ite((waddr == cell)[∧cond], wdata, pv_cell)`.
+    fn leaf_frame(&mut self, cell: Cell) -> Operand {
+        let g = self.write_guard(cell);
+        let pv = self.pv_for(cell);
+        Operand(self.push(Node::Op {
+            sort: self.elem_sort,
+            op: Op::Ite,
+            args: vec![g, self.wdata, Operand(pv)],
+            symbol: None,
+        }))
+    }
+
+    /// See through a width-preserving `uext`/`sext(x, 0)` alias to the underlying node (yosys puts
+    /// the visible name on such a copy — e.g. `u.key`).
+    fn see_through(&self, nid: Nid) -> Nid {
+        if let Some(l) = self.file.lookup(nid)
+            && let Node::Op { op, args, .. } = &l.node
+            && matches!(op, Op::Uext | Op::Sext)
+            && l.immediates.first().copied() == Some(0)
+            && let Some(a) = args.first()
+        {
+            return self.see_through(a.nid());
+        }
+        nid
+    }
+
+    /// The CURRENT-cycle value read at index expression `E`, rebuilt over the `pv`s. Clears `ok`
+    /// on a leaf that cannot be registerized (an input index / a complex op).
+    fn read_at(&mut self, nid: Nid) -> Operand {
+        if !self.ok || self.depth > Self::DEPTH_CAP {
+            self.ok = false;
+            return Operand(0);
+        }
+        let nid = self.see_through(nid);
+        if let Some(c) = crate::adapter::btor2::bit_blast::resolve_btor2_constant(self.file, nid) {
+            return Operand(self.pv_for(Cell::Const(c)));
+        }
+        match self.file.lookup(nid).map(|l| &l.node) {
+            Some(Node::State { .. }) => Operand(self.pv_for(Cell::State(nid))),
+            Some(Node::Op {
+                op: Op::Ite, args, ..
+            }) if args.len() == 3 => {
+                let (c, a, b) = (args[0], args[1].nid(), args[2].nid());
+                self.depth += 1;
+                let ra = self.read_at(a);
+                let rb = self.read_at(b);
+                self.depth -= 1;
+                Operand(self.push(Node::Op {
+                    sort: self.elem_sort,
+                    op: Op::Ite,
+                    args: vec![c, ra, rb],
+                    symbol: None,
+                }))
+            }
+            _ => {
+                self.ok = false;
+                Operand(0)
+            }
+        }
+    }
+
+    /// `mem'[value-of(E)]` — the NEXT-cycle memory content at index expression `E`. Substitutes
+    /// `mem'[leaf]` recursively: a state/const leaf → [`Elim::leaf_frame`]; the write address (under
+    /// an unconditional write) → `wdata`; an `ite` → the reconstructed `ite`. Clears `ok` otherwise.
+    fn mem_next_at(&mut self, nid: Nid) -> Operand {
+        if !self.ok || self.depth > Self::DEPTH_CAP {
+            self.ok = false;
+            return Operand(0);
+        }
+        let nid = self.see_through(nid);
+        if nid == self.waddr.nid() {
+            if self.write_cond.is_none() {
+                return self.wdata;
+            }
+            self.ok = false;
+            return Operand(0);
+        }
+        if let Some(c) = crate::adapter::btor2::bit_blast::resolve_btor2_constant(self.file, nid) {
+            return self.leaf_frame(Cell::Const(c));
+        }
+        match self.file.lookup(nid).map(|l| &l.node) {
+            Some(Node::State { .. }) => self.leaf_frame(Cell::State(nid)),
+            Some(Node::Op {
+                op: Op::Ite, args, ..
+            }) if args.len() == 3 => {
+                let (c, a, b) = (args[0], args[1].nid(), args[2].nid());
+                self.depth += 1;
+                let ma = self.mem_next_at(a);
+                let mb = self.mem_next_at(b);
+                self.depth -= 1;
+                Operand(self.push(Node::Op {
+                    sort: self.elem_sort,
+                    op: Op::Ite,
+                    args: vec![c, ma, mb],
+                    symbol: None,
+                }))
+            }
+            // an RMW read in a next-value, or any other op ⇒ cannot registerize soundly.
+            _ => {
+                self.ok = false;
+                Operand(0)
+            }
+        }
+    }
 }
 
 fn sort_of(file: &Btor2File, nid: Nid) -> Option<Sort> {
@@ -106,61 +311,63 @@ fn node_refs_array(node: &Node, array_nid: Nid) -> bool {
     }
 }
 
-/// Detect the sound P-A1 SPCR shape for one array state. `None` ⇒ abstain (leave the array).
-fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
-    let array_sort_nid = match &file.lookup(array_nid)?.node {
-        Node::State { sort, .. } => *sort,
-        _ => return None,
+/// P-A1d — eliminate ONE array via the recursive [`Elim`], accumulating the fresh prophecy nodes
+/// (`new_nodes`), the `read_nid → reconstruction` map, and the drop set. Returns `false` (⇒ SPCR
+/// abstains) on any unsound shape: a write-chain / write in the else-branch, an unexpected
+/// reference to the array, a direct-read write-enable, or an un-registerizable index leaf.
+#[allow(clippy::too_many_arguments)]
+fn eliminate_array(
+    file: &Btor2File,
+    array_nid: Nid,
+    next_nid: &mut Nid,
+    new_nodes: &mut Vec<Line>,
+    const_of: &mut HashMap<(u64, Nid), Nid>,
+    bool_sort: Nid,
+    read_repl: &mut HashMap<Nid, Operand>,
+    drops: &mut HashSet<Nid>,
+) -> bool {
+    let array_sort_nid = match file.lookup(array_nid).map(|l| &l.node) {
+        Some(Node::State { sort, .. }) => *sort,
+        _ => return false,
     };
-    let Sort::Array { element, .. } = sort_of(file, array_sort_nid)? else {
-        return None;
+    let Some(Sort::Array { element, .. }) = sort_of(file, array_sort_nid) else {
+        return false;
     };
     let elem_sort = element;
 
-    // The array's next is either a single unconditional `Write(array, waddr, wdata)` (P-A1) or a
-    // write-ENABLE mux `ite(cond, write(array, …), array)` (P-A1b). A tautological `cond` collapses
-    // to unconditional. Anything else (write-chain, write in the else-branch, nested mux) abstains.
-    let next_op = find_next_value_operand(file, array_nid)?;
+    // Write shape: unconditional `Write(array, waddr, wdata)` (P-A1) or a write-ENABLE mux
+    // `ite(cond, write, array)` (P-A1b; tautological `cond` collapses to unconditional).
+    let Some(next_op) = find_next_value_operand(file, array_nid) else {
+        return false;
+    };
     let array_next_nid = file.lines.iter().find_map(|l| match &l.node {
         Node::Next { state, .. } if *state == array_nid => Some(l.nid),
         _ => None,
     });
-    let next_line = file.lookup(next_op.nid())?;
     let (write_nid, mux_nid, write_cond): (Nid, Option<Nid>, Option<Operand>) =
-        match &next_line.node {
-            Node::Op { op: Op::Write, .. } => (next_op.nid(), None, None),
-            Node::Op {
+        match file.lookup(next_op.nid()).map(|l| &l.node) {
+            Some(Node::Op { op: Op::Write, .. }) => (next_op.nid(), None, None),
+            Some(Node::Op {
                 op: Op::Ite, args, ..
-            } if args.len() == 3 && args[2].nid() == array_nid => {
-                // ite(cond, write(array,…), array) — write in the THEN branch, hold in the else.
+            }) if args.len() == 3 && args[2].nid() == array_nid => {
                 let cond = args[0];
-                let eff_cond = if is_tautology(file, cond.nid()) {
+                let eff = if is_tautology(file, cond.nid()) {
                     None
                 } else {
                     Some(cond)
                 };
-                (args[1].nid(), Some(next_op.nid()), eff_cond)
+                (args[1].nid(), Some(next_op.nid()), eff)
             }
-            _ => return None,
+            _ => return false,
         };
-    let write_line = file.lookup(write_nid)?;
-    let (waddr, wdata) = match &write_line.node {
-        Node::Op {
+    let (waddr, wdata) = match file.lookup(write_nid).map(|l| &l.node) {
+        Some(Node::Op {
             op: Op::Write,
             args,
             ..
-        } if args.len() == 3 && args[0].nid() == array_nid => (args[1], args[2]),
-        _ => return None,
+        }) if args.len() == 3 && args[0].nid() == array_nid => (args[1], args[2]),
+        _ => return false,
     };
-    // SOUNDNESS: the frame `pv' = ite(cond ∧ waddr==idx', wdata, pv)` is exact iff `idx' ≠ idx ⟹
-    // cond` (the index moves to `waddr` only when the write fires). Two sound, checkable cases:
-    //   (U) `write_cond == None` (unconditional / tautological) ⇒ the move-to-`waddr` guard is
-    //       trivially satisfied ⇒ a MOVING index (`idx' ∈ {idx, waddr}`) is fine.
-    //   (S) `write_cond == Some` (a real enable) ⇒ require a STABLE index (never moves), so the
-    //       `idx' = waddr` case never arises and the frame is exact for any `cond`.
-    let allow_waddr = write_cond.is_none();
-
-    // Broadcast init (a const operand) if present.
     let (init_value, array_init_nid) = file
         .lines
         .iter()
@@ -172,107 +379,114 @@ fn plan_for_array(file: &Btor2File, array_nid: Nid) -> Option<ArrayPlan> {
         })
         .unwrap_or((None, None));
 
-    // Reads of the array; each index must be a bare state register.
-    let mut reads: Vec<(Nid, Nid)> = Vec::new();
-    for l in &file.lines {
-        if let Node::Op {
-            op: Op::Read, args, ..
-        } = &l.node
-            && args.len() == 2
-            && args[0].nid() == array_nid
-        {
-            let idx = args[1].nid();
-            if !matches!(file.lookup(idx)?.node, Node::State { .. }) {
-                return None; // non-register index → P-A1 abstains
-            }
-            reads.push((l.nid, idx));
-        }
-    }
+    let reads: Vec<(Nid, Nid)> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Op {
+                op: Op::Read, args, ..
+            } if args.len() == 2 && args[0].nid() == array_nid => Some((l.nid, args[1].nid())),
+            _ => None,
+        })
+        .collect();
     if reads.is_empty() {
-        return None;
+        return false;
     }
-    // The write-enable condition must not itself BE an array read (else the frame's guard would
-    // dangle when the read is dropped). A cond that merely CONTAINS a read via an op node is fine
-    // — that op is kept and remapped to `pv`. Direct-read-as-enable is bizarre; abstain.
+    // A write-enable that is itself an array read would dangle when the read is dropped; abstain.
     if let Some(cond) = write_cond
         && reads.iter().any(|&(r, _)| r == cond.nid())
     {
-        return None;
+        return false;
     }
-
-    // Stability: each index register's next-value moves only within {itself, waddr}.
-    let mut index_next: HashMap<Nid, Option<Operand>> = HashMap::new();
-    for &(_, idx) in &reads {
-        if index_next.contains_key(&idx) {
-            continue;
-        }
-        let nx = find_next_value_operand(file, idx);
-        if let Some(nxop) = nx {
-            let mut vis: HashSet<Nid> = HashSet::new();
-            let mut st = vec![nxop.nid()];
-            while let Some(n) = st.pop() {
-                if !vis.insert(n) {
-                    continue;
-                }
-                if n == idx {
-                    continue; // held — always allowed
-                }
-                if n == waddr.nid() {
-                    // move-to-write-address — allowed ONLY for an unconditional/tautological write
-                    // (case U); a conditional write requires a stable index (case S).
-                    if allow_waddr {
-                        continue;
-                    }
-                    return None;
-                }
-                match &file.lookup(n)?.node {
-                    Node::Op {
-                        op: Op::Ite, args, ..
-                    } if args.len() == 3 => {
-                        st.push(args[1].nid());
-                        st.push(args[2].nid());
-                    }
-                    // a leaf other than {idx, waddr} ⇒ the index moves to an arbitrary cell
-                    // whose old content `pv` does not hold ⇒ frame is not exact ⇒ abstain.
-                    _ => return None,
-                }
-            }
-        }
-        index_next.insert(idx, nx);
-    }
-
     // No OTHER reference to the array beyond the reads + the write + the enable-mux + next + init.
     let mut expected: HashSet<Nid> = reads.iter().map(|&(r, _)| r).collect();
     expected.insert(write_nid);
-    if let Some(n) = mux_nid {
-        expected.insert(n);
-    }
-    if let Some(n) = array_next_nid {
-        expected.insert(n);
-    }
-    if let Some(n) = array_init_nid {
+    for n in [mux_nid, array_next_nid, array_init_nid]
+        .into_iter()
+        .flatten()
+    {
         expected.insert(n);
     }
     for l in &file.lines {
         if !expected.contains(&l.nid) && node_refs_array(&l.node, array_nid) {
-            return None; // an unexpected use of the array ⇒ cannot eliminate soundly
+            return false;
         }
     }
 
-    Some(ArrayPlan {
+    let mut elim = Elim {
+        file,
         array_nid,
         elem_sort,
+        bool_sort,
         waddr,
         wdata,
-        init_value,
-        reads,
-        index_next,
-        array_next_nid,
-        array_init_nid,
-        write_nid,
-        mux_nid,
         write_cond,
-    })
+        init_value,
+        next_nid,
+        new_nodes,
+        const_of,
+        pv_of: HashMap::new(),
+        frame_done: HashSet::new(),
+        ok: true,
+        depth: 0,
+    };
+    // Reconstruct each read `mem[E]` as the index `ite`-tree over the prophecy registers.
+    for &(read_nid, index_nid) in &reads {
+        let recon = elim.read_at(index_nid);
+        read_repl.insert(read_nid, recon);
+    }
+    // Build each prophecy register's frame `pv_L' = mem'[L']` (fixpoint — a frame may pull in more
+    // cells via `mem_next_at`).
+    let mut worklist: Vec<Cell> = elim.pv_of.keys().copied().collect();
+    while let Some(cell) = worklist.pop() {
+        if !elim.frame_done.insert(cell) {
+            continue;
+        }
+        let frame = match cell {
+            // A const index never moves: pv_c' = mem'[c].
+            Cell::Const(_) => elim.leaf_frame(cell),
+            // A state index: pv_s' = mem'[s'] where s' is the state's next-value (self if none).
+            Cell::State(s) => {
+                let nn = find_next_value_operand(file, s)
+                    .map(|o| o.nid())
+                    .unwrap_or(s);
+                elim.mem_next_at(nn)
+            }
+        };
+        let pv = elim.pv_of[&cell];
+        let n = elim.alloc();
+        elim.new_nodes.push(Line {
+            nid: n,
+            node: Node::Next {
+                sort: elem_sort,
+                state: pv,
+                value: frame,
+            },
+            immediates: Vec::new(),
+            source_line: 0,
+        });
+        for c in elim.pv_of.keys().copied().collect::<Vec<_>>() {
+            if !elim.frame_done.contains(&c) {
+                worklist.push(c);
+            }
+        }
+    }
+    if !elim.ok {
+        return false;
+    }
+
+    drops.insert(array_nid);
+    drops.insert(write_nid);
+    for n in [mux_nid, array_next_nid, array_init_nid]
+        .into_iter()
+        .flatten()
+    {
+        drops.insert(n);
+    }
+    for &(r, _) in &reads {
+        drops.insert(r);
+    }
+    true
 }
 
 fn remap_node(node: &Node, f: &impl Fn(Operand) -> Operand) -> Node {
@@ -561,21 +775,13 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
     if array_states.is_empty() {
         return None; // no arrays ⇒ nothing for SPCR to do (caller uses the normal path)
     }
-    // P-A1: every array must be soundly eliminable, else abstain wholesale.
-    let plans: Vec<ArrayPlan> = array_states
-        .iter()
-        .map(|&a| plan_for_array(file, a))
-        .collect::<Option<Vec<_>>>()?;
-
     let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
-    let mut alloc = || {
-        let n = next_nid;
-        next_nid += 1;
-        n
-    };
+    let mut new_nodes: Vec<Line> = Vec::new();
+    let mut const_of: HashMap<(u64, Nid), Nid> = HashMap::new();
+    let mut read_repl: HashMap<Nid, Operand> = HashMap::new();
+    let mut drops: HashSet<Nid> = HashSet::new();
 
-    // A 1-bit sort for the `eq(waddr, idx')` guards (reuse an existing one, else create it).
-    let mut prelude: Vec<Line> = Vec::new();
+    // A 1-bit sort for the `eq(waddr, idx)` guards (reuse an existing one, else create it).
     let bool_sort = file
         .lines
         .iter()
@@ -586,8 +792,9 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
             _ => None,
         })
         .unwrap_or_else(|| {
-            let n = alloc();
-            prelude.push(Line {
+            let n = next_nid;
+            next_nid += 1;
+            new_nodes.push(Line {
                 nid: n,
                 node: Node::Sort {
                     sort: Sort::BitVec { width: 1 },
@@ -598,126 +805,49 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
             n
         });
 
-    let mut tail: Vec<Line> = Vec::new();
-    let mut read_to_pv: HashMap<Nid, Nid> = HashMap::new();
-    let mut drop_nodes: HashSet<Nid> = HashSet::new();
-
-    for plan in &plans {
-        drop_nodes.insert(plan.array_nid);
-        drop_nodes.insert(plan.write_nid);
-        if let Some(n) = plan.mux_nid {
-            drop_nodes.insert(n);
-        }
-        if let Some(n) = plan.array_next_nid {
-            drop_nodes.insert(n);
-        }
-        if let Some(n) = plan.array_init_nid {
-            drop_nodes.insert(n);
-        }
-        for &(r, _) in &plan.reads {
-            drop_nodes.insert(r);
-        }
-
-        let mut idx_to_pv: HashMap<Nid, Nid> = HashMap::new();
-        for (&idx, idx_next) in &plan.index_next {
-            let pv = alloc();
-            idx_to_pv.insert(idx, pv);
-            // pv state (element sort).
-            prelude.push(Line {
-                nid: pv,
-                node: Node::State {
-                    sort: plan.elem_sort,
-                    symbol: Some(format!("spcr_pv_{}_{}", plan.array_nid, idx)),
-                },
-                immediates: Vec::new(),
-                source_line: 0,
-            });
-            // pv init (broadcast) if the array is initialised.
-            if let Some(iv) = plan.init_value {
-                tail.push(Line {
-                    nid: alloc(),
-                    node: Node::Init {
-                        sort: plan.elem_sort,
-                        state: pv,
-                        value: iv,
-                    },
-                    immediates: Vec::new(),
-                    source_line: 0,
-                });
-            }
-            // frame: pv' = ite(GUARD, wdata, pv), GUARD = (waddr == idx') [∧ write_cond].
-            // Unconditional/tautological write ⇒ GUARD = eq (index may move). Conditional write ⇒
-            // GUARD = write_cond ∧ eq, and the index is stable (idx' = idx) by the plan gate.
-            let idx_next_op = idx_next.unwrap_or(Operand(idx));
-            let eq = alloc();
-            tail.push(Line {
-                nid: eq,
-                node: Node::Op {
-                    sort: bool_sort,
-                    op: Op::Eq,
-                    args: vec![plan.waddr, idx_next_op],
-                    symbol: None,
-                },
-                immediates: Vec::new(),
-                source_line: 0,
-            });
-            let guard = match plan.write_cond {
-                None => Operand(eq),
-                Some(cond) => {
-                    let and = alloc();
-                    tail.push(Line {
-                        nid: and,
-                        node: Node::Op {
-                            sort: bool_sort,
-                            op: Op::And,
-                            args: vec![cond, Operand(eq)],
-                            symbol: None,
-                        },
-                        immediates: Vec::new(),
-                        source_line: 0,
-                    });
-                    Operand(and)
-                }
-            };
-            let ite = alloc();
-            tail.push(Line {
-                nid: ite,
-                node: Node::Op {
-                    sort: plan.elem_sort,
-                    op: Op::Ite,
-                    args: vec![guard, plan.wdata, Operand(pv)],
-                    symbol: None,
-                },
-                immediates: Vec::new(),
-                source_line: 0,
-            });
-            tail.push(Line {
-                nid: alloc(),
-                node: Node::Next {
-                    sort: plan.elem_sort,
-                    state: pv,
-                    value: Operand(ite),
-                },
-                immediates: Vec::new(),
-                source_line: 0,
-            });
-        }
-        for &(r, idx) in &plan.reads {
-            read_to_pv.insert(r, idx_to_pv[&idx]);
+    // Every array must be soundly eliminable (P-A1d recursive prophecy), else abstain wholesale.
+    for &a in &array_states {
+        if !eliminate_array(
+            file,
+            a,
+            &mut next_nid,
+            &mut new_nodes,
+            &mut const_of,
+            bool_sort,
+            &mut read_repl,
+            &mut drops,
+        ) {
+            return None;
         }
     }
 
-    // Rewrite: references to a dropped read node → its prophecy register (sign-preserving).
+    // Rewrite: references to a dropped read node → its reconstruction (sign-combining).
     let remap = |o: Operand| -> Operand {
-        match read_to_pv.get(&o.nid()) {
-            Some(&pv) => Operand(if o.0 < 0 { -pv } else { pv }),
+        match read_repl.get(&o.nid()) {
+            Some(&r) => {
+                if (o.0 < 0) ^ (r.0 < 0) {
+                    Operand(-r.nid())
+                } else {
+                    Operand(r.nid())
+                }
+            }
             None => o,
         }
     };
-    let mut out: Vec<Line> = Vec::with_capacity(file.lines.len() + prelude.len() + tail.len());
-    out.extend(prelude); // pv states (+ maybe the bool sort) — only forward-ref a SORT (nid-resolved)
+    // Topological layout: fresh DECLARATIONS (sorts / prophecy states / consts — they reference at
+    // most a sort) first, then the original lines (minus drops, remapped), then the fresh
+    // COMBINATIONAL/next nodes (in push order = dependency order). This keeps every data operand a
+    // backward reference (only sort references may be forward — resolved by NID).
+    let (decls, rest): (Vec<Line>, Vec<Line>) = new_nodes.into_iter().partition(|l| {
+        matches!(
+            l.node,
+            Node::Sort { .. } | Node::State { .. } | Node::Const { .. }
+        )
+    });
+    let mut out: Vec<Line> = Vec::with_capacity(file.lines.len() + decls.len() + rest.len());
+    out.extend(decls);
     for line in &file.lines {
-        if drop_nodes.contains(&line.nid) {
+        if drops.contains(&line.nid) {
             continue;
         }
         out.push(Line {
@@ -727,7 +857,7 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
             source_line: line.source_line,
         });
     }
-    out.extend(tail); // eq / ite / next-pv / init — all backward refs
+    out.extend(rest);
     let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
     Some(Btor2File { lines: out, by_nid })
 }
@@ -1055,6 +1185,100 @@ mod tests {
                 ExactVerdict::Holds,
             );
         }
+    }
+
+    /// P-A1d — the REAL yosys async-reset lift of `array_gates_recovery.sv` (module _small): the
+    /// read index is a reset-mux `ite(rst_n, key, 0)` (node 16), `key`'s next carries reset-value
+    /// `const 0` leaves (nodes 35/36), and the write is the masked RMW (nodes 38-45, P-A1c folds
+    /// it). The recursive prophecy registerizes BOTH `mem[key]` and `mem[0]` and reconstructs the
+    /// read as `ite(rst_n, pv_key, pv_0)`. SPCR must produce an array-free design.
+    const AGR_RESETMUX_LIFT: &str = "\
+1 sort bitvec 1
+2 input 1 clk
+3 input 1 rst_n
+4 input 1 start
+5 sort bitvec 2
+6 input 5 waddr
+7 input 5 wdata
+8 const 1 0
+9 state 1
+10 ite 1 3 9 8
+11 output 10 busy
+12 uext 1 10 0 u.busy
+13 uext 1 2 0 u.clk
+14 const 5 00
+15 state 5
+16 ite 5 3 15 14
+17 uext 5 16 0 u.key
+18 uext 1 3 0 u.rst_n
+19 uext 1 4 0 u.start
+20 uext 5 6 0 u.waddr
+21 uext 5 7 0 u.wdata
+22 sort array 5 5
+23 state 22 u.mem
+24 read 5 23 16
+25 const 5 11
+26 eq 1 24 25
+27 ite 1 26 8 10
+28 ite 1 10 27 10
+29 const 1 1
+30 not 1 10
+31 and 1 4 30
+32 ite 1 31 29 28
+33 ite 1 3 32 8
+34 next 1 9 33
+35 ite 5 31 6 16
+36 ite 5 3 35 14
+37 next 5 15 36
+38 read 5 23 6
+39 not 5 25
+40 and 5 38 39
+41 and 5 7 25
+42 or 5 41 40
+43 write 22 23 6 42
+44 redor 1 25
+45 ite 22 44 43 23
+46 next 22 23 45
+";
+
+    #[test]
+    fn spcr_pa1d_real_async_reset_lift_decides_holds_e2e() {
+        // End-to-end through the wired recoverability path (which runs SPCR): the REAL async-reset
+        // yosys lift decides Holds — the DIFFERENTIAL ORACLE (matches the whole-array-registerized
+        // ROBDD, which independently gives Holds). Was `unknown` before P-A1d.
+        use crate::verdict::PropertyVerdict;
+        assert_eq!(
+            crate::adapter::recoverability::verify_recoverability_scalable(
+                AGR_RESETMUX_LIFT,
+                "busy == 0",
+                &[],
+            )
+            .expect("decides"),
+            PropertyVerdict::Holds,
+        );
+    }
+
+    #[test]
+    fn spcr_pa1d_resetmux_lift_eliminates_array_two_cells() {
+        let file = crate::adapter::btor2::parser::parse(AGR_RESETMUX_LIFT).expect("parse");
+        let out = super::spcr(&file).expect("SPCR (P-A1c fold + P-A1d recursive prophecy) applies");
+        assert!(
+            !has_array(&out),
+            "the async-reset lift must become array-free"
+        );
+        assert!(
+            !out.lines
+                .iter()
+                .any(|l| matches!(&l.node, Node::Op { op: Op::Read, .. })),
+            "no array reads remain (reconstructed over prophecy registers)"
+        );
+        // The reset-mux index `ite(rst_n, key, 0)` has TWO leaves ⇒ two prophecy cells (mem[key], mem[0]).
+        let pvs = out
+            .lines
+            .iter()
+            .filter(|l| matches!(&l.node, Node::State { symbol: Some(s), .. } if s.starts_with("spcr_pv_")))
+            .count();
+        assert_eq!(pvs, 2, "reset-mux index registerizes mem[key] AND mem[0]");
     }
 
     #[test]
