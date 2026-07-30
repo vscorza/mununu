@@ -132,6 +132,11 @@ pub struct Btor2SmtView {
     /// value of each array-sorted state cell. Mirror of
     /// `state_curr_arr` over `s_next`.
     pub state_next_arr: HashMap<Nid, z3::ast::Array>,
+    /// SEL — array-cell NAME → NID, for array-content (`Select`) predicates. Memory cells
+    /// are intentionally absent from `signals` (they are not BV cube dimensions), so the
+    /// BV `nid_map` cannot resolve an array name; this map lets a `select(arr, idx)` atom
+    /// bind the array by its symbol. Populated under `Theory::BvUfArray`, empty under BvOnly.
+    pub array_name_nid: HashMap<String, Nid>,
     /// Per-signal metadata for callers that need to round-trip
     /// names / widths back to the sidecar. Includes State, Input, and
     /// (H.E.1) named Combinational nodes.
@@ -225,6 +230,7 @@ pub fn encode_design_with_theory(
     let mut state_next: HashMap<Nid, z3::ast::BV> = HashMap::new();
     let mut state_curr_arr: HashMap<Nid, z3::ast::Array> = HashMap::new();
     let mut state_next_arr: HashMap<Nid, z3::ast::Array> = HashMap::new();
+    let mut array_name_nid: HashMap<String, Nid> = HashMap::new();
     let mut inputs: HashMap<Nid, z3::ast::BV> = HashMap::new();
     let mut signals = Vec::new();
 
@@ -264,10 +270,14 @@ pub fn encode_design_with_theory(
                         z3::ast::Array::new_const(format!("a_next_{label}").as_str(), &dom, &rng);
                     state_curr_arr.insert(line.nid, curr);
                     state_next_arr.insert(line.nid, next);
+                    if let Some(s) = &sym {
+                        array_name_nid.insert(s.clone(), line.nid);
+                    }
                     // Memory cells are tracked in the array maps, not
                     // the BV `signals` vector (which feeds bit-vector
                     // cube enumeration). The predicate-cube lift's
-                    // cube predicates reference BV registers only.
+                    // cube predicates reference BV registers only; the
+                    // `array_name_nid` map lets a `Select` atom bind them.
                 } else {
                     return Err(EncodeError::ArraySortUnsupportedInBvOnly { nid: line.nid });
                 }
@@ -314,6 +324,7 @@ pub fn encode_design_with_theory(
         state_next,
         state_curr_arr,
         state_next_arr,
+        array_name_nid,
         inputs,
         signals,
         signal_bvs: HashMap::new(),
@@ -453,6 +464,7 @@ pub(crate) fn encode_primed(
         state_next: view.state_next.clone(),
         state_curr_arr: view.state_next_arr.clone(),
         state_next_arr: view.state_next_arr.clone(),
+        array_name_nid: view.array_name_nid.clone(),
         inputs: primed_inputs.clone(),
         signals: view.signals.clone(),
         signal_bvs: HashMap::new(),

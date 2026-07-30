@@ -172,6 +172,118 @@ fn counter_gate_of(
 /// that only pushes toward `⊥` (sound, per PR #302's universal ◇). Pairs are ordered (`lhs <= rhs`) for
 /// deterministic dedup (`data == target` and `target == data` are the same predicate); reflexive
 /// `r == r` is dropped (no information). Deduped.
+/// SEL (P1-a, shot ①b) — discover **array-content** guard atoms `array[index] == K`:
+/// an `Eq` comparing a memory `Read(array, index)` against a constant `K` — the
+/// design's own array-content decision condition (e.g. `busy → idle` gated on
+/// `mem[key] == unlock`). Returns `(array_symbol, index_symbol, value)`; the caller
+/// lifts each to a `PredicateExpr::Select` COMPOUND seed. Mirrors [`eq_guard_atoms`]
+/// (register-vs-constant) for the array-read case — the property-directed discovery
+/// of the array-content predicate the predicate-cube KMTS needs to decide a
+/// content-gated recovery (the ROBDD exact engine cannot, since arrays are not
+/// bit-blastable). Bounded by the number of `Eq(Read, const)` nodes; deduped.
+fn select_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, String, u64)> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    // nid → (array_nid, index_nid) for every memory `Read` op.
+    let reads: std::collections::HashMap<i64, (i64, i64)> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Op {
+                op: Op::Read, args, ..
+            } if args.len() == 2 => Some((l.nid, (args[0].0.abs(), args[1].0.abs()))),
+            _ => None,
+        })
+        .collect();
+    let state_nids: std::collections::HashSet<i64> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. }))
+        .map(|l| l.nid)
+        .collect();
+    // Resolve a read-index nid to a symboled register. yosys routinely reset-muxes the
+    // addressing FF (`read(mem, ite(rst, key, 0))`) and — crucially — `collect_symbols`
+    // attaches the visible name (`u.key`) to the underlying STATE cell, NOT to the `ite`/
+    // `uext` chain. So a bare `symbols.get(idx_nid)` on the reset-mux node misses it; walk
+    // the index cone to the first symboled STATE instead (collecting only states skips the
+    // reset-CONDITION input the `ite` branches on). That symboled state name is a real
+    // `Node::State` symbol, so it resolves in the states-only cube `nid_map` AND is pinned
+    // in `init_values` (the reset-cube gate) — the seeded `select(arr, key)` then reads
+    // exactly the cell the design reads, over the same state frame as the BV atoms.
+    let idx_symbol = |idx_nid: i64| -> Option<String> {
+        if let Some(s) = symbols.get(&idx_nid) {
+            return Some(s.clone());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([idx_nid]);
+        while let Some(nid) = queue.pop_front() {
+            if !seen.insert(nid) {
+                continue;
+            }
+            let Some(line) = file.lookup(nid) else {
+                continue;
+            };
+            match &line.node {
+                Node::State { .. } => {
+                    if let Some(s) = symbols.get(&nid) {
+                        return Some(s.clone());
+                    }
+                }
+                Node::Op { args, .. } => {
+                    for o in args {
+                        queue.push_back(o.0.abs());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut out: Vec<(String, String, u64)> = Vec::new();
+    for line in &file.lines {
+        let Node::Op {
+            op: Op::Eq, args, ..
+        } = &line.node
+        else {
+            continue;
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        // Either operand may be the array `Read` vs the constant.
+        for (read_nid, const_nid) in [
+            (args[0].0.abs(), args[1].0.abs()),
+            (args[1].0.abs(), args[0].0.abs()),
+        ] {
+            let Some(&(arr_nid, idx_nid)) = reads.get(&read_nid) else {
+                continue;
+            };
+            // The array must be an array-sorted state cell (a `$mem`) with a symbol; the
+            // index resolves to a symboled alias (see-through above) so the Select binds.
+            if !state_nids.contains(&arr_nid) {
+                continue;
+            }
+            let Some(arr_sym) = symbols.get(&arr_nid) else {
+                continue;
+            };
+            let Some(idx_sym) = idx_symbol(idx_nid) else {
+                continue;
+            };
+            let Some(k) = crate::adapter::btor2::bit_blast::resolve_btor2_constant(file, const_nid)
+            else {
+                continue;
+            };
+            if !out
+                .iter()
+                .any(|(a, i, v)| a == arr_sym && *i == idx_sym && *v == k)
+            {
+                out.push((arr_sym.clone(), idx_sym, k));
+            }
+        }
+    }
+    out
+}
+
 fn eq_reg_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, String)> {
     use crate::adapter::btor2::ast::{Node, Op};
     let symbols = crate::adapter::btor2::parser::collect_symbols(file);
@@ -1312,8 +1424,37 @@ pub fn verify_recoverability_scalable_with_source(
 
     // Parse the design early — needed both for the reset valuation and for the auto-seed candidate
     // values below.
-    let file = crate::adapter::btor2::parser::parse(btor2_content)
+    let file0 = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("recoverability cube path: parsing BTOR2: {}", e.message))?;
+
+    // SPCR (shot ①b) — Selective Prophecy-Cell Registerization. If every in-cone array matches the
+    // sound P-A1 shape (single unconditional full-width write, read at stable/move-to-write indices),
+    // eliminate the arrays by registerizing exactly the accessed cells (a prophecy register + exact
+    // frame). The result is array-FREE, so the must-edge ∀∃ becomes pure QF_BV (decidable) instead of
+    // the undecidable AUFBV+∀-array that leaves the νµ at ⊥. Verdict-preserving reformulation, so a
+    // definite exact verdict on the array-free design transfers. `None` ⇒ no array / not the sound
+    // shape ⇒ keep the original (honest ⊥ downstream). See `array_prophecy` + the plan doc.
+    let spcr_src;
+    let (file, btor2_content): (crate::adapter::btor2::ast::Btor2File, &str) =
+        match crate::adapter::btor2::array_prophecy::spcr(&file0) {
+            Some(af) => {
+                spcr_src = crate::adapter::btor2::emit::emit_btor2(&af);
+                // The array-free cone often now bit-blasts — retry the EXACT ROBDD first (a small
+                // array-free design decides definitively; the array-gated recovery the wall blocked).
+                let formula_str = format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)");
+                if let Ok(formula) = mu_parser::parse(&formula_str)
+                    && let Ok(v) = crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(
+                        &spcr_src, &formula,
+                    )
+                {
+                    return Ok(PropertyVerdict::from(v));
+                }
+                // Cone still too wide for exact even array-free → fall through to the cube on the
+                // array-free design (the guard `pv == K` is now a plain BV predicate; QF_BV must).
+                (af, spcr_src.as_str())
+            }
+            None => (file0, btor2_content),
+        };
     let init_values: BTreeMap<String, u128> =
         crate::adapter::btor2::concrete_oracle::init_valuation(&file);
 
@@ -1515,6 +1656,36 @@ pub fn verify_recoverability_scalable_with_source(
             rhs: rhs.clone(),
             addend,
             width,
+        };
+        compound_seeds.push((name, expr_str, expr));
+    }
+
+    // SEL (P1-a, shot ①b) — ARRAY-CONTENT return: seed the design's `array[index] == K` guard atoms
+    // (`select_guard_atoms`) as COMPOUND `PredicateExpr::Select` predicates. When the must-return reads an
+    // in-cone MEMORY (`busy → idle` only when `mem[key] == unlock`), control/register seeding leaves
+    // `EF good` at ⊥ — the array merges into one cube cell — so the deciding predicate is `mem[key] == K`.
+    // SMT-only (like the relational seeds): the `SmtHyperMust` seam decides each cube's truth via the exact
+    // transition over Z3's array `select` (QF_AUFBV), never bit-blasting the array. Cone-filtered + capped.
+    for (arr, idx, k) in select_guard_atoms(&file) {
+        if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
+            break;
+        }
+        // Property-directed filter keys on the ARRAY (a state cell in the good's cone-of-
+        // influence, per `good_register_coi`'s state traversal): a `mem[·]` predicate is
+        // relevant iff the array's content flows into recovery. The index is a combinational
+        // reset-mux alias (`u.key`, not a state) so it is absent from the states-only cone
+        // set — checking `in_coi(idx)` would spuriously drop every valid array-content seed.
+        // The index only selects which cell; it needs no independent cone membership.
+        if !in_coi(&arr) {
+            continue;
+        }
+        let name = format!("sel_{arr}_{idx}_eq_{k}");
+        if compound_seeds.iter().any(|(n, _, _)| n == &name) {
+            continue;
+        }
+        let expr_str = format!("{arr}[{idx}] == {k}");
+        let Ok(expr) = parse_predicate_expr(&expr_str) else {
+            continue;
         };
         compound_seeds.push((name, expr_str, expr));
     }
@@ -1751,20 +1922,61 @@ pub fn verify_recoverability_scalable_with_source(
     let init_map: std::collections::HashMap<String, u128> =
         init_values.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut init_cube = 0usize;
+    // SEL — a Select's reset truth (`mem[key] == K` at cycle 0) depends on the array's reset
+    // CONTENT, which `init_values` (BV-only) does not model. Rather than read one arbitrary
+    // content (unsound) or abstain outright, treat the array as FREE at reset: the initial
+    // state ranges over ALL array contents, so this bit is enumerated over both truth values
+    // (`free_select_bits`) below. The index register IS pinned (guarded above), so only the
+    // content is free.
+    let mut free_select_bits: Vec<usize> = Vec::new();
     for (i, spec) in trace.final_predicates.iter().enumerate() {
-        let holds = match compound_map.get(&spec.name) {
-            Some(expr) => expr.eval(&init_map),
-            None => init_values.get(&spec.register).copied() == Some(spec.value as u128),
-        };
-        if holds {
-            init_cube |= 1 << i;
+        match compound_map.get(&spec.name) {
+            Some(expr) if expr.has_select() => free_select_bits.push(i),
+            Some(expr) => {
+                if expr.eval(&init_map) {
+                    init_cube |= 1 << i;
+                }
+            }
+            None => {
+                if init_values.get(&spec.register).copied() == Some(spec.value as u128) {
+                    init_cube |= 1 << i;
+                }
+            }
         }
     }
 
-    Ok(match trace.final_verdict.verdict_at(init_cube) {
-        Trit::False => PropertyVerdict::Violated,
-        Trit::Unknown => PropertyVerdict::Unknown,
-        Trit::True => PropertyVerdict::Holds,
+    if free_select_bits.is_empty() {
+        // Pinned reset cube — the exact-input-independent verdict (all three values trusted).
+        return Ok(match trace.final_verdict.verdict_at(init_cube) {
+            Trit::False => PropertyVerdict::Violated,
+            Trit::Unknown => PropertyVerdict::Unknown,
+            Trit::True => PropertyVerdict::Holds,
+        });
+    }
+    // Free array content at reset over-APPROXIMATES the initial set (a superset of the real
+    // reachable initial states). `AG EF good` holding over the superset implies it over the
+    // real set, so a UNANIMOUS `True` across every flavour is a sound `Holds`. A `False` /
+    // `Unknown` flavour could correspond to an initial array content the concrete design
+    // never has (a spurious violation from an unreachable init), so we do NOT emit `Violated`
+    // here — we abstain (the recoverability path's "trust only Holds from an over-approx"
+    // posture). Bounded to keep the 2^f enumeration small; a wider free set abstains.
+    const MAX_FREE_SELECT_BITS: usize = 4;
+    if free_select_bits.len() > MAX_FREE_SELECT_BITS {
+        return Ok(PropertyVerdict::Unknown);
+    }
+    let all_true = (0..(1usize << free_select_bits.len())).all(|mask| {
+        let mut cube = init_cube;
+        for (b, &bit) in free_select_bits.iter().enumerate() {
+            if (mask >> b) & 1 == 1 {
+                cube |= 1 << bit;
+            }
+        }
+        matches!(trace.final_verdict.verdict_at(cube), Trit::True)
+    });
+    Ok(if all_true {
+        PropertyVerdict::Holds
+    } else {
+        PropertyVerdict::Unknown
     })
 }
 
@@ -1892,6 +2104,12 @@ fn atomic_expr_string(expr: &PredicateExpr) -> Option<String> {
             addend,
             ..
         } => Some(format!("{lhs} {} {rhs} + {addend}", op(*o))),
+        PredicateExpr::Select {
+            array,
+            index,
+            op: o,
+            value,
+        } => Some(format!("{array}[{index}] {} {value}", op(*o))),
         PredicateExpr::And(..) | PredicateExpr::Or(..) | PredicateExpr::Not(..) => None,
     }
 }
@@ -3552,6 +3770,143 @@ mod tests {
         assert_eq!(
             verify_recoverability(&wide, "fsm == 2").expect("b2 decides the wide design"),
             PropertyVerdict::Holds,
+        );
+    }
+
+    /// P1-a shot-①b — the array-content Select seed on a yosys-lifted keep-`$mem` design whose
+    /// recovery is gated on array content (`mem[key] == all-ones`). The read index is a reset-mux
+    /// `ite(rst, key, 0)` over an UNNAMED FF, with the symbol on a width-preserving observable copy
+    /// `uext(idx, 0) = u.key` — so `select_guard_atoms` must SEE THROUGH the uext to resolve the
+    /// index. Isolates discovery (does the Select seed get produced?) from decision (can the cube
+    /// use it?). The exact ROBDD SKIPs (in-cone array), so this is the escalated cube path.
+    const AGR_SMALL_MEM: &str = "\
+1 sort bitvec 1
+2 input 1 clk
+3 input 1 rst_n
+4 input 1 start
+5 sort bitvec 2
+6 input 5 waddr
+7 input 5 wdata
+8 const 1 0
+9 state 1
+10 ite 1 3 9 8
+11 output 10 busy
+12 uext 1 10 0 u.busy
+13 uext 1 2 0 u.clk
+14 const 5 00
+15 state 5
+16 ite 5 3 15 14
+17 uext 5 16 0 u.key
+18 uext 1 3 0 u.rst_n
+19 uext 1 4 0 u.start
+20 uext 5 6 0 u.waddr
+21 uext 5 7 0 u.wdata
+22 sort array 5 5
+23 state 22 u.mem
+24 read 5 23 16
+25 const 5 11
+26 eq 1 24 25
+27 ite 1 26 8 10
+28 ite 1 10 27 10
+29 const 1 1
+30 not 1 10
+31 and 1 4 30
+32 ite 1 31 29 28
+33 ite 1 3 32 8
+34 next 1 9 33
+35 ite 5 31 6 16
+36 ite 5 3 35 14
+37 next 5 15 36
+38 read 5 23 6
+39 not 5 25
+40 and 5 38 39
+41 and 5 7 25
+42 or 5 41 40
+43 write 22 23 6 42
+44 redor 1 25
+45 ite 22 44 43 23
+46 next 22 23 45 u.mem
+";
+
+    #[test]
+    fn p1a_select_guard_discovery_sees_through_resetmux_uext() {
+        // (a) DISCOVERY: the index (`16 ite …`, unsymboled) resolves to `u.key` via the
+        //     `17 uext 5 16 0 u.key` observable-copy see-through; array is the `$mem` state.
+        let file = crate::adapter::btor2::parser::parse(AGR_SMALL_MEM).expect("parse");
+        let atoms = select_guard_atoms(&file);
+        assert!(
+            atoms.contains(&("u.mem".to_string(), "u.key".to_string(), 3)),
+            "select_guard_atoms must discover mem[key]==3 (via reset-mux/uext see-through); got {atoms:?}"
+        );
+    }
+
+    /// Hand-authored twin of `AGR_SMALL_MEM` with NAMED state FFs and a DIRECT `mem[key]`
+    /// read (no yosys reset-mux / observable-copy artifacts), so the reset-cube gate pins
+    /// every register and the ONLY hard axis is the in-cone array content. Recovery: busy→0
+    /// iff mem[key]==all-ones(3); mem is freely env-writable (mem[waddr]=wdata), so from any
+    /// busy state the env can write mem[key]=3 and recover ⇒ AG EF(busy==0) HOLDS.
+    const AGR_CLEAN: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 5 8
+25 next 2 8 24
+26 write 3 9 5 6
+27 next 3 9 26
+";
+
+    #[test]
+    fn p1a_spcr_decides_array_gated_recovery_holds() {
+        // (b) THE WALL, REMOVED by SPCR (shot ①b). BACKGROUND: a definite recoverability verdict
+        //     needs the diamond `<>X` = True, hence a MUST (hyper) edge; the must-edge ∀∃ —
+        //     `∀ s ⊨ src. ∃ in, s'. (T ∧ s' ⊨ tgt)` — universally quantifies EVERY next-state
+        //     component including the next-state ARRAY (`universal_bound_arrays`), which is
+        //     quantified array logic (AUFBV + ∀-over-array), UNDECIDABLE for Z3 → no must-edges →
+        //     the raw cube abstains. FIX: SPCR (`array_prophecy`) registerizes the property-
+        //     ACCESSED cell (`pv = mem[key]`, exact frame) and DROPS the array, so the must-query
+        //     is pure QF_BV (decidable). The design is then array-free and the exact ROBDD decides.
+        //     Verdict-preserving reformulation ⇒ the `Holds` transfers (Bruns–Godefroid), matching
+        //     the whole-array-registerized ROBDD oracle — but at O(#accessed-cells), the scaling
+        //     that beats whole-array registerization (see `array_gates_recovery_large`).
+        use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
+        // Discovery still fires on the array-bearing form (the SPCR read-set detector).
+        let file = crate::adapter::btor2::parser::parse(AGR_CLEAN).expect("parse");
+        assert!(
+            select_guard_atoms(&file).contains(&("mem".to_string(), "key".to_string(), 3)),
+            "clean fixture must discover mem[key]==3"
+        );
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        // The ARRAY-BEARING design makes the exact ROBDD SKIP (in-cone array) — the raw wall.
+        assert!(
+            exact_symbolic_verdict(AGR_CLEAN, &f).is_err(),
+            "the in-cone array must make the raw exact ROBDD SKIP"
+        );
+        // SPCR eliminates it → the escalating scalable entry now DECIDES Holds.
+        assert_eq!(
+            verify_recoverability_scalable(AGR_CLEAN, "busy == 0", &[]).expect("scalable decides"),
+            PropertyVerdict::Holds,
+            "SPCR removes the array-must wall: registerize the accessed cell, drop the array, \
+             the QF_BV must-query decides AG EF(busy==0) = Holds"
         );
     }
 }
