@@ -310,22 +310,31 @@ impl BddBitBlaster {
             ));
         }
 
-        // Arena sizing, TIERED so the common (≤ 40-bit) path is UNCHANGED — 2M inner nodes
-        // (~32 MB) + 512K apply cache. A WIDE cone (reachable when the auto-cap admits a
-        // modestly-wide concrete cone, or the cap is raised further via env) gets a larger,
-        // env-tunable arena; the node-budget guard (80 % of the arena)
-        // bails cleanly before it overflows, and `catch_unwind` is the backstop for a single op
-        // that jumps the budget in one apply. The manager is dropped per `BddBitBlaster`, so at
-        // most one arena is live at a time.
+        // Arena sizing, TIERED. The HARD arena size (the memory limit) and the node BUDGET (the
+        // decidability threshold: a build whose BDD passes the budget ABSTAINS → `--engine
+        // explicit`) are DECOUPLED so the arena sits WELL ABOVE the budget. That headroom is
+        // load-bearing: a single wide op (e.g. an `Ite` over a wide word) can grow the BDD past
+        // the budget in ONE apply, before the between-op guard runs — if that one apply also
+        // overran the ARENA, OxiDD returns `OutOfMemory`, the `.unwrap()` panics, and unwinding
+        // then drops the EXHAUSTED manager, which ABORTS the process (SIGABRT — `catch_unwind`
+        // cannot save it). With the arena above the budget, that one over-budget apply still fits,
+        // so the guard sees `live > budget` and returns a clean `Err` (graceful abstain) instead.
+        // Small tier: 2M budget in an 8M arena (6M headroom, ~128 MB). Wide tier: env-tunable
+        // arena, 80 % budget (already ~20 % = several-M headroom). Combined with the start-of-op
+        // guard in `eval_op`, no single op can reach the arena limit. Manager is per-blaster.
         let arena_nodes: usize = if total_bits <= 40 {
-            1 << 21
+            1 << 23 // 8M nodes (~128 MB) — big headroom below the budget (was 2M)
         } else {
             std::env::var("MUNUNU_BDD_ARENA_NODES")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1 << 25) // 32M nodes (~1 GB); bump via env for wider control cones
         };
-        let node_budget = arena_nodes * 8 / 10;
+        let node_budget = if total_bits <= 40 {
+            1 << 21 // 2M — decidability threshold; the 8M arena leaves 6M single-op headroom
+        } else {
+            arena_nodes * 8 / 10
+        };
         let manager = bdd::new_manager(arena_nodes, arena_nodes / 4, 1);
         let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
@@ -1395,6 +1404,19 @@ impl AbstractRelation {
     }
 }
 
+/// Map an OxiDD apply result (arena-full ⇒ `OutOfMemory`) to the engine's `String` error, so a wide
+/// BDD op ABSTAINS (`Err` → the caller routes to `--engine explicit`) instead of `.unwrap()`-panicking.
+/// A panic here aborts the process (SIGABRT) on the unwind of the exhausted manager — `catch_unwind`
+/// cannot save it — so a hot-path op that can exhaust the arena must propagate, never `unwrap`.
+#[inline]
+fn oom<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<T, String> {
+    r.map_err(|_e| {
+        "symbolic bit-blaster: BDD arena exhausted (OxiDD OutOfMemory) — the cone does not compress \
+         to a tractable BDD; use `--engine explicit`"
+            .to_string()
+    })
+}
+
 impl BvTermBackend for BddBitBlaster {
     type Value = BitVec;
     type Error = String;
@@ -1442,6 +1464,12 @@ impl BvTermBackend for BddBitBlaster {
         args: &[Operand],
         width: u32,
     ) -> Result<Self::Value, Self::Error> {
+        // START-of-op guard — if a PRIOR op already pushed the BDD past the budget, bail BEFORE
+        // running this one. Load-bearing: the op we skip could be the wide one whose single apply
+        // would overrun the arena (→ OxiDD `OutOfMemory` → `.unwrap()` panic → SIGABRT on the
+        // unwind of the exhausted manager). The arena headroom (see `build_with_keep`) covers the
+        // one over-budget op that trips the end-of-op guard below; this start guard stops the NEXT.
+        self.check_node_budget()?;
         let read = |i: usize| -> Result<BitVec, String> { self.resolve(args[i]) };
 
         let result: BitVec = match op {
@@ -1666,15 +1694,20 @@ impl BvTermBackend for BddBitBlaster {
                 let c = read(0)?;
                 let (t, e) = (read(1)?, read(2)?);
                 let cond = c[0].clone();
-                let ncond = cond.not().unwrap();
-                (0..width as usize)
-                    .map(|i| {
-                        cond.and(&t[i])
-                            .unwrap()
-                            .or(&ncond.and(&e[i]).unwrap())
-                            .unwrap()
-                    })
-                    .collect()
+                let ncond = oom(cond.not())?;
+                // Per-bit budget check + Err-propagation. A wide `Ite` (a mux over a wide word) is
+                // the heaviest arm — the whole width builds in ONE `eval_op` call, so the between-op
+                // guard cannot fire mid-collect. Checking after each output bit bounds the growth
+                // between checks to a single 2-input mux, so we bail (Err) at the budget with the
+                // arena headroom still intact — OxiDD never actually exhausts, so it never panics.
+                let mut out: BitVec = BitVec::with_capacity(width as usize);
+                for i in 0..width as usize {
+                    let then_i = oom(cond.and(&t[i]))?;
+                    let else_i = oom(ncond.and(&e[i]))?;
+                    out.push(oom(then_i.or(&else_i))?);
+                    self.check_node_budget()?;
+                }
+                out
             }
 
             // Out of R-F5.3a scope — later slices / never in the FSM+counter core.
@@ -1684,20 +1717,10 @@ impl BvTermBackend for BddBitBlaster {
                 ));
             }
         };
-        // Node-budget guard — bail cleanly (→ Skipped) if this op grew the shared BDD arena
-        // past the budget, BEFORE the next op can overflow the fixed OxiDD arena and panic.
-        // `approx_num_inner_nodes` is O(1). The bit cap admitted this cone; the actual BDD is
-        // what decides tractability.
-        let live = self
-            ._manager
-            .with_manager_shared(|m| m.approx_num_inner_nodes());
-        if live > self.node_budget {
-            return Err(format!(
-                "symbolic bit-blaster: BDD node budget exceeded ({live} > {} live nodes) — the \
-                 property's cone does not compress to a tractable BDD; use `--engine explicit`",
-                self.node_budget
-            ));
-        }
+        // END-of-op guard — bail cleanly (→ a graceful `Err`) if this op grew the shared BDD arena
+        // past the budget. The arena is sized well above the budget, so this op (which crossed it)
+        // still fit without hitting OxiDD's `OutOfMemory`; the NEXT op is stopped by the start guard.
+        self.check_node_budget()?;
         Ok(result)
     }
 
@@ -1817,6 +1840,27 @@ fn exact_time_budget() -> Option<std::time::Duration> {
 }
 
 impl BddBitBlaster {
+    /// Bail (→ `Err`, a graceful abstain that routes the caller to `--engine explicit`) once the
+    /// live BDD node count passes the budget. `approx_num_inner_nodes` is O(1). Called at BOTH the
+    /// start and end of every `eval_op`: the end guard catches the op that crossed the budget (the
+    /// arena headroom absorbs it), the start guard stops the following op from running while over
+    /// budget — together they keep the arena from ever actually filling, so OxiDD never returns
+    /// `OutOfMemory` (whose `.unwrap()` panic would abort the process on the unwind of the
+    /// exhausted manager, uncatchable by `catch_unwind`).
+    fn check_node_budget(&self) -> Result<(), String> {
+        let live = self
+            ._manager
+            .with_manager_shared(|m| m.approx_num_inner_nodes());
+        if live > self.node_budget {
+            return Err(format!(
+                "symbolic bit-blaster: BDD node budget exceeded ({live} > {} live nodes) — the \
+                 property's cone does not compress to a tractable BDD; use `--engine explicit`",
+                self.node_budget
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the [`ExactModel`] for full-state 2-valued μ-calculus MC (D1). Pinned
     /// inputs (config concretization / reset-gating) are already constants in the
     /// bit-blasted design, so the `∃`/`∀` over the *remaining* free inputs is exact
@@ -4900,6 +4944,37 @@ mod tests {
         // Must return a Result (Ok or Err) without panicking — `catch_unwind` converts any
         // arena overflow into an Err. A panic here fails the test, which is the guarantee.
         let _ = exact_symbolic_verdict(MUL40, &formula);
+    }
+
+    /// Regression for the `sv check-fsm` SIGABRT on wide RTL (uart/i2c_slave, 2026-07-30): the
+    /// FSM-scan reachability member (`fsm_encoding_scan` → `decide_reach_portfolio` →
+    /// [`exact_bad_reachable`]) bit-blasts the design's transition relation, and a wide op could
+    /// exhaust the BDD arena in a SINGLE apply — before the between-op node-budget guard. OxiDD then
+    /// returned `OutOfMemory`, the `.unwrap()` PANICKED, and unwinding dropped the exhausted manager,
+    /// which ABORTED the process (SIGABRT) — uncatchable by `catch_unwind`, so the whole scan
+    /// crashed. The fix (per-bit budget guard + `Err`-propagation in the wide arms, start/end op
+    /// guards, and arena headroom above the budget) keeps the arena from ever actually filling, so
+    /// this MUST return a Result (Ok/Err) without panicking or aborting. A panic/abort fails the test.
+    #[test]
+    fn exact_bad_reachable_wide_design_bails_gracefully_never_aborts() {
+        const WIDE_MUL_BAD: &str = r#"
+1 sort bitvec 20
+2 sort bitvec 40
+3 sort bitvec 1
+4 input 1 x
+5 input 1 y
+6 uext 2 4 20
+7 uext 2 5 20
+8 mul 2 6 7
+9 state 2 p
+10 next 2 9 8
+11 zero 2
+12 init 2 9 11
+13 ones 2
+14 eq 3 9 13
+15 bad 14
+"#;
+        let _ = exact_bad_reachable(WIDE_MUL_BAD);
     }
 
     /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
