@@ -1307,6 +1307,58 @@ mod tests {
         );
     }
 
+    /// Boundary of the SPCR fragment (found via the OpenTitan config-table synthetic, 2026-07-29):
+    /// identical to the clean `AGR_SPCR` decide case EXCEPT the recovery index `key` latches a FREE
+    /// INPUT `sel` (nid 28) that is INDEPENDENT of the write address `waddr` (nid 5). On a new latch
+    /// the index jumps to an arbitrary cell whose content was set by past writes to a different
+    /// address, so no finite set of prophecy registers tracks it — `mem_next_at` hits `sel` (an
+    /// input ≠ `waddr`) as an index leaf and clears `ok`. SPCR must SOUNDLY ABSTAIN (fall to the
+    /// cube → honest ⊥), never registerize spuriously. Contrast
+    /// `spcr_pb1_latch_last_written_addr_under_we_decides_holds`, where the index tracks `waddr` and
+    /// SPCR decides. This is exactly the OT `ot_cfgtable_recovery` (index←`req_chan_i`, abstains) vs
+    /// `ot_lastcfg_recovery` (index←`cfg_addr_i`=waddr, decides) split.
+    const AGR_SPCR_INDEP_INDEX: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 28 8
+25 next 2 8 24
+26 write 3 9 5 6
+27 next 3 9 26
+28 input 2 sel
+";
+
+    #[test]
+    fn spcr_abstains_when_index_moves_to_independent_free_input() {
+        let file = crate::adapter::btor2::parser::parse(AGR_SPCR_INDEP_INDEX).expect("parse");
+        assert!(has_array(&file), "fixture must have an array");
+        assert!(
+            super::spcr(&file).is_none(),
+            "a recovery index that latches a free input independent of waddr is outside SPCR's \
+             fragment ⇒ SPCR must abstain (no spurious registerization)"
+        );
+    }
+
     /// P-A1c — the yosys per-bit-write-ENABLE modeling of a plain full write `mem[waddr] <= wdata`:
     /// `write(mem, waddr, (wdata & allones) | (mem[waddr] & ~allones))`. The `mem[waddr]` read is
     /// DEAD (`& ~allones = & 0`). Without the fold, SPCR abstains (the RMW read's index is the INPUT
