@@ -1071,6 +1071,52 @@ pub fn verify_recoverability_with_predicates(
     }
 }
 
+/// Harness / attribution seam — run ONLY the SPCR pre-pass ([`array_prophecy::spcr`]), then the
+/// exact ROBDD on the array-free result. Isolates SPCR's contribution, which is otherwise embedded
+/// inside [`verify_recoverability_scalable`] (so a `dflt`/`wp` HOLDS on an array-content case cannot
+/// be attributed to SPCR specifically). Returns:
+/// - `Holds` / `Violated` — SPCR applied (array-content shape registerized, array dropped) and the
+///   exact engine decided the array-free design (a verdict-preserving reformulation — transfers).
+/// - `Unknown` — SPCR applied but the array-free cone is still too wide for exact (would fall to the
+///   cube in the production path).
+/// - `Skipped` — SPCR did NOT apply (no in-cone array, or an unsound / outside-the-fragment shape:
+///   a moving index selected by a free input independent of the write address, a sweeping index,
+///   etc. → SPCR soundly abstains).
+///
+/// Used by the wall-class matrix's `spcr` column to MEASURE SPCR's marginal reach (it decides the
+/// array-content-gated νµ class that exact-alone SKIPs and the plain ∀-array cube leaves ⊥) and to
+/// mark the fragment boundary (the independent-index sibling → `Skipped`).
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD (OxiDD) over the SPCR-produced ARRAY-FREE full-state
+/// design — the array-content atom is now a plain `pv == K` BV register, so the µ-fixpoint
+/// bit-blasts. `Skipped` when the SPCR reformulation does not apply.
+pub fn verify_recoverability_spcr_only(
+    btor2_content: &str,
+    good: &str,
+) -> Result<PropertyVerdict, String> {
+    parse_predicate_expr(good).map_err(|e| {
+        format!("recoverability target `{good}` is not a register-comparison atom (`REG op VALUE`): {e:?}")
+    })?;
+    let file0 = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("SPCR-only: parsing BTOR2: {}", e.message))?;
+    match crate::adapter::btor2::array_prophecy::spcr(&file0) {
+        Some(af) => {
+            let src = crate::adapter::btor2::emit::emit_btor2(&af);
+            let formula_str = format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)");
+            let formula = mu_parser::parse(&formula_str).map_err(|e| {
+                format!("SPCR-only: building the AG EF formula for `{good}`: {e:?}")
+            })?;
+            match crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(&src, &formula) {
+                Ok(v) => Ok(PropertyVerdict::from(v)),
+                // SPCR applied (array dropped) but the array-free cone is still too wide for exact.
+                Err(_) => Ok(PropertyVerdict::Unknown),
+            }
+        }
+        // SPCR does not apply (no array / outside the decidable fragment) → sound abstention.
+        None => Ok(PropertyVerdict::Skipped),
+    }
+}
+
 /// b2 — decide `AG EF good` by COMPOSING a ranking certificate (every in-cone
 /// down-counter that gates progress always eventually expires) with b1's counter
 /// may-abstraction ([`counter_may_abstract`](crate::adapter::btor2::bit_blast::counter_may_abstract)),

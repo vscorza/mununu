@@ -19,7 +19,7 @@ use mununu_core::adapter::btor2::cegar::PredicateSource;
 use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
 use mununu_core::adapter::recoverability::{
     verify_recoverability, verify_recoverability_scalable,
-    verify_recoverability_scalable_with_source,
+    verify_recoverability_scalable_with_source, verify_recoverability_spcr_only,
 };
 use mununu_core::planner::solve_recoverability_combined;
 use mununu_core::verdict::PropertyVerdict;
@@ -250,6 +250,82 @@ const AES_CIPHER: &str = include_str!("fixtures/wall_classes/aes_cipher_control_
 const CSRNG: &str = include_str!("fixtures/wall_classes/csrng_main_sm.btor");
 const AES_CTR: &str = include_str!("fixtures/wall_classes/aes_ctr_fsm.btor");
 
+// ARRAY-CONTENT-GATED νµ recoverability (the SPCR class, PR #410). `AG EF(busy==0)` where recovery
+// routes through ARRAY CONTENT read at a latched index: `busy` clears only when `mem[key]==all-ones`.
+// exact-symbolic SKIPs the in-cone `$mem`; the plain cube's must-edge is an AUFBV ∀-over-array query
+// → Unknown → the νµ abstains (⊥). SPCR registerizes the accessed cell + drops the array → QF_BV →
+// exact decides. TWO sibling cases mark the FRAGMENT BOUNDARY (the whole point of the class):
+//   (decides) `key` latches `waddr` (the write address) → the index only ever moves TO the written
+//             cell → `mem'[key']=mem'[waddr]=wdata` exact → SPCR applies → HOLDS.
+//   (abstains) `key` latches a free input `sel` INDEPENDENT of `waddr` → the index jumps to an
+//             arbitrary past-written cell no finite prophecy-set tracks → SPCR soundly abstains
+//             (`spcr` col = SKIP) → exact SKIP + ∀-array cube ⊥ → HardUnknown.
+// synthetic: the class is measured-ABSENT from real RTL corpora (0/135 AssertLLM2, 0/315 HWMCC20,
+// full OpenTitan hw/ip sweep — the only near-miss, the OTBN loop stack, recovers via a down-counter
+// + PC-match, not a stored-content value-test), so there is no RTL representative to lift.
+const ARRAY_CONTENT_SPCR: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 5 8
+25 next 2 8 24
+26 write 3 9 5 6
+27 next 3 9 26
+";
+
+// Sibling of ARRAY_CONTENT_SPCR with ONE change: `key` latches the independent input `sel` (nid 28)
+// instead of `waddr` (nid 5) — the outside-the-fragment boundary case (SPCR abstains soundly).
+const ARRAY_CONTENT_INDEP: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 28 8
+25 next 2 8 24
+26 write 3 9 5 6
+27 next 3 9 26
+28 input 2 sel
+";
+
 const NO_PIN: &[(&str, u64)] = &[];
 const PIN_RST: &[(&str, u64)] = &[("rst_ni", 1)];
 
@@ -325,6 +401,28 @@ fn cases() -> Vec<Case> {
             btor2: CRAIG_EMERGENT,
             target: "busy == 0",
             oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
+        },
+        // The SPCR class (PR #410) + its fragment boundary. `array_content_spcr` is decided ONLY via
+        // the SPCR pre-pass (exact SKIPs the in-cone array; the ∀-array cube leaves ⊥) — so the
+        // completeness assertion below is a live regression guard on SPCR's marginal reach. The
+        // independent-index sibling is HardUnknown (SPCR soundly abstains → the class's honest ⊥).
+        Case {
+            name: "array_content_spcr",
+            class: "array-content-gated/HOLDS",
+            btor2: ARRAY_CONTENT_SPCR,
+            target: "busy == 0",
+            oracle: Oracle::Holds,
+            source: "synthetic",
+            pin: NO_PIN,
+        },
+        Case {
+            name: "array_content_indep_idx",
+            class: "array-content-indep-idx/⊥",
+            btor2: ARRAY_CONTENT_INDEP,
+            target: "busy == 0",
+            oracle: Oracle::HardUnknown,
             source: "synthetic",
             pin: NO_PIN,
         },
@@ -420,13 +518,14 @@ fn decides(r: &Result<PropertyVerdict, String>, want: PropertyVerdict) -> bool {
 fn wall_class_matrix() {
     let mathsat = std::env::var_os("MUNUNU_MATHSAT_PATH").is_some();
     println!(
-        "\n{:32} {:26} {:>6} {:>6} {:>6} {:>7}",
-        "case", "class", "dflt", "wp", "craig", "comb"
+        "\n{:32} {:26} {:>6} {:>6} {:>6} {:>6} {:>7}",
+        "case", "class", "dflt", "wp", "craig", "spcr", "comb"
     );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(98));
 
     let mut soundness_violations = Vec::new();
     let mut craig_unique = Vec::new();
+    let mut spcr_decided = Vec::new(); // array-content cases the SPCR pre-pass decides (its reach)
     let mut combined_fullspace = Vec::new(); // ⊥-singletons → combined decides with NO pins (transfers)
 
     let mut rtl_classes = std::collections::BTreeSet::new();
@@ -455,18 +554,24 @@ fn wall_class_matrix() {
             &[],
             PredicateSource::CraigInterpolation,
         );
+        // The SPCR pre-pass in ISOLATION (its own `spcr` column): Holds/Violated when SPCR applies +
+        // exact decides the array-free design, Skipped when SPCR does not apply (no array / outside
+        // the fragment → sound abstention). Attributes an array-content decision to SPCR — otherwise
+        // invisible because SPCR is embedded inside `dflt`/`wp`.
+        let spcr = verify_recoverability_spcr_only(&model, c.target);
         // The COMPOSED plan (exact-first + cube + ranking + guard + Craig) — the whole point of a
         // planner: a lever that is 0 alone can contribute in combination. It runs only SOUND,
         // transferable levers (the earlier unsound auto-input-pinning was removed — see
         // `solve_recoverability_combined`), so its verdict is full-space and oracle-comparable.
         let combined = solve_recoverability_combined(&model, c.target);
         println!(
-            "{:32} {:26} {:>6} {:>6} {:>6} {:>7}",
+            "{:32} {:26} {:>6} {:>6} {:>6} {:>6} {:>7}",
             c.name,
             c.class,
             v(&dflt),
             v(&wp),
             v(&craig),
+            v(&spcr),
             v(&combined)
         );
 
@@ -477,6 +582,7 @@ fn wall_class_matrix() {
             ("default", &dflt),
             ("cube-wp", &wp),
             ("cube-craig", &craig),
+            ("spcr", &spcr),
             ("combined", &combined),
         ] {
             let bad = match c.oracle {
@@ -495,7 +601,8 @@ fn wall_class_matrix() {
             Oracle::Holds => assert!(
                 decides(&dflt, PropertyVerdict::Holds)
                     || decides(&wp, PropertyVerdict::Holds)
-                    || decides(&craig, PropertyVerdict::Holds),
+                    || decides(&craig, PropertyVerdict::Holds)
+                    || decides(&spcr, PropertyVerdict::Holds),
                 "{} (HOLDS) is decided by no lever",
                 c.name
             ),
@@ -511,6 +618,13 @@ fn wall_class_matrix() {
         // Craig's UNIQUE reach: a case cube-wp leaves ⊥ that cube-craig decides.
         if matches!(wp, Ok(PropertyVerdict::Unknown)) && is_holds(&craig) {
             craig_unique.push(c.name);
+        }
+
+        // SPCR's reach: an array-content case the SPCR pre-pass decides (Holds/Violated) in
+        // isolation. exact-alone SKIPs it (in-cone `$mem`) and the plain ∀-array cube leaves ⊥, so a
+        // decision here is SPCR's marginal contribution.
+        if is_holds(&spcr) || is_viol(&spcr) {
+            spcr_decided.push(c.name);
         }
 
         // The COMBINE-MECHANISMS hypothesis: a case EVERY singleton leaves ⊥ that the composed
@@ -579,6 +693,31 @@ fn wall_class_matrix() {
              run in mununu-sva-pono to exercise + measure the Craig column."
         );
     }
+
+    // SPCR's MARGINAL reach (PR #410) — MEASURED, not presupposed. The `spcr` column decides the
+    // array-content-gated νµ class (`array_content_spcr`) that exact-alone SKIPs (in-cone `$mem`) and
+    // the plain ∀-array cube leaves ⊥; on every non-array case it correctly SKIPs (no marginal reach,
+    // no harm), and on the independent-index sibling it SKIPs too (the sound fragment boundary). The
+    // class is measured-ABSENT from real RTL corpora (2026-07-29), so this is a MECHANISM guard.
+    println!("{}", "-".repeat(98));
+    if spcr_decided.is_empty() {
+        println!(
+            "MEASURED: SPCR decides nothing on this set — a REGRESSION (the array-content case must \
+             be SPCR-decided; exact SKIPs it and the ∀-array cube is ⊥)."
+        );
+    } else {
+        println!(
+            "SPCR uniquely enables the array-content-gated νµ class (exact SKIP + ∀-array cube ⊥ → \
+             SPCR HOLDS): {spcr_decided:?}. Fragment boundary: the independent-index sibling → SKIP \
+             (sound abstain). Class measured-ABSENT from real RTL — mechanism guard, not corpus-decide."
+        );
+    }
+    // Guard the reach so a silent SPCR regression fails the matrix, not just the printout.
+    assert!(
+        spcr_decided.contains(&"array_content_spcr"),
+        "SPCR must decide the array-content-gated νµ case (its whole reach); exact SKIPs it and the \
+         ∀-array cube leaves ⊥, so a non-decision is an SPCR regression"
+    );
 
     // RTL-COVERAGE tracker (requirement 2026-07-26: an RTL representative for every class). The
     // synthetic fixtures are valid MECHANISM checks; RTL adds realism. This prints the classes
