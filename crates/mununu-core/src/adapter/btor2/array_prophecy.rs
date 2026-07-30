@@ -112,6 +112,15 @@ impl Elim<'_> {
         if let Some(&n) = self.pv_of.get(&cell) {
             return n;
         }
+        // SOUNDNESS: a registerized STATE index must be a real LATCH — it MUST have a `next`. A BTOR2
+        // state with NO `next` is HAVOC every cycle (an unconstrained/free index), so `pv = mem[state]`
+        // cannot be tracked by a single register (the index jumps arbitrarily) — abstain. (Const index
+        // cells never havoc.) Missing this is unsound: it treats a free index as a held constant.
+        if let Cell::State(s) = cell
+            && find_next_value_operand(self.file, s).is_none()
+        {
+            self.ok = false;
+        }
         let symbol = match cell {
             Cell::State(s) => format!("spcr_pv_{}_{}", self.array_nid, s),
             Cell::Const(c) => format!("spcr_pv_{}_c{}", self.array_nid, c),
@@ -772,6 +781,161 @@ fn fold_and_dce(file: &Btor2File) -> Btor2File {
     Btor2File { lines: out, by_nid }
 }
 
+/// The nids a node references (operands + sort + state/value + signals) — for topological ordering.
+fn node_dep_nids(node: &Node) -> Vec<Nid> {
+    match node {
+        Node::Sort {
+            sort: Sort::Array { index, element },
+        } => vec![*index, *element],
+        Node::Sort { .. } => Vec::new(),
+        Node::Op { sort, args, .. } => {
+            let mut v: Vec<Nid> = args.iter().map(|a| a.nid()).collect();
+            v.push(*sort);
+            v
+        }
+        Node::State { sort, .. } | Node::Input { sort, .. } | Node::Const { sort, .. } => {
+            vec![*sort]
+        }
+        Node::Init { sort, state, value } | Node::Next { sort, state, value } => {
+            vec![*sort, *state, value.nid()]
+        }
+        Node::Bad { signal }
+        | Node::Constraint { signal }
+        | Node::Fair { signal }
+        | Node::Output { signal, .. } => vec![signal.nid()],
+        Node::Justice { signals } => signals.iter().map(|s| s.nid()).collect(),
+    }
+}
+
+/// Topologically sort lines so every referenced nid precedes its use (iterative post-order DFS).
+/// The graph is a DAG — BTOR2 forbids combinational cycles, and a `state` is a leaf declaration
+/// whose `next` is a separate node (so `next(s, f(s))` is acyclic: s, then f(s), then next).
+fn topo_sort_lines(lines: Vec<Line>) -> Vec<Line> {
+    let idx_of: HashMap<Nid, usize> = lines.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
+    let mut mark = vec![0u8; lines.len()]; // 0 unvisited, 1 in-progress, 2 done
+    let mut order: Vec<usize> = Vec::with_capacity(lines.len());
+    for start in 0..lines.len() {
+        if mark[start] != 0 {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((i, processed)) = stack.pop() {
+            if processed {
+                if mark[i] != 2 {
+                    mark[i] = 2;
+                    order.push(i);
+                }
+                continue;
+            }
+            if mark[i] != 0 {
+                continue;
+            }
+            mark[i] = 1;
+            stack.push((i, true));
+            for d in node_dep_nids(&lines[i].node) {
+                if let Some(&j) = idx_of.get(&d)
+                    && mark[j] == 0
+                {
+                    stack.push((j, false));
+                }
+            }
+        }
+    }
+    let mut slots: Vec<Option<Line>> = lines.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().unwrap())
+        .collect()
+}
+
+/// Renumber lines to MONOTONIC 1-based nids (their line position) and remap EVERY nid reference —
+/// producing valid BTOR2 (`btormc`/`pono` require strictly-increasing ids in line order). Preserves
+/// operand signs; remaps sort refs (incl. `Array{index,element}`), state/value refs, and signals.
+fn renumber_monotonic(lines: Vec<Line>) -> Vec<Line> {
+    let map: HashMap<Nid, Nid> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.nid, i as Nid + 1))
+        .collect();
+    let m = |old: Nid| -> Nid { map.get(&old).copied().unwrap_or(old) };
+    let mop = |o: Operand| -> Operand {
+        let n = m(o.nid());
+        Operand(if o.0 < 0 { -n } else { n })
+    };
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let node = match l.node {
+                Node::Sort {
+                    sort: Sort::Array { index, element },
+                } => Node::Sort {
+                    sort: Sort::Array {
+                        index: m(index),
+                        element: m(element),
+                    },
+                },
+                s @ Node::Sort { .. } => s, // BitVec width is not a nid
+                Node::Op {
+                    sort,
+                    op,
+                    args,
+                    symbol,
+                } => Node::Op {
+                    sort: m(sort),
+                    op,
+                    args: args.into_iter().map(mop).collect(),
+                    symbol,
+                },
+                Node::State { sort, symbol } => Node::State {
+                    sort: m(sort),
+                    symbol,
+                },
+                Node::Input { sort, symbol } => Node::Input {
+                    sort: m(sort),
+                    symbol,
+                },
+                Node::Const { sort, value } => Node::Const {
+                    sort: m(sort),
+                    value,
+                },
+                Node::Init { sort, state, value } => Node::Init {
+                    sort: m(sort),
+                    state: m(state),
+                    value: mop(value),
+                },
+                Node::Next { sort, state, value } => Node::Next {
+                    sort: m(sort),
+                    state: m(state),
+                    value: mop(value),
+                },
+                Node::Bad { signal } => Node::Bad {
+                    signal: mop(signal),
+                },
+                Node::Constraint { signal } => Node::Constraint {
+                    signal: mop(signal),
+                },
+                Node::Fair { signal } => Node::Fair {
+                    signal: mop(signal),
+                },
+                Node::Output { signal, symbol } => Node::Output {
+                    signal: mop(signal),
+                    symbol,
+                },
+                Node::Justice { signals } => Node::Justice {
+                    signals: signals.into_iter().map(mop).collect(),
+                },
+            };
+            Line {
+                nid: i as Nid + 1,
+                node,
+                immediates: l.immediates,
+                source_line: l.source_line,
+            }
+        })
+        .collect()
+}
+
 /// SPCR entry: if EVERY in-cone array matches the sound P-A1 shape (after the P-A1c fold), return
 /// the array-FREE equivalent design (prophecy registers + exact frames, arrays dropped); else
 /// `None` (the caller keeps the original and falls through to its honest abstain).
@@ -862,30 +1026,24 @@ pub(crate) fn spcr(file: &Btor2File) -> Option<Btor2File> {
             None => o,
         }
     };
-    // Topological layout: fresh DECLARATIONS (sorts / prophecy states / consts — they reference at
-    // most a sort) first, then the original lines (minus drops, remapped), then the fresh
-    // COMBINATIONAL/next nodes (in push order = dependency order). This keeps every data operand a
-    // backward reference (only sort references may be forward — resolved by NID).
-    let (decls, rest): (Vec<Line>, Vec<Line>) = new_nodes.into_iter().partition(|l| {
-        matches!(
-            l.node,
-            Node::Sort { .. } | Node::State { .. } | Node::Const { .. }
-        )
-    });
-    let mut out: Vec<Line> = Vec::with_capacity(file.lines.len() + decls.len() + rest.len());
-    out.extend(decls);
-    for line in &file.lines {
-        if drops.contains(&line.nid) {
-            continue;
-        }
-        out.push(Line {
+    // Combine the surviving original lines (remapped, minus drops) with the fresh SPCR nodes, then
+    // TOPOLOGICALLY SORT (declaration-before-use) — a fixed partition is not enough because a read
+    // reconstructed as `ite(cond, pv_a, pv_b)` is a fresh op that an ORIGINAL node references AND
+    // that itself references an original condition, so new/old nodes interleave in dependency order.
+    let mut combined: Vec<Line> = Vec::with_capacity(file.lines.len() + new_nodes.len());
+    for line in file.lines.iter().filter(|l| !drops.contains(&l.nid)) {
+        combined.push(Line {
             nid: line.nid,
             node: remap_node(&line.node, &remap),
             immediates: line.immediates.clone(),
             source_line: line.source_line,
         });
     }
-    out.extend(rest);
+    combined.extend(new_nodes);
+    let out = topo_sort_lines(combined);
+    // Canonicalize to MONOTONIC nids (1-based line position), remapping every nid reference — valid
+    // BTOR2 requires strictly-increasing ids in line order (btormc/pono reject otherwise).
+    let out = renumber_monotonic(out);
     let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
     // Observability (attribution): report that SPCR fired + its O(#accessed-cells) footprint.
     let pvs = out
@@ -1048,9 +1206,11 @@ mod tests {
         );
     }
 
-    /// P-A1b — write-ENABLE mux `mem' = ite(we, write(mem,waddr,wdata), mem)` with a STABLE
-    /// (never-moving) config index `key`. Recovery via the env asserting `we ∧ waddr==key ∧
-    /// wdata==3`; `AG EF(busy==0)` HOLDS. SPCR frame = `pv' = ite(we ∧ waddr==key, wdata, pv)`.
+    /// P-A1b — write-ENABLE mux `mem' = ite(we, write(mem,waddr,wdata), mem)` with a STABLE config
+    /// index `key`. Recovery via the env asserting `we ∧ waddr==key ∧ wdata==3`; `AG EF(busy==0)`
+    /// HOLDS. SPCR frame = `pv' = ite(we ∧ waddr==key, wdata, pv)`. NOTE `key` has an EXPLICIT
+    /// self-`next` (node 28: `next key key`) — a REAL latch. (A no-`next` state is HAVOC in BTOR2,
+    /// not a held constant, and SPCR correctly abstains on it — see `spcr_abstains_on_havoc_no_next_index`.)
     const AGR_SPCR_WE: &str = "\
 1 sort bitvec 1
 2 sort bitvec 2
@@ -1079,6 +1239,7 @@ mod tests {
 25 write 3 10 5 6
 26 ite 3 7 25 10
 27 next 3 10 26
+28 next 2 9 9
 ";
 
     #[test]
@@ -1371,6 +1532,126 @@ mod tests {
         assert_eq!(
             exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
             ExactVerdict::Holds,
+        );
+    }
+
+    /// Measurement probe (not CI): run SPCR over every `*.btor`/`*.btor2` under
+    /// `MUNUNU_SPCR_PROBE_DIR` and report how many array-bearing designs SPCR's mechanism ELIMINATES
+    /// (becomes array-free) vs abstains on. Used to measure SPCR's applicability to real corpora
+    /// (e.g. the HWMCC20 arrays track). `#[ignore]` — run explicitly with the env var set.
+    #[test]
+    #[ignore]
+    fn spcr_applicability_probe_over_dir() {
+        let dir = std::env::var("MUNUNU_SPCR_PROBE_DIR").expect("set MUNUNU_SPCR_PROBE_DIR");
+        let mut total = 0usize;
+        let mut no_array = 0usize;
+        let mut applied: Vec<(String, usize)> = Vec::new();
+        let mut abstained: Vec<String> = Vec::new();
+        let mut parse_fail = 0usize;
+        // Recursively collect every *.btor / *.btor2 under `dir`.
+        let mut entries: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(&dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "btor" || x == "btor2") {
+                    entries.push(p);
+                }
+            }
+        }
+        entries.sort();
+        for path in entries {
+            total += 1;
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(file) = crate::adapter::btor2::parser::parse(&content) else {
+                parse_fail += 1;
+                continue;
+            };
+            if !has_array(&file) {
+                no_array += 1;
+                continue;
+            }
+            match super::spcr(&file) {
+                Some(out) => {
+                    let pvs = out
+                        .lines
+                        .iter()
+                        .filter(|l| matches!(&l.node, Node::State { symbol: Some(s), .. } if s.starts_with("spcr_pv_")))
+                        .count();
+                    // Optionally emit the array-free design (for a manual `btor2 verify` marginal-reach check).
+                    if let Ok(out_dir) = std::env::var("MUNUNU_SPCR_OUT_DIR") {
+                        let stem = path.file_stem().unwrap().to_string_lossy();
+                        let dst = std::path::Path::new(&out_dir).join(format!("{stem}.spcr.btor2"));
+                        let _ = std::fs::write(dst, crate::adapter::btor2::emit::emit_btor2(&out));
+                    }
+                    applied.push((name, pvs));
+                }
+                None => abstained.push(name),
+            }
+        }
+        eprintln!(
+            "[SPCR-PROBE] dir={dir}\n  total={total} parse_fail={parse_fail} no_array={no_array} \
+             applied={} abstained={}",
+            applied.len(),
+            abstained.len()
+        );
+        for (n, pv) in &applied {
+            eprintln!("[SPCR-PROBE]   APPLIED  pv={pv:<3} {n}");
+        }
+        for n in abstained.iter().take(20) {
+            eprintln!("[SPCR-PROBE]   abstain      {n}");
+        }
+    }
+
+    /// SOUNDNESS regression — the HWMCC20 `easy_zero_array` benchmark. The read index `idx` (node 9)
+    /// has NO `next` line, so in BTOR2 it is HAVOC every cycle (a free index), NOT a held constant.
+    /// SPCR must ABSTAIN (registerizing `mem[idx]` for a havoc `idx` is unsound — btormc found a
+    /// spurious `sat`/violation on the earlier buggy elimination). Caught by an external
+    /// cross-check; this locks in the fix.
+    const EASY_ZERO_ARRAY: &str = "\
+1 sort bitvec 1
+2 sort bitvec 10
+3 sort bitvec 32
+4 sort array 2 3
+5 const 1 0
+6 const 1 1
+7 const 2 0000000000
+8 const 3 00000000000000000000000000000000
+9 state 2 idx
+10 state 4 mem
+11 state 2 i
+12 const 2 0000000000
+13 const 2 0000000001
+14 add 2 11 13
+15 const 2 0000100000
+16 ulte 1 11 15 i_lt_const
+17 ite 2 16 14 11 i_ite_res
+18 next 2 11 17
+19 write 4 10 11 8
+20 init 2 11 7
+21 ult 1 9 11
+22 read 3 10 9
+23 neq 1 22 8
+24 and 1 21 23
+25 next 4 10 19
+26 bad 24
+";
+
+    #[test]
+    fn spcr_abstains_on_havoc_no_next_index() {
+        let file = crate::adapter::btor2::parser::parse(EASY_ZERO_ARRAY).expect("parse");
+        assert!(has_array(&file), "fixture has an array");
+        assert!(
+            super::spcr(&file).is_none(),
+            "a no-next (HAVOC) read index must make SPCR abstain — registerizing mem[havoc] is unsound"
         );
     }
 
