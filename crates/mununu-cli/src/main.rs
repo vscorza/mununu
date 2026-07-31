@@ -730,8 +730,9 @@ struct Btor2VerifyRecoverabilityArgs {
     #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
     predicate: Vec<String>,
     /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
-    /// is never reachable (the `AG EF` is degenerate), and a best-effort "why ⊥ / what would decide it"
-    /// hint. Diagnostic-only — it never changes the canonical verdict.
+    /// is never reachable (the `AG EF` is degenerate), an auto `config_partition` over the design's
+    /// detected reset when recovery depends on it (held-in-reset vs operational), and a best-effort
+    /// "why ⊥ / what would decide it" hint. Diagnostic-only — it never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,
     /// Config-partition (refined-verdicts capability A): name config INPUTS to split the verdict over,
@@ -1818,7 +1819,8 @@ struct SvVerifyRecoverabilityArgs {
     #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
     predicate: Vec<String>,
     /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
-    /// is never reachable, and a best-effort "why ⊥ / what would decide it" hint. Diagnostic-only —
+    /// is never reachable, an auto `config_partition` over the design's detected reset when recovery
+    /// depends on it, and a best-effort "why ⊥ / what would decide it" hint. Diagnostic-only —
     /// never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,

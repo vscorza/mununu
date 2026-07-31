@@ -770,3 +770,33 @@ fn config_partition_over_reset_partitions_opentitan_fsms() {
         "held-in-reset csrng stays idle: {csrng:?}"
     );
 }
+
+/// Slice 2b (AUTO config-atom identification) on the SAME OpenTitan RTL — a bare refined verify (NO
+/// `--config-values`) auto-identifies `rst_ni` (the structurally-detected reset) as the config axis and
+/// reproduces the ConfigDependent partition. Proves the user need not name the reset: the reset-mux scan
+/// ([`detect_resets`]) does it. This is the industrial validation of the 2b auto path — host-runnable,
+/// gates `make ci`.
+#[test]
+fn auto_config_partition_identifies_reset_on_opentitan_fsms() {
+    use mununu_core::adapter::recoverability::verify_recoverability_refined;
+
+    let (_v, aes) = verify_recoverability_refined(AES_CIPHER, "aes_cipher_ctrl_cs == 9", &[], &[]);
+    let part = aes
+        .config_partition
+        .expect("bare --refine auto-identifies rst_ni on aes_cipher");
+    assert!(
+        part.violated.contains(&vec![("rst_ni".to_string(), 1)])
+            && part.holds.contains(&vec![("rst_ni".to_string(), 0)]),
+        "auto reset-partition reproduces the aes_cipher branching pair: {part:?}"
+    );
+
+    let (_v, csrng) = verify_recoverability_refined(CSRNG, "state_q == 55", &[], &[]);
+    let part = csrng
+        .config_partition
+        .expect("bare --refine auto-identifies rst_ni on csrng");
+    assert!(
+        part.violated.contains(&vec![("rst_ni".to_string(), 1)])
+            && part.holds.contains(&vec![("rst_ni".to_string(), 0)]),
+        "auto reset-partition reproduces the csrng branching pair: {part:?}"
+    );
+}

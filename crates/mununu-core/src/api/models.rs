@@ -1009,7 +1009,8 @@ pub struct Btor2VerifyRecoverabilityRequest {
     #[serde(default)]
     pub predicates: Vec<String>,
     /// Also compute a structured [`crate::verdict::VerdictRefinement`] alongside the verdict — a
-    /// `vacuous` witness when the target is never reachable, and a "why ⊥" hint. Diagnostic-only:
+    /// `vacuous` witness when the target is never reachable, an auto `config_partition` over the
+    /// design's detected reset when recovery depends on it, and a "why ⊥" hint. Diagnostic-only:
     /// it never changes the canonical verdict. (Mirrors the CLI `--refine`.)
     #[serde(default)]
     pub refine: bool,
