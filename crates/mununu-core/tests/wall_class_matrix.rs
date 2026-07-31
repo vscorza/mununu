@@ -728,3 +728,45 @@ fn wall_class_matrix() {
     let synthetic_only: Vec<_> = synthetic_classes.difference(&rtl_classes).collect();
     println!("synthetic-only (awaiting RTL representative): {synthetic_only:?}");
 }
+
+/// Config-partition on REAL OpenTitan RTL — the refined-verdicts capability-A industrial validation
+/// (A3). The `AG EF(idle)` recoverability of the aes_cipher / csrng control FSMs DEPENDS on `rst_ni`:
+/// held in reset (`rst_ni=0`, active-low) the FSM stays idle (HOLDS); operational (`rst_ni=1`) it
+/// traps in its absorbing error state (VIOLATED). `config_partition` turns that branching pair — the
+/// SVA-inexpressible differentiator (§3.3) — into ONE `ConfigDependent` verdict. Sound per cell (each
+/// pinned `rst_ni` is a concrete model the exact engine decides). Host-runnable on the checked-in
+/// lifted fixtures (small FSMs), so NOT `#[ignore]` — it gates `make ci`.
+#[test]
+fn config_partition_over_reset_partitions_opentitan_fsms() {
+    use mununu_core::adapter::recoverability::config_partition;
+
+    let aes = config_partition(
+        AES_CIPHER,
+        "aes_cipher_ctrl_cs == 9",
+        &[("rst_ni".to_string(), vec![0, 1])],
+    )
+    .expect("aes_cipher AG EF(idle) depends on rst_ni ⇒ a ConfigDependent partition");
+    assert!(
+        aes.violated.contains(&vec![("rst_ni".to_string(), 1)]),
+        "operational (rst_ni=1) traps in the absorbing error state: {aes:?}"
+    );
+    assert!(
+        aes.holds.contains(&vec![("rst_ni".to_string(), 0)]),
+        "held in reset (rst_ni=0) stays idle: {aes:?}"
+    );
+
+    let csrng = config_partition(
+        CSRNG,
+        "state_q == 55",
+        &[("rst_ni".to_string(), vec![0, 1])],
+    )
+    .expect("csrng_main_sm AG EF(idle) depends on rst_ni ⇒ a ConfigDependent partition");
+    assert!(
+        csrng.violated.contains(&vec![("rst_ni".to_string(), 1)]),
+        "operational csrng traps: {csrng:?}"
+    );
+    assert!(
+        csrng.holds.contains(&vec![("rst_ni".to_string(), 0)]),
+        "held-in-reset csrng stays idle: {csrng:?}"
+    );
+}
