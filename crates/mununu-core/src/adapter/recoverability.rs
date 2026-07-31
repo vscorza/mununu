@@ -49,7 +49,7 @@ use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
 use crate::mu_calculus::Environment;
 use crate::mu_calculus::parser as mu_parser;
 use crate::mu_calculus::trit::Trit;
-use crate::verdict::{PropertyVerdict, VacuityWitness, VerdictRefinement};
+use crate::verdict::{ConfigPartition, PropertyVerdict, VacuityWitness, VerdictRefinement};
 
 /// Max CEGAR refinement iterations for the scalable recoverability path — a sensible
 /// default: a pure state-atom `AG EF` target either decides at the seed abstraction or
@@ -1136,6 +1136,117 @@ fn probe_vacuous(btor2_content: &str, good: &str) -> Option<VacuityWitness> {
         }),
         _ => None, // Reachable, or Unknown/Contradiction ⇒ not (soundly) vacuous
     }
+}
+
+/// Capability A (refined-verdicts Phase 1) — partition the `AG EF good` verdict over the CONFIG the
+/// recovery rides on. For each config valuation (the cross-product of each `(input, candidate values)`
+/// spec) PIN those inputs to constants and decide the CONCRETE pinned model with the exact engine —
+/// which is 2-valued SOUND per cell (a pinned config is a constant, so the νµ is over a concrete
+/// design). Returns a [`ConfigPartition`] ONLY when the property genuinely DEPENDS on config (≥2
+/// non-empty verdict cells) — turning a flat verdict into "holds for configs {A}, violated for {B}".
+/// `None` when config-independent, when `config_specs` is empty, or when the cross-product exceeds the
+/// enumeration cap (a wide/free config needs the symbolic `∃config`, deferred).
+///
+/// **Engine (§16):** `exact-symbolic` full-state ROBDD (OxiDD) over each `pin_inputs_to_constants`
+/// concrete model — no external tool, sidecar-free. The partition is sound OVER THE ENUMERATED config
+/// values; `exhaustive` is set only when a spec lists a config input's FULL value range.
+pub fn config_partition(
+    btor2_content: &str,
+    good: &str,
+    config_specs: &[(String, Vec<u64>)],
+) -> Option<ConfigPartition> {
+    use crate::adapter::btor2::pin::pin_inputs_to_constants;
+    // Cap the enumeration: 2^Σw valuations must stay tractable (else it is the wide/free-config case
+    // that needs the symbolic `∃config` — deferred). Guard the multiply against overflow.
+    const MAX_VALUATIONS: usize = 256;
+    if config_specs.is_empty() {
+        return None;
+    }
+    let total = config_specs
+        .iter()
+        .try_fold(1usize, |acc, (_, v)| acc.checked_mul(v.len().max(1)))?;
+    if total == 0 || total > MAX_VALUATIONS {
+        return None;
+    }
+
+    let widths = config_atom_widths(btor2_content, config_specs);
+    let mut part = ConfigPartition {
+        config_atoms: config_specs
+            .iter()
+            .map(|(n, _)| (n.clone(), *widths.get(n).unwrap_or(&0)))
+            .collect(),
+        engine: "exact-symbolic per-config pin".to_string(),
+        // Exhaustive iff every spec enumerates its config input's FULL value range (all 2^w values):
+        // a free config input reaches all its values, so the partition then covers every reachable
+        // config. A user-supplied partial list ⇒ the partition is over the enumerated subset only.
+        exhaustive: config_specs.iter().all(|(n, v)| {
+            widths
+                .get(n)
+                .is_some_and(|&w| w < 63 && v.len() as u64 == 1u64 << w)
+        }),
+        ..Default::default()
+    };
+
+    for valuation in config_cross_product(config_specs) {
+        let (pinned, _) = pin_inputs_to_constants(btor2_content, &valuation);
+        match verify_recoverability_with_predicates(&pinned, good, &[])
+            .unwrap_or(PropertyVerdict::Unknown)
+        {
+            PropertyVerdict::Holds => part.holds.push(valuation),
+            PropertyVerdict::Violated => part.violated.push(valuation),
+            PropertyVerdict::Unknown | PropertyVerdict::Skipped => part.unknown.push(valuation),
+        }
+    }
+
+    // Report ONLY when the property genuinely DEPENDS on config — ≥2 non-empty verdict cells. A single
+    // non-empty cell (all-holds / all-violated) is config-INDEPENDENT: the bare verdict already says it.
+    let nonempty = [&part.holds, &part.violated, &part.unknown, &part.vacuous]
+        .iter()
+        .filter(|c| !c.is_empty())
+        .count();
+    (nonempty >= 2).then_some(part)
+}
+
+/// The cross-product of the per-input candidate value lists → every config valuation.
+fn config_cross_product(specs: &[(String, Vec<u64>)]) -> Vec<Vec<(String, u64)>> {
+    let mut out: Vec<Vec<(String, u64)>> = vec![Vec::new()];
+    for (name, values) in specs {
+        let mut next = Vec::with_capacity(out.len() * values.len().max(1));
+        for partial in &out {
+            for &v in values {
+                let mut ext = partial.clone();
+                ext.push((name.clone(), v));
+                next.push(ext);
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+/// Best-effort `(name → bit-width)` for the config-spec inputs, resolved from the parsed design.
+fn config_atom_widths(
+    btor2_content: &str,
+    specs: &[(String, Vec<u64>)],
+) -> std::collections::HashMap<String, u32> {
+    use crate::adapter::btor2::ast::Node;
+    let mut widths = std::collections::HashMap::new();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return widths;
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    for (name, _) in specs {
+        if let Some(nid) = symbols.iter().find_map(|(n, s)| (s == name).then_some(*n))
+            && let Some(sort) = match file.lookup(nid).map(|l| &l.node) {
+                Some(Node::Input { sort, .. }) | Some(Node::State { sort, .. }) => Some(*sort),
+                _ => None,
+            }
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, sort)
+        {
+            widths.insert(name.clone(), w);
+        }
+    }
+    widths
 }
 
 /// Harness / attribution seam — run ONLY the SPCR pre-pass ([`array_prophecy::spcr`]), then the
@@ -3471,6 +3582,81 @@ mod tests {
             .expect("an unreachable target must be flagged Vacuous");
         assert!(vac.good_unreachable);
         assert!(vac.note.contains("never reachable"));
+    }
+
+    // `busy` sets on `start`; it then recovers to 0 UNLESS `mode == 3`, in which case it is stuck at 1.
+    // So `AG EF(busy==0)` HOLDS for mode ∈ {0,1,2} and is VIOLATED for mode == 3 — config-dependent.
+    const MODE_DEP: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 start
+4 input 2 mode
+5 state 1 busy
+6 zero 1
+7 init 1 5 6
+8 const 2 11
+9 eq 1 4 8
+10 not 1 5
+11 and 1 3 10
+12 and 1 5 9
+13 or 1 11 12
+14 next 1 5 13
+";
+
+    /// Config-partition (Phase 1) — the verdict genuinely DEPENDS on the `mode` config input, so a
+    /// flat verdict becomes `ConfigDependent`: HOLDS for `mode ∈ {0,1,2}`, VIOLATED for `mode == 3`.
+    #[test]
+    fn config_partition_reveals_mode_dependent_recoverability() {
+        let part = config_partition(
+            MODE_DEP,
+            "busy == 0",
+            &[("mode".to_string(), vec![0, 1, 2, 3])],
+        )
+        .expect("the property depends on `mode` ⇒ a ConfigDependent partition");
+        assert_eq!(part.config_atoms, vec![("mode".to_string(), 2)]);
+        assert!(
+            part.exhaustive,
+            "all 4 values of the 2-bit `mode` were enumerated"
+        );
+        assert_eq!(
+            part.holds.len(),
+            3,
+            "mode ∈ {{0,1,2}} HOLD: {:?}",
+            part.holds
+        );
+        assert_eq!(
+            part.violated,
+            vec![vec![("mode".to_string(), 3)]],
+            "only mode == 3 traps"
+        );
+        assert!(part.unknown.is_empty() && part.vacuous.is_empty());
+    }
+
+    /// Config-partition — a design whose recovery does NOT depend on `mode` (`busy` always recovers)
+    /// yields NO partition: config-independent, the bare verdict already says it.
+    #[test]
+    fn config_partition_none_when_config_independent() {
+        const INDEP: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 start
+4 input 2 mode
+5 state 1 busy
+6 zero 1
+7 init 1 5 6
+8 not 1 5
+9 and 1 3 8
+10 next 1 5 9
+";
+        assert!(
+            config_partition(
+                INDEP,
+                "busy == 0",
+                &[("mode".to_string(), vec![0, 1, 2, 3])]
+            )
+            .is_none(),
+            "recovery independent of `mode` ⇒ no ConfigDependent partition"
+        );
     }
 
     /// Actionable-⊥ diagnosis — a recovery target riding only NARROW control state localizes NO
