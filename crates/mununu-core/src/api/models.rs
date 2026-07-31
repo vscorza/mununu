@@ -1013,6 +1013,11 @@ pub struct Btor2VerifyRecoverabilityRequest {
     /// it never changes the canonical verdict. (Mirrors the CLI `--refine`.)
     #[serde(default)]
     pub refine: bool,
+    /// Config-partition (capability A): config inputs to split the verdict over, each
+    /// `"NAME=v1,v2,..."`. The refinement then carries a `config_partition` decided exactly per config.
+    /// Implies the refined output. Mirrors the CLI `--config-values`.
+    #[serde(default)]
+    pub config_values: Vec<String>,
 }
 
 /// Response for `POST /api/v1/btor2/verify-recoverability`.
@@ -1176,6 +1181,9 @@ pub struct SvVerifyRecoverabilityRequest {
     /// Diagnostic-only — never changes the canonical verdict.
     #[serde(default)]
     pub refine: bool,
+    /// Config-partition config inputs, each `"NAME=v1,v2,..."` (mirrors the CLI `--config-values`).
+    #[serde(default)]
+    pub config_values: Vec<String>,
 }
 
 /// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width
