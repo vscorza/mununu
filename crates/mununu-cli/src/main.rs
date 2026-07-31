@@ -729,6 +729,12 @@ struct Btor2VerifyRecoverabilityArgs {
     /// with none.
     #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
     predicate: Vec<String>,
+    /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
+    /// is never reachable (the `AG EF` is degenerate), and a best-effort "why ⊥ / what would decide it"
+    /// hint. Diagnostic-only — it never changes the canonical verdict. (The config-partition +
+    /// discovered-assumption refinements arrive in later phases.)
+    #[arg(long = "refine")]
+    refine: bool,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -1806,6 +1812,11 @@ struct SvVerifyRecoverabilityArgs {
     /// escalation is automatic even with none.
     #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
     predicate: Vec<String>,
+    /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
+    /// is never reachable, and a best-effort "why ⊥ / what would decide it" hint. Diagnostic-only —
+    /// never changes the canonical verdict. (Config-partition + assumption discovery arrive later.)
+    #[arg(long = "refine")]
+    refine: bool,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2677,7 +2688,8 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// `POST /api/v1/btor2/verify-recoverability`.
 fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<(), String> {
     use mununu_core::adapter::recoverability::{
-        parse_extra_predicate, recoverability_property_str, verify_recoverability_with_predicates,
+        parse_extra_predicate, recoverability_property_str, verify_recoverability_refined,
+        verify_recoverability_with_predicates,
     };
 
     let content = std::fs::read_to_string(&args.file)
@@ -2687,13 +2699,23 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
         .iter()
         .map(|s| parse_extra_predicate(s))
         .collect::<Result<Vec<_>, _>>()?;
-    let verdict = verify_recoverability_with_predicates(&content, &args.target, &extra)?;
 
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "property": recoverability_property_str(&args.target),
-        "verdict": verdict.as_str(),
     });
+    // `--refine` (refined-verdicts Phase 0): the canonical verdict PLUS a structured, diagnostic-only
+    // refinement carried alongside it (never changes the verdict). Without it, the plain verdict path.
+    let verdict = if args.refine {
+        let (verdict, refinement) = verify_recoverability_refined(&content, &args.target, &extra);
+        summary["refinement"] =
+            serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
+        verdict
+    } else {
+        verify_recoverability_with_predicates(&content, &args.target, &extra)?
+    };
+    summary["verdict"] = serde_json::Value::String(verdict.as_str().to_string());
+
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
@@ -5291,7 +5313,9 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
     use mununu_core::adapter::recoverability::{
         parse_extra_predicate, recoverability_property_str,
     };
-    use mununu_core::adapter::sv_verify::sv_verify_recoverability_with_predicates;
+    use mununu_core::adapter::sv_verify::{
+        sv_verify_recoverability_refined, sv_verify_recoverability_with_predicates,
+    };
 
     let file = args.lift.primary_display();
     let extra = args
@@ -5299,13 +5323,22 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
         .iter()
         .map(|s| parse_extra_predicate(s))
         .collect::<Result<Vec<_>, _>>()?;
-    let verdict =
-        sv_verify_recoverability_with_predicates(&read_sv_lift(&args.lift)?, &args.target, &extra)?;
-    let summary = serde_json::json!({
+    let lift = read_sv_lift(&args.lift)?;
+
+    let mut summary = serde_json::json!({
         "file": file,
         "property": recoverability_property_str(&args.target),
-        "verdict": verdict.as_str(),
     });
+    let verdict = if args.refine {
+        let (verdict, refinement) = sv_verify_recoverability_refined(&lift, &args.target, &extra)?;
+        summary["refinement"] =
+            serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
+        verdict
+    } else {
+        sv_verify_recoverability_with_predicates(&lift, &args.target, &extra)?
+    };
+    summary["verdict"] = serde_json::Value::String(verdict.as_str().to_string());
+
     print_json_summary(&summary)?;
     ci_gate_exit(verdict.as_str(), args.ci.fail_on);
     Ok(())

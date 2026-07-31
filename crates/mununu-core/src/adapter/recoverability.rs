@@ -1081,8 +1081,9 @@ pub fn verify_recoverability_with_predicates(
 pub fn verify_recoverability_refined(
     btor2_content: &str,
     good: &str,
+    extra_predicates: &[PredicateSpec],
 ) -> (PropertyVerdict, VerdictRefinement) {
-    let verdict = verify_recoverability_with_predicates(btor2_content, good, &[])
+    let verdict = verify_recoverability_with_predicates(btor2_content, good, extra_predicates)
         .unwrap_or(PropertyVerdict::Unknown);
     let mut refinement = VerdictRefinement::default();
 
@@ -3444,7 +3445,7 @@ mod tests {
     fn refined_verdict_holds_design_has_empty_refinement() {
         const TOGGLE: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 not 1 2\n6 next 1 2 5\n";
-        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0");
+        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0", &[]);
         assert_eq!(verdict, PropertyVerdict::Holds);
         assert!(
             refinement.is_empty(),
@@ -3459,7 +3460,7 @@ mod tests {
     fn refined_verdict_vacuous_target_is_flagged() {
         const STUCK: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
-        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1");
+        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1", &[]);
         assert_ne!(
             verdict,
             PropertyVerdict::Holds,

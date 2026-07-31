@@ -134,6 +134,28 @@ pub fn sv_verify_recoverability_with_predicates(
     verify_recoverability_with_predicates(&btor2, target, extra_predicates)
 }
 
+/// `sv verify-recoverability --refine` — lift SV and decide `AG EF target`, returning the canonical
+/// verdict PLUS a structured [`VerdictRefinement`] (the `Vacuous`/`bot_diagnosis` today; the config
+/// partition and discovered assumptions in later phases). The refinement is diagnostic-only — it never
+/// changes the canonical verdict. Sidecar-free (operates on the same lift as the plain verb).
+pub fn sv_verify_recoverability_refined(
+    lift: &SvLift,
+    target: &str,
+    extra_predicates: &[PredicateSpec],
+) -> Result<(PropertyVerdict, crate::verdict::VerdictRefinement), String> {
+    parse_predicate_expr(target).map_err(|e| {
+        format!("recoverability target `{target}` is not a register-comparison atom: {e:?}")
+    })?;
+    let btor2 = lift.lift()?;
+    Ok(
+        crate::adapter::recoverability::verify_recoverability_refined(
+            &btor2,
+            target,
+            extra_predicates,
+        ),
+    )
+}
+
 /// `sv check-fsm` — lift SV and auto-scan every FSM-like state register for a reachable
 /// illegal encoding (no user input). The SV-direct peer of `btor2 check-fsm`.
 pub fn sv_check_fsm(
