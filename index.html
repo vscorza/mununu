@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mununu — Formal Verification &amp; Controller Synthesis</title>
+<meta name="description" content="Prove your RTL and build the controller. Sound branching-time verification + correct-by-construction synthesis for reactive systems, as an embeddable API.">
+<link rel="canonical" href="https://vscorza.github.io/mununu/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mununu">
+<meta property="og:title" content="Mununu — Formal Verification &amp; Controller Synthesis">
+<meta property="og:description" content="Prove your RTL and build the controller. Sound branching-time verification + correct-by-construction synthesis for reactive systems, as an embeddable API.">
+<meta property="og:url" content="https://vscorza.github.io/mununu/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Mununu — Formal Verification &amp; Controller Synthesis">
+<meta name="twitter:description" content="Prove your RTL and build the controller. Sound branching-time verification + correct-by-construction synthesis, as an embeddable API.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js" defer></script>
+<script>
+/* Spanish page dictionary (chrome strings live in site.js SHARED_ES). */
+window.MununuEs = {
+  "hero.eyebrow": "Verificación y síntesis. Un solo sistema.",
+  "hero.h1": "Demostramos tu RTL. Construimos su controlador.",
+  "hero.lead": "Una sola herramienta que <strong>demuestra</strong> que un diseño de chip es correcto y <strong>construye</strong> la lógica de control que le falta — entregada como una API que puedes integrar en un producto o en un bucle de programación con IA.",
+  "hero.sub": "Mununu es un motor en Rust que escucha a los sistemas reactivos — RTL de hardware, protocolos, la callada coreografía de los flujos de trabajo de IA agéntica — y formula las preguntas temporales que deciden si se sostienen. En la gramática del μ-cálculo y LTL, sobre Sistemas de Transición Etiquetados Composicionales, demuestra lo que es cierto y construye, correctos por construcción, los controladores que lo mantienen cierto. Te encuentra como CLI, como API HTTP y como interfaz web.",
+  "hero.cta1": "Solicitar una evaluación técnica",
+  "hero.cta2": "Verlo sobre RTL real",
+  "hero.cap": "OpenTitan · csrng_main_sm · RTL fijado a un commit",
+  "hero.note": "Respondido en ambos sentidos, sin rodeos: con un reset disponible, la máquina siempre encuentra el camino de vuelta a casa; quítale esa clemencia y hace lo correcto — encierra el peligro dentro y no se mueve.",
+
+  "s2.eye": "La razón por la que existe este sistema",
+  "s2.h": "Dos brechas en la corrección. Ambas quedan cerradas.",
+  "s2.lead": "Hoy dos problemas frenan a los equipos de hardware: la herramienta que verifica chips es cara y no puede embeberse en un producto, y las preguntas de corrección más difíciles ni siquiera pueden escribirse. Mununu cierra ambas.",
+  "s2.c1h": "La brecha del oráculo",
+  "s2.c1p": "El instrumento que juzga si un RTL es correcto cuesta de cien a quinientos mil dólares por puesto, cada año — y no vivirá dentro de tu producto, ni viajará en el bucle de un agente. Si tu sistema necesita una conciencia de la corrección en su núcleo, ese precio y esa postura cierran la puerta en silencio.",
+  "s2.c2h": "La brecha de expresividad",
+  "s2.c2p": "Familias enteras de corrección — el poder de recuperarse, de sobrevivir a un reset, de no bloquearse jamás, de responder siempre — ni siquiera pueden pronunciarse en SVA o LTL. Y la síntesis, que construye un controlador en lugar de solo calificarlo, no la ofrece ningún proveedor comercial ni SaaS.",
+  "s2.close": "Cerramos ambas. Sólidos, expresivos, embebibles — verificamos <em>y</em> construimos.",
+
+  "s3.eye": "La propiedad que nos define",
+  "s3.h": "«¿Siempre puede recuperarse?»",
+  "s3.lead": "La pregunta de seguridad más valiosa es fácil de plantear y, hasta ahora, ha sido imposible de responder: desde cualquier estado en que caiga un diseño, ¿puede volver siempre a uno seguro? Mununu la responde — demostrado, sobre chips reales.",
+  "s3.gloss": "Desde dondequiera que el diseño pueda vagar, ¿sigue habiendo un camino de vuelta a casa — a algo bueno, seguro o en reposo?",
+  "s3.p1": "Esto pregunta por la <em>forma</em> del espacio de estados de un diseño, no por la suerte de una sola ejecución. Una aserción basada en trazas observa un camino a la vez; «la recuperación sigue siendo posible desde cualquier parte» cuantifica sobre los futuros ramificados de cada estado alcanzable. Eso la hace de tiempo ramificado — algo que las aserciones de SystemVerilog y los verificadores acotados de modelos LTL ni siquiera pueden pronunciar, por mucho que se ejecuten.",
+  "s3.p2": "Mununu la decide de forma sólida, y lo ha mostrado sobre RTL de silicio real de OpenTitan — la misma pregunta de recuperabilidad respondida, de manera definitiva, en ambos sentidos sobre una máquina de estados de seguridad de producción.",
+
+  "s4.eye": "Un solo sistema, ambos sentidos",
+  "s4.h": "Verifica <em>y</em> sintetiza. Una sola API.",
+  "s4.lead": "La mayoría de las herramientas o bien comprueban un diseño o bien lo construyen — nunca ambas. Mununu hace las dos cosas tras una sola API, para que demuestres lo que tienes y generes lo que te falta en un solo lugar.",
+  "s4.p": "Las herramientas de verificación solo comprueban; las de síntesis solo construyen. Mununu es la única herramienta mantenida que sostiene las tres a la vez — verificación de modelos en μ-cálculo, síntesis reactiva de controladores y abstracción sólida trivaluada (KMTS) — tras una única API servida y embebible.",
+  "s4.c1h": "Demostramos tu diseño",
+  "s4.c1p": "Seguridad, recuperabilidad (<code>AG EF good</code>), vivacidad y respuesta, especificaciones GR(1). Cada respuesta vuelve definitiva — o honestamente indecidida. Nunca una conjetura.",
+  "s4.c2h": "Construimos el controlador",
+  "s4.c2p": "Síntesis correcta por construcción — control supervisorio de Ramadge–Wonham y GR(1) — con exportación a SystemVerilog y XState. El controlador no puede romper su especificación, porque nunca se construyó capaz de hacerlo.",
+  "s4.surf": "<strong>Superficies:</strong> <code>CLI</code> · <code>API HTTP</code> · <code>interfaz web</code>. Un solo conjunto de motores. Un solo conjunto de veredictos. Allí donde viva tu trabajo.",
+
+  "s5.eye": "Solidez por diseño",
+  "s5.h": "Tres veredictos. Sin faroles.",
+  "s5.lead": "Cuando una herramienta de verificación dice «pasa», ¿puedes confiar? Mununu da una de tres respuestas honestas — sí, no, o «aún no puedo saberlo» — y nunca finge una seguridad que no tiene.",
+  "s5.p1": "Cada pregunta vuelve como <strong>Verdadero</strong>, <strong>Falso</strong> o <strong>⊥ — indecidido</strong>. Cuando la abstracción ya no puede sostener una respuesta definitiva, Mununu calla en lugar de adivinar. La escala honesta hoy es a nivel de bloque y de FSM, un cono exacto de aproximadamente 40 bits; más allá, ⊥ — nunca un falso «pasa».",
+  "s5.p2": "Debajo corre un portafolio que toma la primera respuesta definitiva y lanza una alarma en el instante en que dos motores sólidos discrepan:",
+  "s5.cap": "Portafolio de motores",
+  "s5.r1": "Simbólico exacto — vivacidad exacta en FSM pequeñas, en proceso",
+  "s5.r2": "Abstracción trivaluada may/must por cubos de predicados para rutas de datos anchas, refinada automáticamente",
+  "s5.r3": "Verificación acotada de modelos nativa e inducción",
+  "s5.r4": "Interpolación de McMillan nativa",
+  "s5.r6": "Certificados al estilo de terminación para recuperabilidad y vivacidad",
+
+  "s6.eye": "Evidencia",
+  "s6.h": "Demostrado sobre silicio real. No simulado.",
+  "s6.lead": "Esto no es una demo de laboratorio. Los resultados de abajo provienen de silicio real y de producción — OpenTitan de Google y la raíz de confianza Caliptra de OCP — no de ejemplos de juguete.",
+  "s6.label": "Clases de propiedad demostradas sobre",
+  "s6.note": "OpenTitan (silicio de código abierto de lowRISC/Google como raíz de confianza, fijado a un commit) y Caliptra (raíz de confianza de centro de datos de OCP) son sujetos verificados, no clientes. Son demostraciones de clases de propiedad sobre RTL real — no hallazgos de vulnerabilidades.",
+  "s6.cap1": "OpenTitan · contadores / temporizadores / watchdogs · 48 bits",
+  "s6.eng1": "certificados de ranking, incl. anidados/lexicográficos",
+  "s6.cap2": "OpenTitan · seguridad de codificación legal de FSM criptográficas",
+  "s6.cap3": "OpenTitan · uart_tx",
+  "s6.eng3": "lazo de estancamiento concreto",
+  "legend.proved": '<span class="chip chip--proved">PROVED</span><span>Resultado sólido y no acotado. Los veredictos definitivos se transfieren al sistema real.</span>',
+
+  "s7.eye": "La ciencia",
+  "s7.h": "Verificado por máquina. Reproducible.",
+  "s7.lead": "Las afirmaciones aquí no son marketing. Las garantías centrales están verificadas por máquina, y cada resultado se entrega con la evidencia para reproducirlo byte a byte.",
+  "s7.p": "Los teoremas centrales de solidez están mecanizados en <strong>Lean 4</strong> e <strong>Isabelle/HOL</strong>. Los veredictos definitivos llegan al sistema real en cada profundidad de alternancia (Bruns–Godefroid, KMTS trivaluado); la síntesis se apoya en estrategias ganadoras sin memoria (Zielonka), certificados de ranking (Podelski–Rybalchenko), GR(1) (Piterman–Pnueli–Sá’ar) y control supervisorio (Ramadge–Wonham). Cada ejemplo verificado se entrega con un manifiesto, su fuente y una transcripción determinista byte a byte, y cada veredicto se asigna a un código de salida de CI.",
+
+  "s8.eye": "Dónde aterriza",
+  "s8.h": "Elige tu dominio",
+  "s8.lead": "¿Dónde aterriza esto primero? Empieza por el mundo más cercano al tuyo.",
+  "s8.feat": "Empieza aquí",
+  "s8.c1h": "Defensa y seguridad",
+  "s8.c1p": "Prueba desplegable en air-gap de las propiedades de seguridad que las aserciones no pueden pronunciar, mostrada sobre RTL de raíz de confianza real.",
+  "s8.c1l": "Explora el enfoque de defensa →",
+  "s8.c2h": "Aeroespacial y crítico para la seguridad",
+  "s8.c2p": "Prueba exhaustiva y sólida verificada por máquina de que un diseño nunca puede atascarse — la clase de evidencia que un proceso DO-254 está hecho para recompensar.",
+  "s8.c2l": "Explora el enfoque aeroespacial →",
+  "s8.c3h": "RTL generado por IA",
+  "s8.c3p": "El oráculo embebible de verificar-y-construir para el bucle generar-verificar-corregir — que atrapa los errores de control que los LLM despachan en silencio.",
+  "s8.c3l": "Explora el enfoque de RTL con IA →",
+
+  "cta.h": "Ponle una propiedad a prueba.",
+  "cta.p": 'Cuéntanos qué estás verificando — un bloque, una FSM, un protocolo, un bucle de agente — y lo ejecutamos contigo, codo a codo. <span class="badge-alpha">ALPHA</span>',
+  "cta.eval": "Solicitar una evaluación técnica"
+};
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://vscorza.github.io/mununu/#org",
+      "name": "Mununu",
+      "url": "https://vscorza.github.io/mununu/",
+      "description": "Formal verification and controller synthesis for reactive systems."
+    },
+    {
+      "@type": "SoftwareApplication",
+      "name": "Mununu",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, macOS",
+      "url": "https://vscorza.github.io/mununu/",
+      "softwareVersion": "Alpha",
+      "description": "A Rust formal-verification tool that verifies temporal properties of reactive systems and synthesizes correct-by-construction controllers, using mu-calculus and LTL over Compositional Labeled Transition Systems — delivered as a CLI, an HTTP API, and a web UI.",
+      "publisher": { "@id": "https://vscorza.github.io/mununu/#org" }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="./">mununu<span class="tld">.</span></a>
+    <nav class="site-nav" aria-label="Primary">
+      <ul>
+        <li><a href="ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+        <li><a href="defense/" data-i18n="nav.defense">Defense</a></li>
+        <li><a href="aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+        <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+        <li><a href="mailto:vscorza@gmail.com?subject=Technical%20evaluation" data-i18n="nav.contact">Contact</a></li>
+      </ul>
+    </nav>
+    <div class="lang-toggle" role="group" aria-label="Language / Idioma">
+      <button type="button" class="lang-btn" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" class="lang-btn" data-lang="es" aria-pressed="false">ES</button>
+    </div>
+    <button class="theme-toggle" type="button" aria-pressed="false">Dark theme</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- 1 · Hero -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-lede">
+        <p class="eyebrow" data-i18n="hero.eyebrow">Verification and synthesis. One system.</p>
+        <h1 data-i18n="hero.h1">We prove your RTL. We build its controller.</h1>
+        <p class="sub" data-i18n="hero.lead">One tool that both <strong>proves</strong> a chip design is correct and <strong>builds</strong> the control logic it’s missing — delivered as an API you can drop into a product or an AI coding loop.</p>
+        <details class="tech-detail">
+          <summary data-i18n="tech.more">Technical detail</summary>
+          <div>
+            <p data-i18n="hero.sub">Mununu is a Rust engine that listens to reactive systems — hardware RTL, protocols, the quiet choreography of agentic-AI workflows — and asks the temporal questions that decide whether they hold. In the grammar of μ-calculus and LTL, over Compositional Labeled Transition Systems, it proves what is true and builds, correct by construction, the controllers that keep it true. It meets you as a CLI, an HTTP API, and a web UI.</p>
+          </div>
+        </details>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Technical%20evaluation%20request" data-i18n="hero.cta1">Request a technical evaluation</a>
+          <a class="btn btn-secondary" href="#real-silicon" data-i18n="hero.cta2">See it on real RTL</a>
+        </div>
+      </div>
+      <figure class="verdict" aria-label="Example verification verdicts on OpenTitan RTL">
+        <figcaption data-i18n="hero.cap">OpenTitan · csrng_main_sm · commit-pinned RTL</figcaption>
+        <div class="v-row">
+          <code class="prop">AG EF idle</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">AG EF idle  (escalation input free)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result violated">VIOLATED</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="hero.note">Answered in both directions, without a hedge: given a reset, the machine can always find its way home; take that mercy away, and it does the right thing — it locks the danger inside and will not move.</span>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 2 · The two gaps -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s2.eye">The reason this system exists</p>
+      <h2 data-i18n="s2.h">Two gaps in correctness. Both are closed.</h2>
+      <p class="lead" data-i18n="s2.lead">Two problems hold hardware teams back today: the tool that verifies chips is expensive and can’t be embedded in a product, and the hardest correctness questions can’t even be written down. Mununu closes both.</p>
+      <div class="card-grid">
+        <div class="card reveal">
+          <span class="mono-tag">gap 01</span>
+          <h3 data-i18n="s2.c1h">The oracle gap</h3>
+          <p data-i18n="s2.c1p">The instrument that judges whether RTL is correct costs a hundred to five hundred thousand dollars a seat, every year — and it will not live inside your product, nor ride along in an agent’s loop. If your system needs a conscience of correctness at its core, that price and that posture quietly close the door.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag">gap 02</span>
+          <h3 data-i18n="s2.c2h">The expressiveness gap</h3>
+          <p data-i18n="s2.c2p">Whole families of correctness — the power to recover, to survive a reset, to never deadlock, to always answer — cannot even be spoken in SVA or LTL. And synthesis, which builds a controller rather than merely grading one, is offered by no commercial or SaaS vendor at all.</p>
+        </div>
+      </div>
+      <p style="margin-top:1.4rem;" data-i18n="s2.close">We close both. Sound, expressive, embeddable — we verify <em>and</em> we build.</p>
+    </div>
+  </section>
+
+  <!-- 3 · Can it always recover? -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s3.eye">The defining property</p>
+      <h2 data-i18n="s3.h">“Can it always recover?”</h2>
+      <p class="lead" data-i18n="s3.lead">The most valuable safety question is easy to ask and, until now, has been impossible to answer: from any state a design lands in, can it always get back to a safe one? Mununu answers it — proven, on real chips.</p>
+      <div class="formula">
+        AG EF good
+        <span class="gloss" data-i18n="s3.gloss">From wherever the design may wander, is there still a road home — to something good, safe, or at rest?</span>
+      </div>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s3.p1">This asks after the <em>shape</em> of a design’s state space, not the fortunes of any single run. A trace-based assertion watches one path at a time; “recovery remains possible from everywhere” quantifies over the branching futures of every reachable state. That makes it branching-time — a thing SystemVerilog Assertions and LTL bounded model checkers cannot even utter, no matter how long they run.</p>
+          <p data-i18n="s3.p2">Mununu decides it soundly, and has shown it on real OpenTitan silicon RTL — the same recoverability question answered, definitively, in both directions on a production security state machine.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 4 · Verify and synthesize -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s4.eye">One system, both directions</p>
+      <h2 data-i18n="s4.h">Verify <em>and</em> synthesize. One API.</h2>
+      <p class="lead" data-i18n="s4.lead">Most tools either check a design or build one — never both. Mununu does both behind a single API, so you can prove what you have and generate what you’re missing in one place.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s4.p">Verification tools only check; synthesis tools only build. Mununu is the only maintained tool that holds all three together — μ-calculus model checking, reactive controller synthesis, and sound 3-valued (KMTS) abstraction — behind a single served, embeddable API.</p>
+        </div>
+      </details>
+      <div class="split" style="margin-top:1.4rem;">
+        <div class="card">
+          <h3 data-i18n="s4.c1h">We prove your design</h3>
+          <p data-i18n="s4.c1p">Safety, recoverability (<code>AG EF good</code>), liveness and response, GR(1) specifications. Every answer comes back definite — or honestly undecided. Never a guess.</p>
+        </div>
+        <div class="card">
+          <h3 data-i18n="s4.c2h">We build the controller</h3>
+          <p data-i18n="s4.c2p">Correct-by-construction synthesis — Ramadge–Wonham supervisory control and GR(1) — with export to SystemVerilog and XState. The controller cannot break its specification, because it was never built able to.</p>
+        </div>
+      </div>
+      <p style="margin-top:1.4rem;" data-i18n="s4.surf"><strong>Surfaces:</strong> <code>CLI</code> · <code>HTTP API</code> · <code>web UI</code>. One set of engines. One set of verdicts. Wherever your work lives.</p>
+    </div>
+  </section>
+
+  <!-- 5 · How it stays sound -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s5.eye">Soundness by design</p>
+      <h2 data-i18n="s5.h">Three verdicts. No bluffing.</h2>
+      <p class="lead" data-i18n="s5.lead">When a verification tool says “pass,” can you trust it? Mununu gives one of three honest answers — yes, no, or “I can’t tell yet” — and never fakes confidence it doesn’t have.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s5.p1">Every question returns <strong>True</strong>, <strong>False</strong>, or <strong>⊥ — undecided</strong>. When abstraction can no longer carry a definite answer, Mununu falls silent rather than guess. Honest scale today is block and FSM level, an exact cone of roughly 40 bits; beyond it, ⊥ — never a false “pass.”</p>
+        </div>
+      </details>
+      <p data-i18n="s5.p2">Beneath it runs a portfolio that takes the first definite answer and raises an alarm the moment two sound engines disagree:</p>
+      <table>
+        <caption class="eyebrow" style="text-align:left; caption-side:top;" data-i18n="s5.cap">Engine portfolio</caption>
+        <tbody>
+          <tr><td><code>ROBDD</code></td><td data-i18n="s5.r1">Exact symbolic — exact liveness on small FSMs, in-process</td></tr>
+          <tr><td><code>KMTS + CEGAR</code></td><td data-i18n="s5.r2">Predicate-cube 3-valued may/must abstraction for wide datapaths, auto-refined</td></tr>
+          <tr><td><code>BMC + k-induction</code></td><td data-i18n="s5.r3">Native bounded model checking and induction</td></tr>
+          <tr><td><code>Interpolation</code></td><td data-i18n="s5.r4">Native McMillan interpolation</td></tr>
+          <tr><td><code>Ranking certificates</code></td><td data-i18n="s5.r6">Termination-style certificates for recoverability and liveness</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 6 · Proven on real silicon -->
+  <section id="real-silicon">
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s6.eye">Evidence</p>
+      <h2 data-i18n="s6.h">Demonstrated on real silicon. Not simulated.</h2>
+      <p class="lead" data-i18n="s6.lead">This isn’t a lab demo. The results below come from real, production silicon — Google’s OpenTitan and the OCP Caliptra root-of-trust — not toy examples.</p>
+      <div class="proven-strip">
+        <span class="label" data-i18n="s6.label">Property classes shown on</span>
+        <span class="subject">OpenTitan</span>
+        <span class="subject">Caliptra</span>
+        <p class="note" data-i18n="s6.note">OpenTitan (lowRISC/Google open-source silicon root of trust, commit-pinned) and Caliptra (OCP datacenter root of trust) are verified subjects, not customers. These are property-class demonstrations on real RTL — not vulnerability findings.</p>
+      </div>
+
+      <figure class="verdict" aria-label="Recoverability verdict on OpenTitan counter and watchdog RTL">
+        <figcaption data-i18n="s6.cap1">OpenTitan · counters / timers / watchdogs · 48-bit</figcaption>
+        <div class="v-row">
+          <code class="prop">AG EF (cnt == 0 ∨ cnt == MAX)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--proved">PROVED</span>
+          <span class="engine" data-i18n="s6.eng1">ranking certificates, incl. nested/lexicographic</span>
+        </div>
+      </figure>
+
+      <figure class="verdict" aria-label="Crypto FSM legal-encoding safety verdicts on OpenTitan">
+        <figcaption data-i18n="s6.cap2">OpenTitan · crypto-FSM legal-encoding safety</figcaption>
+        <div class="v-row">
+          <code class="prop">aes_cipher_control · aes_ctr_fsm · otbn_start_stop</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">SAFE</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">keymgr · edn_main_sm · rom_ctrl</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">SAFE</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+      </figure>
+
+      <figure class="verdict" aria-label="Liveness violation with concrete counterexample on OpenTitan uart_tx">
+        <figcaption data-i18n="s6.cap3">OpenTitan · uart_tx</figcaption>
+        <div class="v-row">
+          <code class="prop">AG AF (bit_cnt == 0)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result violated">VIOLATED</span>
+          <span class="chip chip--proved">PROVED</span>
+          <span class="engine" data-i18n="s6.eng3">concrete stall lasso</span>
+        </div>
+      </figure>
+
+      <div class="evidence-legend" role="note">
+        <h3 data-i18n="legend.title">How to read our evidence</h3>
+        <ul>
+          <li data-i18n="legend.proved"><span class="chip chip--proved">PROVED</span><span>Sound, unbounded result. Definite verdicts transfer to the real system.</span></li>
+          <li data-i18n="legend.bounded"><span class="chip chip--bounded">BOUNDED</span><span>Bounded model checking — valid to the stated depth only.</span></li>
+          <li data-i18n="legend.demo"><span class="chip chip--demo">DEMO</span><span>Constructed example. Illustrates the capability; not a real-chip finding.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7 · Science-based -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s7.eye">The science</p>
+      <h2 data-i18n="s7.h">Machine-checked. Reproducible.</h2>
+      <p class="lead" data-i18n="s7.lead">The claims here aren’t marketing. The core guarantees are checked by machine, and every result ships with the evidence to reproduce it byte for byte.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s7.p">The core soundness theorems are mechanized in <strong>Lean 4</strong> and <strong>Isabelle/HOL</strong>. Definite verdicts carry to the real system at every alternation depth (Bruns–Godefroid, 3-valued KMTS); synthesis rests on memoryless winning strategies (Zielonka), ranking certificates (Podelski–Rybalchenko), GR(1) (Piterman–Pnueli–Sá&#8217;ar), and supervisory control (Ramadge–Wonham). Every verified example ships with a manifest, its source, and a byte-deterministic transcript, and every verdict maps to a CI exit code.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 8 · Choose your domain -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s8.eye">Where it lands</p>
+      <h2 data-i18n="s8.h">Choose your domain</h2>
+      <p class="lead" data-i18n="s8.lead">Where does this land first? Start with the world closest to yours.</p>
+      <div class="domain-grid">
+        <a class="card reveal card--featured" href="ai-generated-rtl/">
+          <span class="card-badge" data-i18n="s8.feat">Start here</span>
+          <h3 data-i18n="s8.c3h">AI-generated RTL</h3>
+          <p data-i18n="s8.c3p">The embeddable verify-and-build oracle for the generate-verify-fix loop — catching the control bugs LLMs quietly ship.</p>
+          <p class="card-link" data-i18n="s8.c3l">Explore the AI-RTL angle →</p>
+        </a>
+        <a class="card reveal" href="defense/">
+          <h3 data-i18n="s8.c1h">Defense &amp; security</h3>
+          <p data-i18n="s8.c1p">Air-gap-deployable proof of the security properties assertions can’t voice, shown on real root-of-trust RTL.</p>
+          <p class="card-link" data-i18n="s8.c1l">Explore the defense angle →</p>
+        </a>
+        <a class="card reveal" href="aerospace/">
+          <h3 data-i18n="s8.c2h">Aerospace &amp; safety-critical</h3>
+          <p data-i18n="s8.c2p">Exhaustive, machine-checked-sound proof that a design can never wedge — the kind of evidence a DO-254 process is built to reward.</p>
+          <p class="card-link" data-i18n="s8.c2l">Explore the aerospace angle →</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9 · CTA band -->
+  <section class="cta-band">
+    <div class="wrap">
+      <h2 data-i18n="cta.h">Put a property to it.</h2>
+      <p data-i18n="cta.p">Tell us what you’re verifying — a block, an FSM, a protocol, an agent loop — and we’ll run it with you, side by side. <span class="badge-alpha">ALPHA</span></p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Technical%20evaluation%20request&body=Name%3A%0AOrg%3A%0AWhat%20are%20you%20verifying%3F%20" data-i18n="cta.eval">Request a technical evaluation</a>
+        <a class="btn btn-secondary" href="https://github.com/vscorza/mununu" data-i18n="cta.readdocs">Read the docs</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p><a class="wordmark" href="./">mununu<span class="tld">.</span></a> <span class="badge-alpha">ALPHA</span> <span data-i18n="footer.honest">— early software, honest verdicts.</span></p>
+    <p data-i18n="footer.soundness">Core soundness machine-checked in Lean 4 and Isabelle/HOL.</p>
+    <ul class="footer-links">
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+      <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="footer.source">Source</a></li>
+      <li><a href="ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+      <li><a href="defense/" data-i18n="nav.defense">Defense</a></li>
+      <li><a href="aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+      <li><a href="mailto:vscorza@gmail.com" data-i18n="nav.contact">Contact</a></li>
+    </ul>
+    <p data-i18n="footer.copyright">© 2026 Mununu. All rights reserved.</p>
+  </div>
+</footer>
+</body>
+</html>

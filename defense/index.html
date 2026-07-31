@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardware Security Verification for Root-of-Trust RTL | Mununu</title>
+<meta name="description" content="Sound, air-gap-deployable pre-silicon verification of the security properties SVA can't express — recoverability, reset-robustness, escalation-latching — shown on real root-of-trust RTL.">
+<link rel="canonical" href="https://vscorza.github.io/mununu/defense/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mununu">
+<meta property="og:title" content="Hardware Security Verification for Root-of-Trust RTL | Mununu">
+<meta property="og:description" content="Sound, air-gap-deployable pre-silicon verification of the security properties SVA can't express — shown on real root-of-trust RTL.">
+<meta property="og:url" content="https://vscorza.github.io/mununu/defense/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Hardware Security Verification for Root-of-Trust RTL | Mununu">
+<meta name="twitter:description" content="Sound, air-gap-deployable pre-silicon verification of the security properties SVA can't express — shown on real root-of-trust RTL.">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
+<script>
+/* Spanish page dictionary (chrome strings live in site.js SHARED_ES). */
+window.MununuEs = {
+  "hero.eyebrow": "Verificación de seguridad de hardware. Pre-silicio.",
+  "hero.lead": "Para el hardware de defensa, una pregunta lo decide todo: una vez que un chip de seguridad cae en un estado bloqueado, ¿puede un atacante hacer que salga de él? Mununu responde eso de forma sólida, por completo en tus propias máquinas — y admite cuando no puede, en lugar de un falso «seguro».",
+  "s2.lead": "Las herramientas que examinan chips seguros asumen la nube y cobran por puesto — un mal encaje para el trabajo clasificado — y peor aún, pueden adivinar en silencio y aun así mostrar una marca verde. Mununu se ejecuta por completo sin conexión y nunca adivina.",
+  "s3.lead": "Un chip de seguridad debe hacer dos cosas opuestas a la perfección: recuperarse siempre en uso normal, y no recuperarse nunca una vez atacado. Mununu demuestra ambas — sobre el mismo chip real.",
+  "s4.lead": "Los puntos de prueba de abajo son sobre silicio de raíz de confianza real y de producción — OpenTitan de Google y el Caliptra de la industria — no juguetes de laboratorio.",
+  "s5.lead": "Mununu habla el mismo vocabulario de debilidades de hardware que tu equipo de aseguramiento ya usa — y entrega ejemplos trabajados de error-y-corrección para las clases que importan.",
+  "s6.lead": "Hecho para el enclave: abierto, autoalojado y auditable hasta el byte — sin servidores de licencias, sin llamadas a casa.",
+  "s7.lead": "Más allá de comprobar el trabajo de alguien, Mununu puede construir la propia lógica de control de seguridad — de modo que sea correcta por construcción — y devuelve evidencia legible por máquina cuando algo falla.",
+  "hero.h1": "Verificamos las propiedades de seguridad que las aserciones no pueden expresar.",
+  "hero.sub": "Los programas de microelectrónica confiable giran en torno a una sola pregunta — una vez que una FSM de seguridad ha escalado, ¿puede revertirse alguna vez? Es una pregunta de tiempo ramificado, y Mununu la responde de forma sólida, en tus propias instalaciones, sobre RTL de raíz de confianza real. Cuando no puede saberlo, lo dice — ⊥, nunca un reconfortante y falso «seguro».",
+  "hero.cta1": "Solicitar una evaluación técnica",
+  "hero.cta2": "Verlo sobre RTL real",
+  "hero.cap": "OpenTitan · csrng_main_sm · RTL fijado a un commit",
+  "hero.note": "Definitivo en ambos sentidos: libera la entrada de escalada y la máquina hace lo correcto — encierra el peligro en su trampa de error y se queda ahí. Mununu también lo demuestra.",
+
+  "s2.eye": "El problema",
+  "s2.h": "La brecha de aseguramiento",
+  "s2.p1": "Las herramientas formales comerciales se licencian por puesto y se apoyan, cada año más, en la nube — un huésped incómodo en programas clasificados y aislados (air-gapped), donde toda herramienta debe vivir por completo dentro del enclave y responder de sí misma hasta el último byte.",
+  "s2.p2": "Peor que el licenciamiento es la epistemología. En verificación de seguridad, la pesadilla es el falso «pasa» silencioso — una herramienta que aproxima en silencio y luego reporta «seguro» es un riesgo con una marca de verificación verde.",
+  "s2.p3": "Mununu está construida para la postura contraria: <strong>en local</strong>, escrita en Rust, sobre una cadena de herramientas de código abierto, desplegable sin red alguna. Sus veredictos son trivaluados — <strong>Verdadero</strong>, <strong>Falso</strong> o <strong>⊥ (indecidido)</strong> — y cuando la abstracción no puede sostener una respuesta definitiva, se abstiene. Nunca farolea.",
+
+  "s3.eye": "La cuña diferenciadora",
+  "s3.h": "«¿Puede recuperarse — o se enclava en la trampa?»",
+  "s3.gloss": "Desde cada estado que puede alcanzar, ¿sigue habiendo un camino de vuelta a inactivo?",
+  "s3.p1": "Para una máquina de estados de seguridad, la recuperabilidad corta en ambos sentidos. En operación ordinaria, con reset disponible, inactivo debe seguir al alcance — un controlador de seguridad atascado es una denegación de servicio. Pero en el instante en que se dispara la entrada de escalada, el diseño <em>no debe</em> recuperarse: enclavarse en la trampa de error es el sentido mismo de la guarda.",
+  "s3.p2": "Ambos sentidos son de tiempo ramificado. Las aserciones de SystemVerilog y los verificadores acotados de modelos LTL no pueden decir «siempre existe un camino de vuelta», así que no pueden confirmar ni la recuperación ni la trampa. Mununu decidió ambos, de manera definitiva, sobre una FSM de seguridad de OpenTitan de producción — el mismo RTL real, dos entornos, dos veredictos sólidos.",
+
+  "s4.eye": "Evidencia",
+  "s4.h": "Demostrado sobre silicio de raíz de confianza real",
+  "s4.label": "Clases de propiedad demostradas sobre",
+  "s4.note": "OpenTitan (lowRISC/Google, linaje Titan, fijado a un commit) y Caliptra (raíz de confianza de centro de datos de OCP — Microsoft, Google, AMD, NVIDIA) son sujetos verificados, no clientes. Son demostraciones de clases de propiedad sobre RTL de silicio real — no hallazgos de vulnerabilidades.",
+  "s4.cap1": "OpenTitan · seguridad de codificación legal de FSM criptográficas",
+  "s4.cap2": "Caliptra · fixtures de RTL real",
+  "legend.proved": '<span class="chip chip--proved">PROVED</span><span>Resultado sólido y no acotado sobre el RTL indicado. Los veredictos definitivos se transfieren al sistema real.</span>',
+
+  "s5.eye": "Clases de debilidad",
+  "s5.h": "Las clases de debilidad de hardware que ya rastreas",
+  "s5.p": 'Los programas de aseguramiento hablan el lenguaje de los CWE de hardware de MITRE. Mununu también. Enviamos pares de demostración error/corrección para clases de debilidad reales — cada par un diseño construido en el que la debilidad se planta, se detecta, se corrige y se re-verifica. Cada uno está etiquetado como <span class="chip chip--demo">DEMO</span>: demuestran la clase de propiedad, no son hallazgos en silicio desplegado.',
+  "s5.c1h": "FSM inadecuada en lógica de hardware",
+  "s5.c1p": "Debilidades de estados ilegales y estados muertos en FSM de seguridad — la clase detrás de avisos reales como el CVE-2024-21853 de Intel.",
+  "s5.c2h": "Rangos protegidos solapados",
+  "s5.c2p": "Debilidades de solapamiento de rangos de memoria protegida, la clase ejercitada en los diseños CVA6 de Hack@DAC 2019.",
+  "s5.c3h": "Control de acceso a la interfaz de registros",
+  "s5.c3p": "Control de acceso inadecuado en interfaces de registros — la clase detrás de avisos como el CVE-2024-24968 de Intel.",
+  "s5.c4h": "Patrón de omisión de autenticación en BMC",
+  "s5.c4p": "Un patrón escrito a mano a partir del aviso de AMI MegaRAC en la lista CISA KEV — redactado desde el aviso, no extraído del producto.",
+
+  "s6.eye": "Postura de despliegue",
+  "s6.h": "Sólida, embebible, transparente en la cadena de suministro",
+  "s6.l1": "<strong>Sólida por construcción.</strong> Veredictos trivaluados; los teoremas centrales de solidez están verificados por máquina en Lean 4 e Isabelle/HOL.",
+  "s6.l2": "<strong>Cadena de herramientas abierta.</strong> El front-end es código abierto auditable — slang, sv2v, yosys, Z3 — con Mununu en Rust. Cada capa de la cadena de confianza puede inspeccionarse.",
+  "s6.l3": "<strong>Autoalojable, lista para air-gap.</strong> Se ejecuta por completo en local como CLI o como API HTTP servida dentro de tu enclave. Sin bloqueo por puesto, sin llamadas a casa.",
+  "s6.l4": "<strong>Reproducible.</strong> Transcripciones deterministas byte a byte y códigos de salida de CI: la misma entrada produce la misma evidencia, byte a byte.",
+
+  "s7.eye": "Más allá de comprobar",
+  "s7.h": "Y sintetiza el núcleo de control",
+  "s7.p1": "Para la secuenciación crítica en seguridad — pasos en lockstep, fases de manejo de claves, escaleras de escalada — Mununu puede sintetizar el controlador correcto por construcción en lugar de calificar uno escrito a mano a posteriori. Lo que vuelve es un núcleo de control que no puede violar su especificación, porque nunca se moldeó capaz de hacerlo.",
+  "s7.p2": "Y cuando una propiedad falla, Mununu devuelve contraejemplos en JSON estructurado — trazas legibles por máquina hechas para el utillaje de triaje, no formas de onda para que un humano las escudriñe.",
+
+  "cta.h": "Tráenos una FSM de seguridad.",
+  "cta.p": 'Formalizaremos contigo las propiedades de escalada y recuperación y las ejecutaremos sobre tu RTL — en tus instalaciones, si es ahí donde debe quedarse. <span class="badge-alpha">ALPHA</span>',
+  "cta.eval": "Solicitar una evaluación técnica"
+};
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Service",
+      "name": "Hardware security verification for root-of-trust RTL",
+      "serviceType": "Pre-silicon hardware security verification",
+      "provider": { "@type": "Organization", "name": "Mununu", "url": "https://vscorza.github.io/mununu/" },
+      "url": "https://vscorza.github.io/mununu/defense/",
+      "description": "Sound, air-gap-deployable pre-silicon verification of security properties SVA cannot express — recoverability, reset-robustness, escalation-latching — demonstrated on real root-of-trust RTL."
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://vscorza.github.io/mununu/" },
+        { "@type": "ListItem", "position": 2, "name": "Defense", "item": "https://vscorza.github.io/mununu/defense/" }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="../">mununu<span class="tld">.</span></a>
+    <nav class="site-nav" aria-label="Primary">
+      <ul>
+        <li><a href="../ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+        <li><a href="../defense/" aria-current="page" data-i18n="nav.defense">Defense</a></li>
+        <li><a href="../aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+        <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+        <li><a href="mailto:vscorza@gmail.com?subject=Technical%20evaluation" data-i18n="nav.contact">Contact</a></li>
+      </ul>
+    </nav>
+    <div class="lang-toggle" role="group" aria-label="Language / Idioma">
+      <button type="button" class="lang-btn" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" class="lang-btn" data-lang="es" aria-pressed="false">ES</button>
+    </div>
+    <button class="theme-toggle" type="button" aria-pressed="false">Dark theme</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- 1 · Hero -->
+  <section class="hero hero--defense">
+    <div class="wrap hero-grid">
+      <div class="hero-lede">
+        <p class="eyebrow" data-i18n="hero.eyebrow">Hardware security verification · pre-silicon</p>
+        <h1 data-i18n="hero.h1">We verify the security properties assertions cannot express.</h1>
+        <p class="sub" data-i18n="hero.lead">For defense hardware, one question decides everything: once a security chip trips into a locked-down state, can an attacker ever coax it back out? Mununu answers that soundly, entirely on your own machines — and admits when it can’t, instead of a false “secure.”</p>
+        <details class="tech-detail">
+          <summary data-i18n="tech.more">Technical detail</summary>
+          <div>
+            <p data-i18n="hero.sub">Trusted-microelectronics programs turn on a single question — once a security FSM has escalated, can it ever be walked back? That is a branching-time question, and Mununu answers it soundly, on your own premises, on real root-of-trust RTL. When it cannot know, it says so — ⊥, never a comforting, false “secure.”</p>
+          </div>
+        </details>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Technical%20evaluation%20request%20(defense)" data-i18n="hero.cta1">Request a technical evaluation</a>
+          <a class="btn btn-secondary" href="#rot-silicon" data-i18n="hero.cta2">See it on real RTL</a>
+        </div>
+      </div>
+      <figure class="verdict" aria-label="Escalation-recoverability verdicts on OpenTitan csrng_main_sm">
+        <figcaption data-i18n="hero.cap">OpenTitan · csrng_main_sm · commit-pinned RTL</figcaption>
+        <div class="v-row">
+          <code class="prop">AG EF idle  (reset available)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">AG EF idle  (escalation free)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result violated">VIOLATED</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="hero.note">Definite in both directions: set the escalation input free and the machine does the right thing — it latches the danger into its error trap and stays there. Mununu proves that, too.</span>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 2 · The assurance gap -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s2.eye">The problem</p>
+      <h2 data-i18n="s2.h">The assurance gap</h2>
+      <p class="lead" data-i18n="s2.lead">The tools that vet secure chips assume the cloud and charge per seat — a bad fit for classified work — and worse, they can quietly guess and still show a green checkmark. Mununu runs fully offline and never guesses.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div class="split">
+        <div>
+          <p data-i18n="s2.p1">Commercial formal tools are licensed by the seat and lean, more each year, on the cloud — an awkward guest in classified and air-gapped programs, where every tool must live wholly inside the enclave and answer for itself down to the byte.</p>
+          <p data-i18n="s2.p2">Worse than the licensing is the epistemics. In security verification the nightmare is the silent wrong “pass” — a tool that quietly approximates, then reports “secure,” is a liability wearing a green checkmark.</p>
+        </div>
+        <div>
+          <p data-i18n="s2.p3">Mununu is built for the opposite stance: <strong>on-prem</strong>, written in Rust, on an open-source toolchain, deployable with no network at all. Its verdicts are three-valued — <strong>True</strong>, <strong>False</strong>, or <strong>⊥ (undecided)</strong> — and when abstraction cannot carry a definite answer, it abstains. It never bluffs.</p>
+        </div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 3 · Recoverability as a security property -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s3.eye">The differentiated wedge</p>
+      <h2 data-i18n="s3.h">“Can it recover — or does it latch into the trap?”</h2>
+      <p class="lead" data-i18n="s3.lead">A security chip has to do two opposite things perfectly: always recover under normal use, and never recover once it’s been attacked. Mununu proves both — on the same real chip.</p>
+      <div class="formula">
+        AG EF idle
+        <span class="gloss" data-i18n="s3.gloss">From every reachable state, does a path back to idle still exist?</span>
+      </div>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s3.p1">For a security state machine, recoverability cuts both ways. In ordinary operation, with reset available, idle must stay within reach — a wedged security controller is a denial of service. But the instant the escalation input fires, the design <em>must not</em> recover: latching into the error trap is the whole point of the guard.</p>
+          <p data-i18n="s3.p2">Both directions are branching-time. SystemVerilog Assertions and LTL bounded model checkers cannot say “a path back always exists,” so they can confirm neither the recovery nor the trap. Mununu decided both, definitively, on a production OpenTitan security FSM — the same real RTL, two environments, two sound verdicts.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 4 · Real root-of-trust silicon -->
+  <section id="rot-silicon">
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s4.eye">Evidence</p>
+      <h2 data-i18n="s4.h">Demonstrated on real root-of-trust silicon</h2>
+      <p class="lead" data-i18n="s4.lead">The proof points below are on real, production root-of-trust silicon — Google’s OpenTitan and the industry Caliptra — not lab toys.</p>
+      <div class="proven-strip">
+        <span class="label" data-i18n="s4.label">Property classes shown on</span>
+        <span class="subject">OpenTitan</span>
+        <span class="subject">Caliptra</span>
+        <p class="note" data-i18n="s4.note">OpenTitan (lowRISC/Google, Titan lineage, commit-pinned) and Caliptra (OCP datacenter root of trust — Microsoft, Google, AMD, NVIDIA) are verified subjects, not customers. These are property-class demonstrations on real silicon RTL — not vulnerability findings.</p>
+      </div>
+
+      <figure class="verdict" aria-label="Crypto-FSM legal-encoding safety verdicts on OpenTitan">
+        <figcaption data-i18n="s4.cap1">OpenTitan · crypto-FSM legal-encoding safety</figcaption>
+        <div class="v-row">
+          <code class="prop">aes_cipher_control · aes_ctr_fsm · otbn_start_stop</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">SAFE</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">keymgr · edn_main_sm · rom_ctrl</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">SAFE</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+      </figure>
+
+      <figure class="verdict" aria-label="Caliptra mailbox contract discharge">
+        <figcaption data-i18n="s4.cap2">Caliptra · real RTL fixtures</figcaption>
+        <div class="v-row">
+          <code class="prop">mailbox black-box contract</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">DISCHARGED</span>
+          <span class="chip chip--proved">PROVED</span>
+        </div>
+      </figure>
+
+      <div class="evidence-legend" role="note">
+        <h3 data-i18n="legend.title">How to read our evidence</h3>
+        <ul>
+          <li data-i18n="legend.proved"><span class="chip chip--proved">PROVED</span><span>Sound, unbounded result on the stated RTL. Definite verdicts transfer to the real system.</span></li>
+          <li data-i18n="legend.bounded"><span class="chip chip--bounded">BOUNDED</span><span>Bounded model checking — valid to the stated depth only.</span></li>
+          <li data-i18n="legend.demo"><span class="chip chip--demo">DEMO</span><span>Constructed example. Illustrates the capability; not a real-chip finding.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 · Hardware-CWE language -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s5.eye">Weakness classes</p>
+      <h2 data-i18n="s5.h">The hardware-weakness classes you already track</h2>
+      <p class="lead" data-i18n="s5.lead">Mununu speaks the same hardware-weakness vocabulary your assurance team already uses — and ships worked bug-and-fix examples for the classes that matter.</p>
+      <p data-i18n="s5.p">Assurance programs speak MITRE’s hardware-CWE language. So does Mununu. We ship bug/fix demonstration pairs for real weakness classes — each pair a constructed design in which the weakness is planted, detected, fixed, and re-verified. Every one is tagged <span class="chip chip--demo">DEMO</span>: they demonstrate the property class, they are not findings in fielded silicon.</p>
+      <div class="card-grid">
+        <div class="card reveal">
+          <span class="mono-tag">CWE-1245 <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c1h">Improper FSM in hardware logic</h3>
+          <p data-i18n="s5.c1p">Illegal-state and dead-state weaknesses in security FSMs — the class behind real advisories such as Intel CVE-2024-21853.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag">CWE-1260 <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c2h">Overlapping protected ranges</h3>
+          <p data-i18n="s5.c2p">Protected-memory-range overlap weaknesses, the class exercised in the CVA6 Hack@DAC 2019 designs.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag">CWE-1262 <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c3h">Register-interface access control</h3>
+          <p data-i18n="s5.c3p">Improper access control on register interfaces — the class behind advisories such as Intel CVE-2024-24968.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag">CVE-2024-54085 pattern <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c4h">BMC authentication-bypass pattern</h3>
+          <p data-i18n="s5.c4p">A hand-authored pattern after the AMI MegaRAC advisory on the CISA KEV list — written from the advisory, not extracted from the product.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6 · Sound, embeddable, transparent -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s6.eye">Deployment posture</p>
+      <h2 data-i18n="s6.h">Sound, embeddable, supply-chain-transparent</h2>
+      <p class="lead" data-i18n="s6.lead">Built for the enclave: open, self-hosted, and accountable to the byte — no license servers, no calls home.</p>
+      <ul style="padding-left:1.2rem;">
+        <li data-i18n="s6.l1"><strong>Sound by construction.</strong> 3-valued verdicts; the core soundness theorems are machine-checked in Lean 4 and Isabelle/HOL.</li>
+        <li data-i18n="s6.l2"><strong>Open toolchain.</strong> The front end is auditable open source — slang, sv2v, yosys, Z3 — with Mununu itself in Rust. Every layer of the trust chain can be inspected.</li>
+        <li data-i18n="s6.l3"><strong>Self-hostable, air-gap-ready.</strong> Runs entirely on-prem as a CLI or a served HTTP API inside your enclave. No per-seat lock, no phone-home.</li>
+        <li data-i18n="s6.l4"><strong>Reproducible.</strong> Byte-deterministic transcripts and CI exit codes: the same input yields the same evidence, byte for byte.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7 · Synthesis -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s7.eye">Beyond checking</p>
+      <h2 data-i18n="s7.h">And synthesize the control kernel</h2>
+      <p class="lead" data-i18n="s7.lead">Beyond checking someone’s work, Mununu can build the security control logic itself — so it’s correct by construction — and hands back machine-readable evidence when something fails.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s7.p1">For security-critical sequencing — lockstep steps, key-handling phases, escalation ladders — Mununu can synthesize the controller correct-by-construction instead of grading a hand-written one after the fact. What comes back is a control kernel that cannot violate its specification, because it was never shaped able to.</p>
+          <p data-i18n="s7.p2">And when a property does fail, Mununu hands back structured JSON counterexamples — machine-readable traces made for triage tooling, not waveforms for a human to squint at.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 8 · CTA band -->
+  <section class="cta-band">
+    <div class="wrap">
+      <h2 data-i18n="cta.h">Bring us a security FSM.</h2>
+      <p data-i18n="cta.p">We’ll formalize the escalation and recovery properties with you and run them on your RTL — on your premises, if that’s where it has to stay. <span class="badge-alpha">ALPHA</span></p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Technical%20evaluation%20request%20(defense)&body=Name%3A%0AOrg%3A%0AWhat%20are%20you%20verifying%3F%20" data-i18n="cta.eval">Request a technical evaluation</a>
+        <a class="btn btn-secondary" href="https://github.com/vscorza/mununu" data-i18n="cta.readdocs">Read the docs</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p><a class="wordmark" href="../">mununu<span class="tld">.</span></a> <span class="badge-alpha">ALPHA</span> <span data-i18n="footer.honest">— early software, honest verdicts.</span></p>
+    <p data-i18n="footer.soundness">Core soundness machine-checked in Lean 4 and Isabelle/HOL.</p>
+    <ul class="footer-links">
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="footer.source">Source</a></li>
+      <li><a href="../ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+      <li><a href="../defense/" data-i18n="nav.defense">Defense</a></li>
+      <li><a href="../aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+      <li><a href="mailto:vscorza@gmail.com" data-i18n="nav.contact">Contact</a></li>
+    </ul>
+    <p data-i18n="footer.copyright">© 2026 Mununu. All rights reserved.</p>
+  </div>
+</footer>
+</body>
+</html>

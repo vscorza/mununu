@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Formal Verification for DO-254 Safety-Critical Hardware | Mununu</title>
+<meta name="description" content="Exhaustive, machine-checked-sound proof that safety-critical RTL can never wedge — recoverability, SEU-tolerance, correct-by-construction interlocks. DO-254-relevant evidence.">
+<link rel="canonical" href="https://vscorza.github.io/mununu/aerospace/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mununu">
+<meta property="og:title" content="Formal Verification for DO-254 Safety-Critical Hardware | Mununu">
+<meta property="og:description" content="Exhaustive, machine-checked-sound proof that safety-critical RTL can never wedge — recoverability, SEU-tolerance, correct-by-construction interlocks.">
+<meta property="og:url" content="https://vscorza.github.io/mununu/aerospace/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Formal Verification for DO-254 Safety-Critical Hardware | Mununu">
+<meta name="twitter:description" content="Exhaustive, machine-checked-sound proof that safety-critical RTL can never wedge. DO-254-relevant evidence.">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
+<script>
+/* Spanish page dictionary (chrome strings live in site.js SHARED_ES). */
+window.MununuEs = {
+  "hero.eyebrow": "Verificación formal DO-254. FPGA y ASIC críticos para la seguridad.",
+  "hero.lead": "Para el hardware crítico para la seguridad — controles de vuelo, aviónica — el peor fallo es un bloqueo silencioso que ninguna prueba llegó a tocar. Mununu demuestra que un diseño siempre puede recuperarse, comprobando cada estado posible, no solo los que muestreaste.",
+  "s2.lead": "«¿Siempre puede volver a un estado seguro?» suena simple, pero ninguna cantidad de pruebas puede responderlo de verdad. Mununu sí puede, porque razona sobre todos los estados alcanzables a la vez.",
+  "s3.lead": "Lo demostramos sobre lógica real de producción de contadores y temporizadores de OpenTitan de Google — y donde un diseño puede colgarse, producimos la secuencia de fallo exacta.",
+  "s4.lead": "En el espacio y en altura, la radiación invierte bits. Mununu puede comprobar si la redundancia de un chip realmente enmascara esas alteraciones — la propiedad sobre la que se construyen los diseños endurecidos ante radiación.",
+  "s5.lead": "El interbloqueo más seguro es uno que físicamente no puede romperse. Mununu construye la lógica de control de modo que la acción insegura es imposible por construcción — no solo comprobada a posteriori.",
+  "s6.lead": "La certificación de seguridad (DO-254) recompensa la evidencia que es exhaustiva, trazable y repetible. La prueba formal tiene justo esa forma — y Mununu es honesta sobre dónde termina su escala hoy.",
+  "hero.h1": "Demuestra que nunca puede atascarse.",
+  "hero.sub": "Las preguntas críticas para la seguridad que más importan son de tiempo ramificado — sin bloqueo permanente, recuperación elegante desde cualquier estado de fallo. La simulación solo las muestrea; las aserciones ni siquiera pueden formularlas. Mununu las demuestra — de forma exhaustiva, con solidez verificada por máquina — sobre RTL real.",
+  "hero.cta1": "Solicita una evaluación sobre tu FPGA/ASIC",
+  "hero.cta2": "Verlo sobre RTL real",
+  "hero.cap": "OpenTitan · contadores / temporizadores / watchdogs · RTL real",
+  "hero.eng": "48 bits · certificados de ranking",
+  "hero.note": "Desde cada estado alcanzable del contador de 48 bits, el camino de vuelta a cero sigue abierto — demostrado, no muestreado.",
+
+  "s2.eye": "La idea central",
+  "s2.h": "Lo crítico para la seguridad es una pregunta de tiempo ramificado",
+  "s2.p1": "«¿Siempre puede volver a un estado seguro?» no es una afirmación sobre una sola ejecución. Dice: desde <em>cada</em> estado que el diseño puede alcanzar — cada estado inducido por un fallo entre ellos — sigue existiendo al menos un camino a casa, a la seguridad. Eso cuantifica sobre los futuros ramificados de cada estado alcanzable.",
+  "s2.p2": "Las aserciones de SystemVerilog y LTL hablan de trazas individuales, así que la propiedad es inexpresable en ellas — no difícil de comprobar, sino imposible de <em>enunciar</em>. La verificación acotada de modelos y la k-inducción heredan la misma ceguera: recorren ejecuciones, y ninguna colección de ejecuciones puede atestiguar «siempre existe un camino de vuelta». La simulación, por su parte, solo muestrea; para un bloqueo escondido en un rincón de miles de millones de estados, muestrear es esperanza, no evidencia.",
+  "s2.p3": "Mununu evalúa propiedades de tiempo ramificado (μ-cálculo, clase CTL) de forma directa y sólida. Un veredicto HOLDS cubre todo el espacio de estados alcanzable; un veredicto VIOLATED llega con una traza concreta que muestra exactamente cómo se atasca el diseño.",
+
+  "s3.eye": "Evidencia · recuperabilidad",
+  "s3.h": "Desde cualquier estado inducido por un fallo, ¿puede recuperarse?",
+  "s3.p": "La clase de recuperabilidad se muestra sobre <strong>RTL real de contadores, temporizadores y watchdogs de OpenTitan</strong> — fuente de silicio de producción fijada a un commit, no un juguete. Los veredictos se zanjan con certificados de ranking — anidados y lexicográficos donde los temporizadores jerárquicos lo exigen — con anchura de 48 bits.",
+  "s3.cap": "OpenTitan · familia de contador / temporizador / watchdog",
+  "s3.eng1": "48 bits · ranking anidado/lexicográfico",
+  "s3.eng2": "lazo de estancamiento concreto",
+  "s3.note": "Ambos sentidos se ganan su lugar: la prueba certifica la recuperación; la violación te entrega el estancamiento exacto a corregir.",
+  "legend.proved": '<span class="chip chip--proved">PROVED</span><span>Resultado sólido y no acotado sobre el RTL indicado. Los veredictos definitivos se transfieren al sistema real.</span>',
+
+  "s4.eye": "Tolerancia a fallos",
+  "s4.h": 'Alteraciones por eventos únicos y tolerancia a fallos <span class="chip chip--demo">DEMO</span>',
+  "s4.p1": "La radiación invierte bits. La respuesta clásica es la redundancia — votación modular doble o triple, como en procesadores de clase LEON3-FT — y la pregunta clásica es si la lógica de votación enmascara de verdad cada alteración por evento único que el diseño afirma tolerar.",
+  "s4.p2": "El bloque <code>dmr_commit_4bit</code> de Mununu demuestra esta clase de propiedad sobre una etapa de commit con redundancia modular doble, tomando su modelo de fallos de la literatura de efectos de radiación y del linaje LEON3-FT.",
+  "s4.note": "<strong>Alcance honesto:</strong> esta es una demostración construida — un diseño diminuto, comprobado solo a nivel de sistema de transición etiquetado, y aún no reproducido en Verilator. Muestra la clase de propiedad; no es una afirmación sobre silicio tolerante a fallos desplegado.",
+
+  "s5.eye": "Correcto por construcción",
+  "s5.h": 'Interbloqueos que no se pueden violar <span class="chip chip--demo">DEMO</span>',
+  "s5.p": "El interbloqueo más fuerte es el que el controlador no puede romper. Mununu sintetiza controladores como estrategias ganadoras contra cada movimiento que el entorno pueda hacer, de modo que la condición de seguridad es estructural — no una comprobación añadida a posteriori.",
+  "s5.c1h": "«Nunca actuar mientras sea inseguro»",
+  "s5.c1p": "Un controlador de gating sintetizado que estructuralmente no puede habilitar el reloj mientras se cumple la condición insegura — demostrado por k-inducción, con un control negativo que confirma que el verificador detecta la variante rota.",
+  "s5.c2h": "Interbloqueo de puerta-motor de ascensor",
+  "s5.c2p": "Un controlador de puerta/motor sintetizado en el que el movimiento con la puerta abierta es inalcanzable por construcción — el interbloqueo de manual, entregado como una estrategia en lugar de una esperanza.",
+
+  "s6.eye": "Encaje con el proceso",
+  "s6.h": "Evidencia que DO-254 recompensa",
+  "s6.p": "El aseguramiento de diseño DO-254 en DAL A/B pide evidencia que sea exhaustiva, trazable y repetible de forma independiente. La prueba formal es su forma nativa, y Mununu está hecha para producir justo eso:",
+  "s6.l1": "<strong>Exhaustiva, no muestreada.</strong> Un veredicto definitivo cubre todo el espacio de estados alcanzable del bloque verificado.",
+  "s6.l2": "<strong>Trazable.</strong> Cada resultado es un registro propiedad → veredicto → motor, ligado a fuente fijada.",
+  "s6.l3": "<strong>Reproducible.</strong> Transcripciones deterministas byte a byte; los veredictos se asignan a códigos de salida de CI, de modo que la evidencia se regenera de forma idéntica a demanda.",
+  "s6.l4": "<strong>Sólida — y la solidez en sí está verificada.</strong> Los teoremas centrales de solidez están mecanizados en Lean 4 e Isabelle/HOL.",
+  "s6.note": "<strong>Alcance, sin rodeos:</strong> Mununu produce evidencia <em>relevante</em> para DO-254; es software Alpha y no una herramienta cualificada. La escala honesta hoy es a nivel de bloque y de FSM, con un cono exacto de aproximadamente 40 bits — por encima de eso devuelve ⊥ en lugar de adivinar. Consideramos la abstención una virtud: para este público, una herramienta que nunca farolea vale más que una que siempre responde.",
+
+  "cta.h": "Elige el bloque que nunca debe atascarse.",
+  "cta.p": 'Envíanos la FSM o el contador en el corazón de tu caso de seguridad; formalizaremos contigo su recuperabilidad y te devolveremos evidencia reproducible. <span class="badge-alpha">ALPHA</span>',
+  "cta.eval": "Solicitar una evaluación"
+};
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Service",
+      "name": "Formal verification for DO-254 safety-critical hardware",
+      "serviceType": "Safety-critical FPGA and ASIC formal verification",
+      "provider": { "@type": "Organization", "name": "Mununu", "url": "https://vscorza.github.io/mununu/" },
+      "url": "https://vscorza.github.io/mununu/aerospace/",
+      "description": "Exhaustive, machine-checked-sound proof that safety-critical RTL can never wedge — recoverability, SEU-tolerance, and correct-by-construction interlocks, producing DO-254-relevant evidence."
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://vscorza.github.io/mununu/" },
+        { "@type": "ListItem", "position": 2, "name": "Aerospace", "item": "https://vscorza.github.io/mununu/aerospace/" }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="../">mununu<span class="tld">.</span></a>
+    <nav class="site-nav" aria-label="Primary">
+      <ul>
+        <li><a href="../ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+        <li><a href="../defense/" data-i18n="nav.defense">Defense</a></li>
+        <li><a href="../aerospace/" aria-current="page" data-i18n="nav.aerospace">Aerospace</a></li>
+        <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+        <li><a href="mailto:vscorza@gmail.com?subject=Technical%20evaluation" data-i18n="nav.contact">Contact</a></li>
+      </ul>
+    </nav>
+    <div class="lang-toggle" role="group" aria-label="Language / Idioma">
+      <button type="button" class="lang-btn" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" class="lang-btn" data-lang="es" aria-pressed="false">ES</button>
+    </div>
+    <button class="theme-toggle" type="button" aria-pressed="false">Dark theme</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- 1 · Hero -->
+  <section class="hero hero--aerospace">
+    <div class="wrap hero-grid">
+      <div class="hero-lede">
+        <p class="eyebrow" data-i18n="hero.eyebrow">DO-254 formal verification · safety-critical FPGA / ASIC</p>
+        <h1 data-i18n="hero.h1">Prove it can never wedge.</h1>
+        <p class="sub" data-i18n="hero.lead">For safety-critical hardware — flight controls, avionics — the worst failure is a silent lockup no test happened to hit. Mununu proves a design can always recover, by checking every possible state, not just the ones you sampled.</p>
+        <details class="tech-detail">
+          <summary data-i18n="tech.more">Technical detail</summary>
+          <div>
+            <p data-i18n="hero.sub">The safety-critical questions that matter most are branching-time — no permanent lockup, graceful recovery from any fault state. Simulation only samples them; assertions cannot even phrase them. Mununu proves them — exhaustively, with machine-checked soundness — on real RTL.</p>
+          </div>
+        </details>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Evaluation%20request%20(FPGA%2FASIC)" data-i18n="hero.cta1">Request an evaluation on your FPGA/ASIC</a>
+          <a class="btn btn-secondary" href="#recoverability" data-i18n="hero.cta2">See it on real RTL</a>
+        </div>
+      </div>
+      <figure class="verdict" aria-label="Watchdog recoverability verdict on OpenTitan counter RTL at 48 bits">
+        <figcaption data-i18n="hero.cap">OpenTitan · counters / timers / watchdogs · real RTL</figcaption>
+        <div class="v-row">
+          <code class="prop">AG EF (cnt == 0)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--proved">PROVED</span>
+          <span class="engine" data-i18n="hero.eng">48-bit · ranking certificates</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="hero.note">From every reachable state of the 48-bit counter, the way back to zero is still open — proved, not sampled.</span>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 2 · Education: branching time -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s2.eye">The core idea</p>
+      <h2 data-i18n="s2.h">Safety-critical is a branching-time question</h2>
+      <p class="lead" data-i18n="s2.lead">“Can it always get back to a safe state?” sounds simple, but no amount of testing can truly answer it. Mununu can, because it reasons about every reachable state at once.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s2.p1">“Can it always get back to safe?” is no statement about a single run. It says: from <em>every</em> state the design can reach — every fault-induced state among them — at least one path home to safety still exists. That quantifies over the branching futures of every reachable state.</p>
+          <p data-i18n="s2.p2">SystemVerilog Assertions and LTL speak of individual traces, so the property is inexpressible in them — not hard to check, but impossible to <em>state</em>. Plain bounded model checking and k-induction inherit the same blindness: they walk runs, and no collection of runs can witness “a path back always exists.” Simulation, for its part, only samples; for a lockup hiding in one corner of billions of states, sampling is hope, not evidence.</p>
+          <p data-i18n="s2.p3">Mununu evaluates branching-time properties (μ-calculus, CTL-class) directly and soundly. A HOLDS verdict covers the whole reachable state space; a VIOLATED verdict arrives with a concrete trace showing exactly how the design wedges.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 3 · Recoverability on real RTL -->
+  <section id="recoverability">
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s3.eye">Evidence · recoverability</p>
+      <h2 data-i18n="s3.h">From any fault-induced state, can it recover?</h2>
+      <p class="lead" data-i18n="s3.lead">We proved this on real production counter and timer logic from Google’s OpenTitan — and where a design can hang, we produce the exact failing sequence.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s3.p">The recoverability class is shown on <strong>real OpenTitan counter, timer, and watchdog RTL</strong> — commit-pinned production silicon source, not a toy. Verdicts are settled by ranking certificates — nested and lexicographic where hierarchical timers demand it — at 48-bit width.</p>
+        </div>
+      </details>
+      <figure class="verdict" aria-label="Recoverability verdicts on OpenTitan counter and timer RTL">
+        <figcaption data-i18n="s3.cap">OpenTitan · counter / timer / watchdog family</figcaption>
+        <div class="v-row">
+          <code class="prop">AG EF (cnt == 0 ∨ cnt == MAX)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--proved">PROVED</span>
+          <span class="engine" data-i18n="s3.eng1">48-bit · nested/lexicographic ranking</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">uart_tx · AG AF (bit_cnt == 0)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result violated">VIOLATED</span>
+          <span class="chip chip--proved">PROVED</span>
+          <span class="engine" data-i18n="s3.eng2">concrete stall lasso</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="s3.note">Both directions earn their keep: the proof certifies recovery; the violation hands you the exact stall to fix.</span>
+        </div>
+      </figure>
+      <div class="evidence-legend" role="note">
+        <h3 data-i18n="legend.title">How to read our evidence</h3>
+        <ul>
+          <li data-i18n="legend.proved"><span class="chip chip--proved">PROVED</span><span>Sound, unbounded result on the stated RTL. Definite verdicts transfer to the real system.</span></li>
+          <li data-i18n="legend.bounded"><span class="chip chip--bounded">BOUNDED</span><span>Bounded model checking — valid to the stated depth only.</span></li>
+          <li data-i18n="legend.demo"><span class="chip chip--demo">DEMO</span><span>Constructed example. Illustrates the capability; not a real-chip finding.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 · SEU / fault tolerance -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s4.eye">Fault tolerance</p>
+      <h2 data-i18n="s4.h">Single-event upsets &amp; fault tolerance <span class="chip chip--demo">DEMO</span></h2>
+      <p class="lead" data-i18n="s4.lead">In space and at altitude, radiation flips bits. Mununu can check whether a chip’s redundancy really masks those upsets — the property radiation-hardened designs are built around.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s4.p1">Radiation flips bits. The classic answer is redundancy — dual- or triple-modular voting, as in LEON3-FT-class processors — and the classic question is whether the voting logic truly masks every single-event upset the design claims to tolerate.</p>
+          <p data-i18n="s4.p2">Mununu’s <code>dmr_commit_4bit</code> gate demonstrates this property class on a dual-modular-redundancy commit stage, drawing its fault model from the radiation-effects literature and the LEON3-FT lineage.</p>
+        </div>
+      </details>
+      <div class="scope-note" data-i18n="s4.note">
+        <strong>Honest scope:</strong> this is a constructed demonstration — a tiny design, checked at the labeled-transition-system level only, and not yet reproduced in Verilator. It shows the property class; it is not a claim about fielded fault-tolerant silicon.
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 · Interlocks -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s5.eye">Correct by construction</p>
+      <h2 data-i18n="s5.h">Interlocks that cannot be violated <span class="chip chip--demo">DEMO</span></h2>
+      <p class="lead" data-i18n="s5.lead">The safest interlock is one that physically cannot be broken. Mununu builds the control logic so that the unsafe action is impossible by construction — not merely checked for afterward.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s5.p">The strongest interlock is the one the controller cannot break. Mununu synthesizes controllers as winning strategies against every move the environment can make, so the safety condition is structural — not a check bolted on afterward.</p>
+        </div>
+      </details>
+      <div class="card-grid">
+        <div class="card reveal">
+          <span class="mono-tag">clock_gating <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c1h">“Never actuate while unsafe”</h3>
+          <p data-i18n="s5.c1p">A synthesized gating controller that structurally cannot enable the clock while the unsafe condition holds — proven by k-induction, with a negative control confirming the checker catches the broken variant.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag">door-motor interlock <span class="chip chip--demo">DEMO</span></span>
+          <h3 data-i18n="s5.c2h">Elevator door-motor interlock</h3>
+          <p data-i18n="s5.c2p">A synthesized door/motor controller in which motion-while-open is unreachable by construction — the textbook interlock, delivered as a strategy rather than a hope.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6 · DO-254 evidence -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s6.eye">Process fit</p>
+      <h2 data-i18n="s6.h">Evidence DO-254 rewards</h2>
+      <p class="lead" data-i18n="s6.lead">Safety certification (DO-254) rewards evidence that is exhaustive, traceable, and repeatable. Formal proof is exactly that shape — and Mununu is honest about where its scale ends today.</p>
+      <p data-i18n="s6.p">DO-254 design assurance at DAL A/B asks for evidence that is exhaustive, traceable, and independently repeatable. Formal proof is its native shape, and Mununu is built to produce exactly that:</p>
+      <ul style="padding-left:1.2rem;">
+        <li data-i18n="s6.l1"><strong>Exhaustive, not sampled.</strong> A definite verdict covers the entire reachable state space of the verified block.</li>
+        <li data-i18n="s6.l2"><strong>Traceable.</strong> Every result is a property → verdict → engine record, tied to pinned source.</li>
+        <li data-i18n="s6.l3"><strong>Reproducible.</strong> Byte-deterministic transcripts; verdicts map to CI exit codes, so the evidence regenerates identically on demand.</li>
+        <li data-i18n="s6.l4"><strong>Sound — and the soundness itself is checked.</strong> The core soundness theorems are mechanized in Lean 4 and Isabelle/HOL.</li>
+      </ul>
+      <div class="scope-note" data-i18n="s6.note">
+        <strong>Scope, plainly:</strong> Mununu produces DO-254-<em>relevant</em> evidence; it is Alpha software and not a qualified tool. Honest scale today is block and FSM level, with an exact cone of roughly 40 bits — above that it returns ⊥ rather than guessing. We consider the abstention a feature: for this audience, a tool that never bluffs is worth more than one that always answers.
+      </div>
+    </div>
+  </section>
+
+  <!-- 7 · CTA band -->
+  <section class="cta-band">
+    <div class="wrap">
+      <h2 data-i18n="cta.h">Pick the block that must never wedge.</h2>
+      <p data-i18n="cta.p">Send us the FSM or counter at the heart of your safety case; we’ll formalize its recoverability with you and hand back reproducible evidence. <span class="badge-alpha">ALPHA</span></p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Evaluation%20request%20(FPGA%2FASIC)&body=Name%3A%0AOrg%3A%0AWhat%20are%20you%20verifying%3F%20" data-i18n="cta.eval">Request an evaluation</a>
+        <a class="btn btn-secondary" href="https://github.com/vscorza/mununu" data-i18n="cta.readdocs">Read the docs</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p><a class="wordmark" href="../">mununu<span class="tld">.</span></a> <span class="badge-alpha">ALPHA</span> <span data-i18n="footer.honest">— early software, honest verdicts.</span></p>
+    <p data-i18n="footer.soundness">Core soundness machine-checked in Lean 4 and Isabelle/HOL.</p>
+    <ul class="footer-links">
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="footer.source">Source</a></li>
+      <li><a href="../ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+      <li><a href="../defense/" data-i18n="nav.defense">Defense</a></li>
+      <li><a href="../aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+      <li><a href="mailto:vscorza@gmail.com" data-i18n="nav.contact">Contact</a></li>
+    </ul>
+    <p data-i18n="footer.copyright">© 2026 Mununu. All rights reserved.</p>
+  </div>
+</footer>
+</body>
+</html>

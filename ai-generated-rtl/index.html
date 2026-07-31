@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify AI-Generated RTL — the Embeddable Oracle | Mununu</title>
+<meta name="description" content="AI writes the RTL; Mununu synthesizes the control kernel correct-by-construction and verifies the whole system — catching the deadlocks and races LLMs ship. Per-run API, embeddable.">
+<link rel="canonical" href="https://vscorza.github.io/mununu/ai-generated-rtl/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mununu">
+<meta property="og:title" content="Verify AI-Generated RTL — the Embeddable Oracle | Mununu">
+<meta property="og:description" content="AI writes the RTL; Mununu synthesizes the control kernel correct-by-construction and verifies the whole system. Per-run API, embeddable.">
+<meta property="og:url" content="https://vscorza.github.io/mununu/ai-generated-rtl/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Verify AI-Generated RTL — the Embeddable Oracle | Mununu">
+<meta name="twitter:description" content="AI writes the RTL; Mununu synthesizes the control kernel and verifies the whole system. Per-run, embeddable.">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
+<script>
+/* Spanish page dictionary (chrome strings live in site.js SHARED_ES). */
+window.MununuEs = {
+  "hero.eyebrow": "Verifica RTL generado por IA. Verificación de Verilog de LLM.",
+  "hero.lead": "La IA ya puede escribir Verilog, pero se equivoca en silencio en la lógica de control más difícil — los bloqueos y las condiciones de carrera que pasan todas las pruebas y luego cuelgan el chip. Mununu es el verificador que tu bucle de IA invoca para atraparlos, y puede construir esa lógica de control correctamente desde el principio.",
+  "s2.lead": "Los LLM manejan bien las partes fáciles y repetitivas de un chip. Donde fallan es en la lógica de coordinación — y esos errores son justo del tipo que ninguna cantidad de pruebas puede descartar.",
+  "s3.lead": "Deja que la IA haga lo que se le da bien, y que Mununu se encargue de lo que no: la IA escribe el grueso del diseño, Mununu construye el núcleo de control y verifica el conjunto.",
+  "s4.lead": "Se integra en un bucle automatizado: la IA propone un diseño, Mununu sintetiza el núcleo de control y verifica el resultado, y ante un fallo devuelve una corrección legible por máquina sobre la que el modelo puede actuar.",
+  "s5.lead": "Aquí está la ventaja comercial: las herramientas de verificación industriales no pueden embeberse en un producto por cómo se licencian. Mununu se cobra por ejecución y está hecho para vivir dentro de tu pipeline.",
+  "s6.lead": "No solo lo probamos con nuestros propios ejemplos — lo ejecutamos contra un benchmark público de aserciones reales escritas por LLM sobre chips reales.",
+  "hero.h1": "La IA escribe el RTL. Nosotros lo verificamos — y sintetizamos lo que hace mal.",
+  "hero.sub": "No puedes muestrear tu camino hasta la exclusión mutua, y no puedes hacer pruebas unitarias de una propiedad de vivacidad. Mununu es el oráculo embebible para el bucle generar-verificar-corregir: sintetiza el núcleo de control correcto por construcción, y verifica el sistema completo que tu modelo ensambló — de extremo a extremo.",
+  "hero.cta1": "Embebe el oráculo — reserva una llamada de integración",
+  "hero.cta2": "Ver el bucle",
+  "hero.cap": "agentic_rtl_loop · síntesis GR(1) + verificación del sistema completo",
+  "hero.note": "Demostrado por el oráculo, con un control negativo que lo mantiene honesto: la variante deliberadamente rota se detecta — así que cuando dice HOLDS, eso significa algo.",
+
+  "s2.eye": "El modo de fallo",
+  "s2.h": "Dónde se rompe el RTL de IA generativa: la lógica de control",
+  "s2.p1": "Los LLM son decentes con las rutas de datos — pipelines, aritmética, multiplexado. Donde los diseños generados se deshacen es en el control: arbitraje, handshakes, exclusión mutua, equidad, contrapresión, interbloqueos. La lógica de control es sensible al orden y adversarial — el entorno tiene un movimiento en cada ciclo, y un rincón no cubierto es un cuelgue o una condición de carrera.",
+  "s2.p2": "Ese tipo de error pasa el lint. Pasa un puñado de pruebas dirigidas. Y luego se despacha — porque ninguna muestra finita de trazas puede atestiguar «este bloqueo es inalcanzable» o «todo solicitante acaba siendo atendido». Estudios externos sitúan alrededor del 60% de los diseños de hardware generados por LLM como portadores de debilidades del catálogo de CWE de hardware de MITRE; las clases de control son exactamente donde las comprobaciones basadas en muestreo se quedan ciegas.",
+
+  "s3.eye": "El marco",
+  "s3.h": "La división del trabajo",
+  "s3.t1": "el LLM",
+  "s3.c1h": "Escribe la ruta de datos",
+  "s3.c1p": "En lo que es bueno: estructura, aritmética, fontanería, el grueso del RTL — y la especificación que pretende cumplir.",
+  "s3.t2": "mununu · sintetizar",
+  "s3.c2h": "Construye el núcleo de control",
+  "s3.c2p": "Correcto por construcción: una estrategia ganadora que <em>estructuralmente no puede</em> violar la exclusión mutua ni la equidad. Sintetizada — no generada y luego comprobada.",
+  "s3.t3": "mununu · verificar",
+  "s3.c3h": "Verifica el sistema completo",
+  "s3.c3p": "El diseño integrado — ruta de datos más núcleo — se verifica de extremo a extremo, descargando las mismas suposiciones bajo las que se sintetizó el núcleo.",
+  "s3.close": "El verificador confirma; no rescata. Sintetiza el núcleo de control en lugar de alucinarlo, y toda una clase de modos de fallo de LLM nunca entra en el diseño en absoluto.",
+
+  "s4.eye": "El flujo de trabajo",
+  "s4.h": "El bucle generar-verificar-corregir",
+  "s4.p1": "Fundamentado en tres demostraciones ejecutables: <code>agentic_rtl_loop</code> (síntesis GR(1) más verificación del sistema completo, demostrada por el oráculo, con un control negativo), <code>handshake_flow</code> (contrapresión) y <code>compute_engine_faulty</code> — el cuelgue que una batería de regresión pasa y Mununu no.",
+  "s4.p2": '<span class="chip chip--demo">DEMO</span>&nbsp; Estas demostraciones del bucle son ejemplos construidos: la parte del LLM está simulada — tú traes el modelo — y algunos resultados de vivacidad en el bucle son <span class="chip chip--bounded">BOUNDED</span> en lugar de pruebas no acotadas.',
+
+  "s5.eye": "El punto estructural",
+  "s5.h": "Embebible — por ejecución, no por puesto",
+  "s5.p1": "Aquí está la restricción que ninguna hoja de ruta arregla: una licencia formal comercial por puesto no puede vivir dentro de tu producto SaaS o de agente. Cada cliente que tengas necesitaría traer su propia licencia antes de que tu paso de verificación pudiera siquiera ejecutarse. Es el modelo de negocio lo que lo descarta — no el motor.",
+  "s5.p2": "Mununu se cobra por ejecución y está hecho para embeberse: un binario en Rust, una CLI y una API HTTP servida que invocas como un paso de tu bucle, autoalojada o alojada. Ocupa el hueco que los actores establecidos estructuralmente no pueden — un complemento a ellos, no un reemplazo. Los motores industriales dominan la escala; Mununu domina la región del mapa de tiempo ramificado, síntesis y embebibilidad.",
+
+  "s6.eye": "Evidencia · artefactos reales de LLM",
+  "s6.h": "Probado contra aserciones reales generadas por LLM",
+  "s6.cap": "AssertLLM2 · SVA real generado por LLM sobre RTL real",
+  "s6.prop": "diseños elaborados",
+  "s6.note": "Mununu como backend abierto y sin licencia para el benchmark AssertLLM2 — salida real del modelo sobre RTL real, distinta de las demos construidas del bucle de arriba.",
+  "legend.proved": '<span class="chip chip--proved">PROVED</span><span>Resultado sólido y no acotado sobre la entrada indicada. Los veredictos definitivos se transfieren al sistema real.</span>',
+
+  "s7.eye": "Respuestas directas",
+  "s7.h": "Preguntas frecuentes",
+  "s7.q1": "¿Puedo embeberlo en mi producto?",
+  "s7.a1": "Sí. Mununu se cobra por ejecución, no por puesto, y es autoalojable: un binario en Rust con una CLI y una API HTTP servida que puedes invocar desde tu bucle de SaaS o de agente. Tus clientes no necesitan sus propias licencias para que tu paso de verificación se ejecute.",
+  "s7.q2": "¿Reemplaza a JasperGold o VC Formal?",
+  "s7.a2": "No — es un complemento, y puede envolver motores de escala industrial en lugar de superarlos. Esas herramientas dominan la escala; Mununu ocupa una región distinta del mapa: propiedades de tiempo ramificado como <code>AG EF good</code>, síntesis reactiva de controladores y embebibilidad tras una API por ejecución.",
+  "s7.q3": "¿Cómo maneja las alucinaciones del LLM en la lógica de control?",
+  "s7.a3": "Manteniéndolas fuera de la ruta de control. Mununu sintetiza el núcleo de control correcto por construcción — una estrategia ganadora que estructuralmente no puede violar su especificación — en lugar de comprobar lógica de control alucinada a posteriori. El verificador confirma; no rescata.",
+  "s7.q4": "¿Qué no puede hacer todavía?",
+  "s7.a4": "Firma de un SoC completo. La escala honesta es a nivel de bloque y de FSM, con un cono exacto de aproximadamente 40 bits. Por encima de eso, devuelve ⊥ (indecidido) en lugar de adivinar — y es software Alpha. Preferimos abstenernos a farolear.",
+  "s7.q5": "¿Está incluida la parte del LLM?",
+  "s7.a5": "No — tú traes el modelo. Mununu es el oráculo de síntesis y verificación que tu modelo invoca: toma RTL y una especificación, y devuelve veredictos, núcleos de control sintetizados y contraejemplos en JSON estructurado que tu modelo puede consumir.",
+  "s7.q6": "¿Es rápido sintetizando?",
+  "s7.a6": "Los sintetizadores dedicados sintetizan más rápido. La propuesta de Mununu es la <em>integración</em>: síntesis y verificación del sistema completo tras una sola API embebible, con las suposiciones del núcleo descargadas contra el diseño realmente ensamblado.",
+
+  "cta.h": "Pon el oráculo dentro de tu bucle.",
+  "cta.p": 'Una llamada de integración: cableamos la API en tu pipeline de generar-verificar-corregir, contra tus propios diseños. <span class="badge-alpha">ALPHA</span>',
+  "cta.eval": "Embebe el oráculo — reserva una llamada de integración"
+};
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "Mununu",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, macOS",
+      "url": "https://vscorza.github.io/mununu/ai-generated-rtl/",
+      "softwareVersion": "Alpha",
+      "description": "An embeddable verification-and-synthesis oracle for AI-generated RTL: synthesizes correct-by-construction control kernels and verifies whole systems, returning structured JSON counterexamples for LLM fix loops."
+    },
+    {
+      "@type": "Service",
+      "name": "Verification oracle for AI-generated RTL",
+      "serviceType": "LLM Verilog verification and controller synthesis",
+      "provider": { "@type": "Organization", "name": "Mununu", "url": "https://vscorza.github.io/mununu/" },
+      "url": "https://vscorza.github.io/mununu/ai-generated-rtl/"
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Can I embed Mununu in my product?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. Mununu is priced per run, not per seat, and is self-hostable: a Rust binary with a CLI and a served HTTP API you can call from your SaaS or agent loop. Your customers do not need their own licenses." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does Mununu replace JasperGold or VC Formal?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No — it complements them. Industrial engines own scale; Mununu occupies the region they structurally can't reach: branching-time properties like AG EF good, reactive controller synthesis, and embeddability behind a per-run API." }
+        },
+        {
+          "@type": "Question",
+          "name": "How does it handle LLM hallucinations in control logic?",
+          "acceptedAnswer": { "@type": "Answer", "text": "By removing the LLM from the control path. Mununu synthesizes the control kernel correct-by-construction — a winning strategy that structurally cannot violate mutex or fairness — rather than checking hallucinated control logic after the fact. The checker confirms; it doesn't rescue." }
+        },
+        {
+          "@type": "Question",
+          "name": "What can't it do yet?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Full-SoC sign-off. Honest scale is block/FSM level with an exact cone of roughly 40 bits; above that Mununu returns ⊥ (undecided) rather than guessing. It is Alpha software." }
+        },
+        {
+          "@type": "Question",
+          "name": "Is the LLM part included?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No — you bring the model. Mununu is the synthesis-and-verification oracle your model calls: it takes RTL and a spec, and returns verdicts, synthesized control kernels, and structured JSON counterexamples." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="../">mununu<span class="tld">.</span></a>
+    <nav class="site-nav" aria-label="Primary">
+      <ul>
+        <li><a href="../ai-generated-rtl/" aria-current="page" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+        <li><a href="../defense/" data-i18n="nav.defense">Defense</a></li>
+        <li><a href="../aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+        <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+        <li><a href="mailto:vscorza@gmail.com?subject=Integration%20call" data-i18n="nav.contact">Contact</a></li>
+      </ul>
+    </nav>
+    <div class="lang-toggle" role="group" aria-label="Language / Idioma">
+      <button type="button" class="lang-btn" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" class="lang-btn" data-lang="es" aria-pressed="false">ES</button>
+    </div>
+    <button class="theme-toggle" type="button" aria-pressed="false">Dark theme</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- 1 · Hero -->
+  <section class="hero hero--airtl">
+    <div class="wrap hero-grid">
+      <div class="hero-lede">
+        <p class="eyebrow" data-i18n="hero.eyebrow">Verify AI-generated RTL · LLM Verilog verification</p>
+        <h1 data-i18n="hero.h1">AI writes the RTL. We verify it — and synthesize what it gets wrong.</h1>
+        <p class="sub" data-i18n="hero.lead">AI can now write Verilog, but it quietly gets the tricky control logic wrong — the deadlocks and races that pass every test and then hang the chip. Mununu is the checker your AI loop calls to catch them, and it can build that control logic correctly in the first place.</p>
+        <details class="tech-detail">
+          <summary data-i18n="tech.more">Technical detail</summary>
+          <div>
+            <p data-i18n="hero.sub">You can’t sample your way to mutual exclusion, and you can’t unit-test a liveness property. Mununu is the embeddable oracle for the generate-verify-fix loop: it synthesizes the control kernel correct-by-construction, and verifies the whole system your model assembled — end to end.</p>
+          </div>
+        </details>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Integration%20call%20—%20embed%20the%20oracle" data-i18n="hero.cta1">Embed the oracle — book an integration call</a>
+          <a class="btn btn-secondary" href="#loop" data-i18n="hero.cta2">See the loop</a>
+        </div>
+      </div>
+      <figure class="verdict" aria-label="Verdicts from the agentic RTL loop demonstration">
+        <figcaption data-i18n="hero.cap">agentic_rtl_loop · GR(1) synthesis + whole-system verify</figcaption>
+        <div class="v-row">
+          <code class="prop">mutex</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--demo">DEMO</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">no_starvation(c0, c1)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">HOLDS</span>
+          <span class="chip chip--demo">DEMO</span>
+        </div>
+        <div class="v-row">
+          <code class="prop">bad_mutex  (negative control)</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result sat">SAT</span>
+          <span class="chip chip--demo">DEMO</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="hero.note">Oracle-proven, with a negative control kept honest: the deliberately broken variant is caught — so when it says HOLDS, that means something.</span>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 2 · Where GenAI RTL breaks -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s2.eye">The failure mode</p>
+      <h2 data-i18n="s2.h">Where GenAI RTL breaks: control logic</h2>
+      <p class="lead" data-i18n="s2.lead">LLMs handle the easy, repetitive parts of a chip well. Where they slip is the coordination logic — and those bugs are exactly the kind no amount of testing can rule out.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s2.p1">LLMs are respectable at datapaths — pipelines, arithmetic, muxing. Where generated designs come apart is control: arbitration, handshakes, mutual exclusion, fairness, backpressure, interlocks. Control logic is order-sensitive and adversarial — the environment gets a move every cycle, and one missed corner is a hang or a race.</p>
+          <p data-i18n="s2.p2">That kind of bug passes lint. It passes a handful of directed tests. And then it ships — because no finite sample of traces can witness “this deadlock is unreachable” or “every requester is eventually served.” External studies put roughly 60% of LLM-generated hardware designs as carrying weaknesses in MITRE’s hardware-CWE catalog; the control classes are exactly where sampling-based checks go blind.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 3 · Division of labor -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s3.eye">The frame</p>
+      <h2 data-i18n="s3.h">The division of labor</h2>
+      <p class="lead" data-i18n="s3.lead">Let the AI do what it’s good at, and let Mununu own the part it isn’t: the AI writes the bulk of the design, Mununu builds the control core and checks the whole thing.</p>
+      <div class="card-grid">
+        <div class="card reveal">
+          <span class="mono-tag" data-i18n="s3.t1">the LLM</span>
+          <h3 data-i18n="s3.c1h">Writes the datapath</h3>
+          <p data-i18n="s3.c1p">What it’s good at: structure, arithmetic, plumbing, the bulk of the RTL — and the spec it means to meet.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag" data-i18n="s3.t2">mununu · synthesize</span>
+          <h3 data-i18n="s3.c2h">Builds the control kernel</h3>
+          <p data-i18n="s3.c2p">Correct-by-construction: a winning strategy that <em>structurally cannot</em> violate mutex or fairness. Synthesized — not generated, then checked.</p>
+        </div>
+        <div class="card reveal">
+          <span class="mono-tag" data-i18n="s3.t3">mununu · verify</span>
+          <h3 data-i18n="s3.c3h">Verifies the whole system</h3>
+          <p data-i18n="s3.c3p">The integrated design — datapath plus kernel — is verified end to end, discharging the very assumptions the kernel was synthesized under.</p>
+        </div>
+      </div>
+      <p style="margin-top:1.4rem;" data-i18n="s3.close">The checker confirms; it does not rescue. Synthesize the control kernel instead of hallucinating it, and a whole class of LLM failure modes never enters the design at all.</p>
+    </div>
+  </section>
+
+  <!-- 4 · The loop -->
+  <section id="loop">
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s4.eye">The workflow</p>
+      <h2 data-i18n="s4.h">The generate-verify-fix loop</h2>
+      <p class="lead" data-i18n="s4.lead">It slots into an automated loop: the AI proposes a design, Mununu synthesizes the control core and verifies the result, and on failure it hands back a machine-readable fix the model can act on.</p>
+      <div class="loop-diagram" role="img" aria-label="Diagram of the generate-verify-fix loop: an English requirement goes to the LLM, which produces the datapath and a spec; Mununu synthesizes the control kernel; the parts are assembled; Mununu verifies the whole system; on failure a structured JSON counterexample and lasso trace feed back into the LLM's fix loop.">
+        <svg viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <style>
+            .box { fill: var(--bg-raise); stroke: var(--line); rx: 6; }
+            .box-mnu { fill: var(--panel); stroke: var(--panel-line); }
+            .t  { font: 600 14px var(--sans); fill: var(--ink); }
+            .t2 { font: 400 12px var(--sans); fill: var(--ink-3); }
+            .tm { font: 600 13px var(--mono); fill: var(--panel-ink); }
+            .tm2{ font: 400 11px var(--mono); fill: var(--panel-dim); }
+            .edge { stroke: var(--ink-3); stroke-width: 1.6; fill: none; marker-end: url(#arr); }
+            .edge-fail { stroke: var(--alarm); }
+          </style>
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/>
+            </marker>
+          </defs>
+          <!-- Requirement -->
+          <rect class="box" x="10" y="105" width="140" height="70" rx="6"/>
+          <text class="t"  x="80" y="135" text-anchor="middle">English</text>
+          <text class="t"  x="80" y="153" text-anchor="middle">requirement</text>
+          <!-- LLM -->
+          <rect class="box" x="200" y="105" width="150" height="70" rx="6"/>
+          <text class="t"  x="275" y="130" text-anchor="middle">LLM</text>
+          <text class="t2" x="275" y="148" text-anchor="middle">datapath + spec</text>
+          <text class="t2" x="275" y="164" text-anchor="middle">(you bring the model)</text>
+          <!-- Mununu synth -->
+          <rect class="box box-mnu" x="400" y="30" width="170" height="64" rx="6"/>
+          <text class="tm"  x="485" y="56" text-anchor="middle">mununu synth</text>
+          <text class="tm2" x="485" y="74" text-anchor="middle">control kernel · GR(1)</text>
+          <!-- Assemble -->
+          <rect class="box" x="430" y="115" width="110" height="50" rx="6"/>
+          <text class="t" x="485" y="145" text-anchor="middle">assemble</text>
+          <!-- Mununu verify -->
+          <rect class="box box-mnu" x="620" y="105" width="170" height="70" rx="6"/>
+          <text class="tm"  x="705" y="132" text-anchor="middle">mununu verify</text>
+          <text class="tm2" x="705" y="150" text-anchor="middle">whole system</text>
+          <text class="tm2" x="705" y="164" text-anchor="middle">assumptions discharged</text>
+          <!-- Pass -->
+          <rect class="box" x="840" y="115" width="90" height="50" rx="6"/>
+          <text class="t" x="885" y="140" text-anchor="middle" fill="var(--proved)" style="fill:var(--proved)">HOLDS</text>
+          <text class="t2" x="885" y="156" text-anchor="middle">ship</text>
+          <!-- Counterexample -->
+          <rect class="box" x="470" y="225" width="300" height="56" rx="6"/>
+          <text class="t"  x="620" y="248" text-anchor="middle">structured JSON counterexample</text>
+          <text class="t2" x="620" y="266" text-anchor="middle">+ lasso trace — LLM-consumable, not waveforms</text>
+          <!-- Edges -->
+          <path class="edge" d="M150 140 H198"/>
+          <path class="edge" d="M350 128 C 380 100, 380 70, 398 62"/>
+          <path class="edge" d="M350 150 H428"/>
+          <path class="edge" d="M485 94 V113"/>
+          <path class="edge" d="M540 140 H618"/>
+          <path class="edge" d="M790 140 H838"/>
+          <path class="edge edge-fail" d="M705 175 V225 H772"/>
+          <path class="edge edge-fail" d="M470 253 H275 V177"/>
+        </svg>
+      </div>
+      <p data-i18n="s4.p1">Grounded in three runnable demonstrations: <code>agentic_rtl_loop</code> (GR(1) synthesis plus whole-system verification, oracle-proven, with a negative control), <code>handshake_flow</code> (backpressure), and <code>compute_engine_faulty</code> — the lockup a regression suite passes and Mununu doesn’t.</p>
+      <p data-i18n="s4.p2"><span class="chip chip--demo">DEMO</span>&nbsp; These loop demonstrations are constructed examples: the LLM leg is mocked — you bring the model — and some liveness results in the loop are <span class="chip chip--bounded">BOUNDED</span> rather than unbounded proofs.</p>
+    </div>
+  </section>
+
+  <!-- 5 · Embeddable, per run -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s5.eye">The structural point</p>
+      <h2 data-i18n="s5.h">Embeddable — per run, not per seat</h2>
+      <p class="lead" data-i18n="s5.lead">Here’s the commercial edge: the industrial verification tools can’t be embedded in a product because of how they’re licensed. Mununu is priced per run and built to live inside your pipeline.</p>
+      <details class="tech-detail">
+        <summary data-i18n="tech.more">Technical detail</summary>
+        <div>
+          <p data-i18n="s5.p1">Here is the constraint no roadmap fixes: a per-seat commercial formal license cannot live inside your SaaS or agent product. Every customer you have would need to bring their own license before your verify step could even run. The business model rules it out — not the engine.</p>
+          <p data-i18n="s5.p2">Mununu is priced per run and made to embed: a Rust binary, a CLI, and a served HTTP API you call as one step in your loop, self-hosted or hosted. It takes the slot the incumbents structurally can’t — a complement to them, not a replacement. Industrial engines own scale; Mununu owns the branching-time, synthesis, and embeddable region of the map.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 6 · Real LLM-artifact evidence -->
+  <section>
+    <div class="wrap">
+      <p class="eyebrow" data-i18n="s6.eye">Evidence · real LLM artifacts</p>
+      <h2 data-i18n="s6.h">Tested against real LLM-generated assertions</h2>
+      <p class="lead" data-i18n="s6.lead">We didn’t just test this on our own examples — we ran it against a public benchmark of real LLM-written assertions on real chips.</p>
+      <figure class="verdict" aria-label="AssertLLM2 benchmark result">
+        <figcaption data-i18n="s6.cap">AssertLLM2 · real LLM-generated SVA on real RTL</figcaption>
+        <div class="v-row">
+          <code class="prop" data-i18n="s6.prop">designs elaborated</code><span class="arrow" aria-hidden="true">→</span>
+          <span class="result holds">82 / 83</span>
+          <span class="chip chip--proved">REAL ARTIFACTS</span>
+        </div>
+        <div class="v-row" style="border-top:1px solid var(--panel-line); margin-top:0.5rem; padding-top:0.6rem;">
+          <span style="color:var(--panel-dim); font-size:0.76rem;" data-i18n="s6.note">Mununu as an open, license-free backend for the AssertLLM2 benchmark — real model output on real RTL, distinct from the constructed loop demos above.</span>
+        </div>
+      </figure>
+      <div class="evidence-legend" role="note">
+        <h3 data-i18n="legend.title">How to read our evidence</h3>
+        <ul>
+          <li data-i18n="legend.proved"><span class="chip chip--proved">PROVED</span><span>Sound, unbounded result on the stated input. Definite verdicts transfer to the real system.</span></li>
+          <li data-i18n="legend.bounded"><span class="chip chip--bounded">BOUNDED</span><span>Bounded model checking — valid to the stated depth only.</span></li>
+          <li data-i18n="legend.demo"><span class="chip chip--demo">DEMO</span><span>Constructed example. Illustrates the capability; not a real-chip finding.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7 · FAQ -->
+  <section>
+    <div class="wrap faq">
+      <p class="eyebrow" data-i18n="s7.eye">Straight answers</p>
+      <h2 data-i18n="s7.h">FAQ</h2>
+      <details>
+        <summary data-i18n="s7.q1">Can I embed it in my product?</summary>
+        <div><p data-i18n="s7.a1">Yes. Mununu is priced per run, not per seat, and is self-hostable: a Rust binary with a CLI and a served HTTP API you can call from your SaaS or agent loop. Your customers don’t need their own licenses for your verify step to run.</p></div>
+      </details>
+      <details>
+        <summary data-i18n="s7.q2">Does it replace JasperGold or VC Formal?</summary>
+        <div><p data-i18n="s7.a2">No — it’s a complement, and it can wrap industrial-scale engines rather than beat them. Those tools own scale; Mununu occupies a different region of the map: branching-time properties like <code>AG EF good</code>, reactive controller synthesis, and embeddability behind a per-run API.</p></div>
+      </details>
+      <details>
+        <summary data-i18n="s7.q3">How does it handle LLM hallucinations in the control logic?</summary>
+        <div><p data-i18n="s7.a3">By keeping them out of the control path. Mununu synthesizes the control kernel correct-by-construction — a winning strategy that structurally cannot violate its specification — rather than checking hallucinated control logic after the fact. The checker confirms; it doesn’t rescue.</p></div>
+      </details>
+      <details>
+        <summary data-i18n="s7.q4">What can’t it do yet?</summary>
+        <div><p data-i18n="s7.a4">Full-SoC sign-off. Honest scale is block and FSM level, with an exact cone of roughly 40 bits. Above that, it returns ⊥ (undecided) rather than guessing — and it’s Alpha software. We’d rather abstain than bluff.</p></div>
+      </details>
+      <details>
+        <summary data-i18n="s7.q5">Is the LLM part included?</summary>
+        <div><p data-i18n="s7.a5">No — you bring the model. Mununu is the synthesis-and-verification oracle your model calls: it takes RTL and a spec, and returns verdicts, synthesized control kernels, and structured JSON counterexamples your model can consume.</p></div>
+      </details>
+      <details>
+        <summary data-i18n="s7.q6">Is it fast at synthesis?</summary>
+        <div><p data-i18n="s7.a6">Dedicated synthesizers synthesize faster. Mununu’s claim is the <em>integration</em>: synthesis and whole-system verification behind one embeddable API, with the kernel’s assumptions discharged against the actual assembled design.</p></div>
+      </details>
+    </div>
+  </section>
+
+  <!-- 8 · CTA band -->
+  <section class="cta-band">
+    <div class="wrap">
+      <h2 data-i18n="cta.h">Put the oracle inside your loop.</h2>
+      <p data-i18n="cta.p">One integration call: we’ll wire the API into your generate-verify-fix pipeline, against your own designs. <span class="badge-alpha">ALPHA</span></p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="mailto:vscorza@gmail.com?subject=Integration%20call%20—%20embed%20the%20oracle&body=Name%3A%0AOrg%3A%0AWhat%20are%20you%20verifying%3F%20" data-i18n="cta.eval">Embed the oracle — book an integration call</a>
+        <a class="btn btn-secondary" href="https://github.com/vscorza/mununu" data-i18n="cta.readdocs">Read the docs</a>
+        <a class="btn btn-secondary" href="https://github.com/vscorza/mununu">GitHub</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p><a class="wordmark" href="../">mununu<span class="tld">.</span></a> <span class="badge-alpha">ALPHA</span> <span data-i18n="footer.honest">— early software, honest verdicts.</span></p>
+    <p data-i18n="footer.soundness">Core soundness machine-checked in Lean 4 and Isabelle/HOL.</p>
+    <ul class="footer-links">
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="nav.docs">Docs</a></li>
+        <li><a href="https://marianocerrutti.substack.com/" data-i18n="nav.blog">Blog</a></li>
+      <li><a href="https://github.com/vscorza/mununu" data-i18n="footer.source">Source</a></li>
+      <li><a href="../ai-generated-rtl/" data-i18n="nav.airtl">AI-Generated RTL</a></li>
+      <li><a href="../defense/" data-i18n="nav.defense">Defense</a></li>
+      <li><a href="../aerospace/" data-i18n="nav.aerospace">Aerospace</a></li>
+      <li><a href="mailto:vscorza@gmail.com" data-i18n="nav.contact">Contact</a></li>
+    </ul>
+    <p data-i18n="footer.copyright">© 2026 Mununu. All rights reserved.</p>
+  </div>
+</footer>
+</body>
+</html>
