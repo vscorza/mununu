@@ -49,7 +49,7 @@ use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
 use crate::mu_calculus::Environment;
 use crate::mu_calculus::parser as mu_parser;
 use crate::mu_calculus::trit::Trit;
-use crate::verdict::PropertyVerdict;
+use crate::verdict::{PropertyVerdict, VacuityWitness, VerdictRefinement};
 
 /// Max CEGAR refinement iterations for the scalable recoverability path — a sensible
 /// default: a pure state-atom `AG EF` target either decides at the seed abstraction or
@@ -1071,6 +1071,72 @@ pub fn verify_recoverability_with_predicates(
     }
 }
 
+/// Phase 0 of the refined-verdicts plan (`.claude/plans/refined-verdicts-assumption-discovery.md`):
+/// the recoverability verdict PLUS a structured [`VerdictRefinement`] carried alongside it. Today it
+/// attaches a `Vacuous` witness (the target is never reachable) and the best-effort `bot_diagnosis`
+/// "why ⊥" hint; later phases add the config partition (capability A) and discovered assumptions
+/// (capability B) to the SAME object. The canonical [`PropertyVerdict`] is UNCHANGED — the refinement
+/// is diagnostic-only and never turns a ⊥ into a bare `Holds` (an assumption/config scope is not a
+/// sound unconditional verdict). Sidecar-free: operates on the same BTOR2 content the plain verb uses.
+pub fn verify_recoverability_refined(
+    btor2_content: &str,
+    good: &str,
+) -> (PropertyVerdict, VerdictRefinement) {
+    let verdict = verify_recoverability_with_predicates(btor2_content, good, &[])
+        .unwrap_or(PropertyVerdict::Unknown);
+    let mut refinement = VerdictRefinement::default();
+
+    // Vacuity probe — only for a non-`Holds` verdict (a `Holds` target is trivially reachable). A
+    // sound `Unreachable` from the reachability portfolio (never emitted on free-init state) means
+    // the target is never entered ⇒ the `AG EF(good)` verdict is degenerate.
+    if verdict != PropertyVerdict::Holds
+        && let Some(vac) = probe_vacuous(btor2_content, good)
+    {
+        refinement.vacuous = Some(vac);
+    }
+
+    // Structural "why ⊥ / what would decide it" hint — only meaningful when genuinely undecided.
+    if verdict == PropertyVerdict::Unknown {
+        let diag = diagnose_recoverability_bot(btor2_content, good);
+        if !diag.is_empty() {
+            refinement.bot_diagnosis = Some(diag);
+        }
+    }
+    (verdict, refinement)
+}
+
+/// SOUND vacuity probe: is `good` (a `REG == VALUE` atom) reachable from the initial state? Emits a
+/// `bad = (REG == VALUE)` monitor — via the `AG(REG != VALUE)` monitor, whose `bad` is exactly
+/// `!(REG != VALUE) = (REG == VALUE) = good` — and asks the reachability portfolio. A sound
+/// `Unreachable` ⇒ `good` is never reached ⇒ vacuous. `None` when the atom is not a `REG == VALUE`
+/// equality, or the probe cannot run (a hint is never load-bearing — never changes a verdict).
+fn probe_vacuous(btor2_content: &str, good: &str) -> Option<VacuityWitness> {
+    use crate::adapter::btor2::bad_monitor::emit_ag_state_atom_monitor;
+    use crate::adapter::reach_portfolio::{ReachVerdict, decide_reach_portfolio};
+    let (register, value) = match parse_predicate_expr(good).ok()? {
+        PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        } => (register, value),
+        _ => return None, // relational / inequality target: no vacuity determination here
+    };
+    let monitored =
+        emit_ag_state_atom_monitor(btor2_content, &register, CmpOp::Ne, value as u128, false)
+            .ok()?;
+    let file = crate::adapter::btor2::parser::parse(&monitored).ok()?;
+    match decide_reach_portfolio(&file).verdict {
+        ReachVerdict::Unreachable => Some(VacuityWitness {
+            good_unreachable: true,
+            note: format!(
+                "`{good}` is never reachable from the initial state — `AG EF({good})` is degenerate \
+                 (the recovery target is never entered); the verdict is vacuous, not a meaningful decide"
+            ),
+        }),
+        _ => None, // Reachable, or Unknown/Contradiction ⇒ not (soundly) vacuous
+    }
+}
+
 /// Harness / attribution seam — run ONLY the SPCR pre-pass ([`array_prophecy::spcr`]), then the
 /// exact ROBDD on the array-free result. Isolates SPCR's contribution, which is otherwise embedded
 /// inside [`verify_recoverability_scalable`] (so a `dflt`/`wp` HOLDS on an array-content case cannot
@@ -1194,7 +1260,7 @@ fn verify_recoverability_counter_abstracted(
 /// so a ⊥ becomes ACTIONABLE ("what would it take to decide this?") instead of a bare "don't know".
 /// Purely a diagnostic: it NEVER produces or changes a verdict. Localizes the structural obstacles in
 /// the good's recovery cone that the predicate abstraction cannot cross.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoverabilityBotDiagnosis {
     /// Down-counters that GATE the recovery (in the good's cone, not read by the good) whose descent
     /// is NOT ranking-certified — a fairness-gated reload or a non-affine descent: `(name, width)`.
@@ -3369,6 +3435,41 @@ mod tests {
         );
         assert!(diag.hint().contains("wide data/config state"));
         assert!(!diag.is_empty());
+    }
+
+    /// Refined verdict (Phase 0) — a HOLDS design carries an EMPTY refinement: the target is
+    /// recoverable (so not vacuous) and the verdict is definite (so no ⊥ hint). `flag` toggles, so
+    /// `AG EF(flag==0)` HOLDS.
+    #[test]
+    fn refined_verdict_holds_design_has_empty_refinement() {
+        const TOGGLE: &str =
+            "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 not 1 2\n6 next 1 2 5\n";
+        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0");
+        assert_eq!(verdict, PropertyVerdict::Holds);
+        assert!(
+            refinement.is_empty(),
+            "a definite, recoverable HOLDS needs no refinement: {refinement:?}"
+        );
+    }
+
+    /// Refined verdict (Phase 0) — a design whose target is NEVER reachable is flagged `Vacuous`:
+    /// `flag` is init 0 and stuck at 0 (`next = 0`), so `flag == 1` is unreachable and `AG EF(flag==1)`
+    /// is degenerate. The canonical verdict is NOT Holds; the refinement carries the vacuity witness.
+    #[test]
+    fn refined_verdict_vacuous_target_is_flagged() {
+        const STUCK: &str =
+            "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1");
+        assert_ne!(
+            verdict,
+            PropertyVerdict::Holds,
+            "a stuck-at-0 flag can never recover to 1"
+        );
+        let vac = refinement
+            .vacuous
+            .expect("an unreachable target must be flagged Vacuous");
+        assert!(vac.good_unreachable);
+        assert!(vac.note.contains("never reachable"));
     }
 
     /// Actionable-⊥ diagnosis — a recovery target riding only NARROW control state localizes NO

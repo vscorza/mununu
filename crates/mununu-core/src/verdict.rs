@@ -32,6 +32,110 @@ pub enum PropertyVerdict {
     Skipped,
 }
 
+/// A structured elaboration of a [`PropertyVerdict`], carried ALONGSIDE the canonical verdict —
+/// never replacing it. `None`/empty on the common path. This is how a bare `⊥`/`violated` becomes an
+/// *actionable* result: which configs hold, under what assumption it would hold, or that the target is
+/// simply never reachable. It follows the same contract as the cube-cell / countertrace detail Track I
+/// already carries: **a refinement is a diagnostic and NEVER changes the canonical verdict** — a
+/// config-scoped or assumption-scoped result keeps the canonical verdict `Unknown` (the honest
+/// unconditional answer; an assumption is not monotone for `AG EF`, so it cannot soundly transfer).
+///
+/// Phases (see `.claude/plans/refined-verdicts-assumption-discovery.md`): Phase 0 populates
+/// [`Self::vacuous`] + [`Self::bot_diagnosis`]; Phase 1 populates [`Self::config_partition`]; Phase 2
+/// populates [`Self::holds_under`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerdictRefinement {
+    /// The recovery target is never reachable from the initial state — `AG EF(good)` is degenerate
+    /// (the target is never entered), so the plain verdict is misleading. A SOUND witness (the
+    /// reachability portfolio proved `good` unreachable; only emitted when that proof is sound —
+    /// i.e. not on free-init state, per `ReachVerdict::Unreachable`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vacuous: Option<VacuityWitness>,
+    /// A config-scoped partition: the property depends on config values (Phase 1 / capability A).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub config_partition: Option<ConfigPartition>,
+    /// Environment assumption(s) under which the property holds (Phase 2 / capability B). Each is a
+    /// CONDITIONAL result (`HoldsUnder(φ)`) — the canonical verdict stays `Unknown`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub holds_under: Vec<DiscoveredAssumption>,
+    /// The best-effort structural "why ⊥ / what would decide it" hint (promoted from the standalone
+    /// [`crate::adapter::recoverability::diagnose_recoverability_bot`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bot_diagnosis: Option<crate::adapter::recoverability::RecoverabilityBotDiagnosis>,
+}
+
+impl VerdictRefinement {
+    /// True when no refinement was produced — the bare canonical verdict stands.
+    pub fn is_empty(&self) -> bool {
+        self.vacuous.is_none()
+            && self.config_partition.is_none()
+            && self.holds_under.is_empty()
+            && self.bot_diagnosis.is_none()
+    }
+}
+
+/// See [`VerdictRefinement::vacuous`]. The recovery target is never reached.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VacuityWitness {
+    /// `good` is unreachable from the initial state (a sound reachability-portfolio `Unreachable`).
+    pub good_unreachable: bool,
+    /// A one-line, user-facing explanation.
+    pub note: String,
+}
+
+/// A concrete assignment of config leaves to values — one point in the config space.
+pub type ConfigValuation = Vec<(String, u64)>;
+
+/// See [`VerdictRefinement::config_partition`]. The property's verdict partitioned over the config
+/// leaves the recovery rides on. Sound per cell (each is a concrete pinned model decided by
+/// exact-symbolic); `exhaustive` is true ONLY when the enumerated config set is the complete reachable
+/// set. (Populated in Phase 1.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConfigPartition {
+    /// The config leaves case-split on: `(name, width)`.
+    pub config_atoms: Vec<(String, u32)>,
+    /// Config valuations for which the property HOLDS.
+    pub holds: Vec<ConfigValuation>,
+    /// … for which it is VIOLATED.
+    pub violated: Vec<ConfigValuation>,
+    /// … for which it stayed ⊥ even pinned.
+    pub unknown: Vec<ConfigValuation>,
+    /// … for which the target is vacuous (never reached under that config).
+    pub vacuous: Vec<ConfigValuation>,
+    /// True iff the enumerated config set is the COMPLETE reachable config set (else the partition is
+    /// over the enumerated/reachable subset only).
+    pub exhaustive: bool,
+    /// The deciding engine, for provenance (e.g. `"exact-symbolic per-config pin"`).
+    pub engine: String,
+}
+
+/// The shape of a discovered environment assumption.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssumptionKind {
+    /// An input held at a constant value (`en = 1`).
+    InputHold,
+    /// A finite input schedule (a command sequence).
+    InputSchedule,
+    /// "Reset is eventually asserted."
+    ResetEventually,
+    /// A synthesized environment strategy (Mealy contract).
+    EnvStrategy,
+}
+
+/// See [`VerdictRefinement::holds_under`]. A CONDITIONAL result: the property holds under `phi`.
+/// (Populated in Phase 2.)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredAssumption {
+    /// A human-readable predicate over named inputs (Phase 2b may carry a typed schedule/strategy).
+    pub phi: String,
+    /// The assumption's shape.
+    pub kind: AssumptionKind,
+    /// True iff `good` is genuinely reached under `phi` (the non-vacuity gate passed).
+    pub non_vacuous: bool,
+    /// The engine that discovered it, for provenance.
+    pub engine: String,
+}
+
 impl PropertyVerdict {
     /// The stable lowercase label — identical across CLI, HTTP API, and UI.
     pub fn as_str(self) -> &'static str {
@@ -82,6 +186,46 @@ impl From<ExactVerdict> for PropertyVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verdict_refinement_default_is_empty_and_serde_round_trips() {
+        // Common path: an empty refinement serializes to `{}` (every field is skip-if-empty) so it is
+        // a zero-cost optional detail on the surfaces.
+        let empty = VerdictRefinement::default();
+        assert!(empty.is_empty());
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+
+        // A populated refinement (vacuity + a config partition + an assumption) round-trips.
+        let full = VerdictRefinement {
+            vacuous: Some(VacuityWitness {
+                good_unreachable: true,
+                note: "never reached".into(),
+            }),
+            config_partition: Some(ConfigPartition {
+                config_atoms: vec![("cfg".into(), 4)],
+                holds: vec![vec![("cfg".into(), 15)]],
+                violated: vec![vec![("cfg".into(), 0)]],
+                unknown: vec![],
+                vacuous: vec![],
+                exhaustive: true,
+                engine: "exact-symbolic per-config pin".into(),
+            }),
+            holds_under: vec![DiscoveredAssumption {
+                phi: "rst eventually".into(),
+                kind: AssumptionKind::ResetEventually,
+                non_vacuous: true,
+                engine: "native-bmc".into(),
+            }],
+            bot_diagnosis: None,
+        };
+        assert!(!full.is_empty());
+        let json = serde_json::to_string(&full).unwrap();
+        let back: VerdictRefinement = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            full, back,
+            "VerdictRefinement must survive a JSON round-trip"
+        );
+    }
 
     #[test]
     fn labels_are_the_canonical_vocabulary() {
