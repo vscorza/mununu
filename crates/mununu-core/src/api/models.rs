@@ -1008,6 +1008,11 @@ pub struct Btor2VerifyRecoverabilityRequest {
     /// (over the ~40-bit cone cap); the escalation is automatic even with none.
     #[serde(default)]
     pub predicates: Vec<String>,
+    /// Also compute a structured [`crate::verdict::VerdictRefinement`] alongside the verdict — a
+    /// `vacuous` witness when the target is never reachable, and a "why ⊥" hint. Diagnostic-only:
+    /// it never changes the canonical verdict. (Mirrors the CLI `--refine`.)
+    #[serde(default)]
+    pub refine: bool,
 }
 
 /// Response for `POST /api/v1/btor2/verify-recoverability`.
@@ -1020,6 +1025,10 @@ pub struct Btor2VerifyRecoverabilityResponse {
     pub verdict: String,
     /// The decided property, echoed for provenance: `AG EF (<target>)`.
     pub property: String,
+    /// The structured refinement, when `refine` was requested and it produced one. `None` otherwise.
+    /// Diagnostic detail carried ALONGSIDE the verdict — never changes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<crate::verdict::VerdictRefinement>,
 }
 
 /// Request for the auto FSM illegal-encoding scan
@@ -1163,6 +1172,10 @@ pub struct SvVerifyRecoverabilityRequest {
     /// `"NAME:REGISTER=VALUE"` (P2 Slice 1). Used only when the exact engine abstains.
     #[serde(default)]
     pub predicates: Vec<String>,
+    /// Also compute a structured `refinement` alongside the verdict (mirrors the CLI `--refine`).
+    /// Diagnostic-only — never changes the canonical verdict.
+    #[serde(default)]
+    pub refine: bool,
 }
 
 /// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width

@@ -789,7 +789,8 @@ pub async fn btor2_verify_recoverability_handler(
     Json(request): Json<Btor2VerifyRecoverabilityRequest>,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
     use crate::adapter::recoverability::{
-        parse_extra_predicate, recoverability_property_str, verify_recoverability_with_predicates,
+        parse_extra_predicate, recoverability_property_str, verify_recoverability_refined,
+        verify_recoverability_with_predicates,
     };
 
     let extra = request
@@ -801,15 +802,23 @@ pub async fn btor2_verify_recoverability_handler(
             message,
             details: None,
         })?;
-    let verdict = verify_recoverability_with_predicates(&request.content, &request.target, &extra)
-        .map_err(|message| ApiError::BadRequest {
-            message,
-            details: None,
-        })?;
+    // `refine` (refined-verdicts Phase 0): canonical verdict PLUS a diagnostic-only refinement.
+    let (verdict, refinement) = if request.refine {
+        let (v, r) = verify_recoverability_refined(&request.content, &request.target, &extra);
+        (v, Some(r))
+    } else {
+        let v = verify_recoverability_with_predicates(&request.content, &request.target, &extra)
+            .map_err(|message| ApiError::BadRequest {
+                message,
+                details: None,
+            })?;
+        (v, None)
+    };
 
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
         property: recoverability_property_str(&request.target),
+        refinement,
     }))
 }
 
@@ -1000,7 +1009,9 @@ pub async fn sv_verify_recoverability_handler(
     Json(request): Json<SvVerifyRecoverabilityRequest>,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
     use crate::adapter::recoverability::{parse_extra_predicate, recoverability_property_str};
-    use crate::adapter::sv_verify::{SvLift, sv_verify_recoverability_with_predicates};
+    use crate::adapter::sv_verify::{
+        SvLift, sv_verify_recoverability_refined, sv_verify_recoverability_with_predicates,
+    };
 
     let property = recoverability_property_str(&request.target);
     let extra = request
@@ -1031,14 +1042,27 @@ pub async fn sv_verify_recoverability_handler(
             crate::adapter::yosys::SvFrontend::Auto
         },
     };
-    let verdict = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra)
-        .map_err(|message| ApiError::BadRequest {
-            message,
-            details: None,
-        })?;
+    let (verdict, refinement) = if request.refine {
+        let (v, r) = sv_verify_recoverability_refined(&lift, &request.target, &extra).map_err(
+            |message| ApiError::BadRequest {
+                message,
+                details: None,
+            },
+        )?;
+        (v, Some(r))
+    } else {
+        let v = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra).map_err(
+            |message| ApiError::BadRequest {
+                message,
+                details: None,
+            },
+        )?;
+        (v, None)
+    };
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
         property,
+        refinement,
     }))
 }
 
@@ -4421,12 +4445,35 @@ members = ["x"]
             content: LIVENESS_STALLER.to_string(),
             target: "st == 0".to_string(),
             predicates: Vec::new(),
+            refine: false,
         };
         let Json(out) = btor2_verify_recoverability_handler(Json(request))
             .await
             .expect("verify-recoverability runs");
         assert_eq!(out.verdict, "violated", "response: {out:?}");
         assert_eq!(out.property, "AG EF (st == 0)");
+        assert!(out.refinement.is_none(), "no refinement without `refine`");
+    }
+
+    /// `refine: true` carries a structured refinement alongside the verdict (refined-verdicts
+    /// Phase 0). A stuck-at-0 flag can never recover to 1, so the target is flagged `vacuous`.
+    #[tokio::test]
+    async fn btor2_verify_recoverability_refine_flags_vacuous_target() {
+        const STUCK: &str =
+            "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let request = Btor2VerifyRecoverabilityRequest {
+            content: STUCK.to_string(),
+            target: "flag == 1".to_string(),
+            predicates: Vec::new(),
+            refine: true,
+        };
+        let Json(out) = btor2_verify_recoverability_handler(Json(request))
+            .await
+            .expect("verify-recoverability --refine runs");
+        assert_ne!(out.verdict, "holds");
+        let refinement = out.refinement.expect("refine returns a refinement");
+        let vac = refinement.vacuous.expect("unreachable target is vacuous");
+        assert!(vac.good_unreachable);
     }
 
     #[tokio::test]
@@ -4435,6 +4482,7 @@ members = ["x"]
             content: LIVENESS_STALLER.to_string(),
             target: "definitely not an atom".to_string(),
             predicates: Vec::new(),
+            refine: false,
         };
         let err = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4528,6 +4576,7 @@ members = ["x"]
             use_slang: false,
             target: "not an atom !!".to_string(),
             predicates: Vec::new(),
+            refine: false,
         };
         let err = sv_verify_recoverability_handler(Json(request))
             .await
