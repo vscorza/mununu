@@ -1082,10 +1082,21 @@ pub fn verify_recoverability_refined(
     btor2_content: &str,
     good: &str,
     extra_predicates: &[PredicateSpec],
+    config_specs: &[(String, Vec<u64>)],
 ) -> (PropertyVerdict, VerdictRefinement) {
     let verdict = verify_recoverability_with_predicates(btor2_content, good, extra_predicates)
         .unwrap_or(PropertyVerdict::Unknown);
     let mut refinement = VerdictRefinement::default();
+
+    // Config-partition (capability A) — when the caller names config inputs, partition the verdict
+    // over their values (`--config-values`). A concrete decide per config, so it composes with any
+    // canonical verdict (it can even reveal a config that breaks a HOLDS). `None` ⇒ config-independent
+    // or over the enumeration cap.
+    if !config_specs.is_empty()
+        && let Some(part) = config_partition(btor2_content, good, config_specs)
+    {
+        refinement.config_partition = Some(part);
+    }
 
     // Vacuity probe — only for a non-`Holds` verdict (a `Holds` target is trivially reachable). A
     // sound `Unreachable` from the reachability portfolio (never emitted on free-init state) means
@@ -1104,6 +1115,35 @@ pub fn verify_recoverability_refined(
         }
     }
     (verdict, refinement)
+}
+
+/// Parse `--config-values`-style entries `"NAME=v1,v2,…"` into config-partition specs
+/// `(input_name, [values])`. Reuses the decimal-value convention; a malformed entry is an error.
+pub fn parse_config_value_specs(entries: &[String]) -> Result<Vec<(String, Vec<u64>)>, String> {
+    entries
+        .iter()
+        .map(|e| {
+            let (name, vals) = e
+                .split_once('=')
+                .ok_or_else(|| format!("--config-values `{e}`: expected `NAME=v1,v2,...`"))?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!("--config-values `{e}`: empty signal name"));
+            }
+            let values = vals
+                .split(',')
+                .map(|v| {
+                    v.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("--config-values `{e}`: `{v}` is not a decimal value"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if values.is_empty() {
+                return Err(format!("--config-values `{e}`: no values listed"));
+            }
+            Ok((name.to_string(), values))
+        })
+        .collect()
 }
 
 /// SOUND vacuity probe: is `good` (a `REG == VALUE` atom) reachable from the initial state? Emits a
@@ -3556,7 +3596,7 @@ mod tests {
     fn refined_verdict_holds_design_has_empty_refinement() {
         const TOGGLE: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 not 1 2\n6 next 1 2 5\n";
-        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0", &[]);
+        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0", &[], &[]);
         assert_eq!(verdict, PropertyVerdict::Holds);
         assert!(
             refinement.is_empty(),
@@ -3571,7 +3611,7 @@ mod tests {
     fn refined_verdict_vacuous_target_is_flagged() {
         const STUCK: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
-        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1", &[]);
+        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1", &[], &[]);
         assert_ne!(
             verdict,
             PropertyVerdict::Holds,

@@ -142,6 +142,7 @@ pub fn sv_verify_recoverability_refined(
     lift: &SvLift,
     target: &str,
     extra_predicates: &[PredicateSpec],
+    config_specs: &[(String, Vec<u64>)],
 ) -> Result<(PropertyVerdict, crate::verdict::VerdictRefinement), String> {
     parse_predicate_expr(target).map_err(|e| {
         format!("recoverability target `{target}` is not a register-comparison atom: {e:?}")
@@ -152,6 +153,7 @@ pub fn sv_verify_recoverability_refined(
             &btor2,
             target,
             extra_predicates,
+            config_specs,
         ),
     )
 }

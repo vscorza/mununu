@@ -731,10 +731,15 @@ struct Btor2VerifyRecoverabilityArgs {
     predicate: Vec<String>,
     /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
     /// is never reachable (the `AG EF` is degenerate), and a best-effort "why ⊥ / what would decide it"
-    /// hint. Diagnostic-only — it never changes the canonical verdict. (The config-partition +
-    /// discovered-assumption refinements arrive in later phases.)
+    /// hint. Diagnostic-only — it never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,
+    /// Config-partition (refined-verdicts capability A): name config INPUTS to split the verdict over,
+    /// each `NAME=v1,v2,...` (repeatable). The refinement then reports a `config_partition` — "holds
+    /// for configs {A}, violated for {B}" — decided exactly per config (sound per cell). Implies the
+    /// refined output. Best for a NARROW / few-value config (the cross-product is capped).
+    #[arg(long = "config-values", value_name = "NAME=v1,v2,...")]
+    config_values: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -1814,9 +1819,14 @@ struct SvVerifyRecoverabilityArgs {
     predicate: Vec<String>,
     /// Also emit a structured `refinement` alongside the verdict: a `vacuous` witness when the target
     /// is never reachable, and a best-effort "why ⊥ / what would decide it" hint. Diagnostic-only —
-    /// never changes the canonical verdict. (Config-partition + assumption discovery arrive later.)
+    /// never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,
+    /// Config-partition (refined-verdicts capability A): name config INPUTS to split the verdict over,
+    /// each `NAME=v1,v2,...` (repeatable) → the refinement reports a `config_partition`, decided exactly
+    /// per config. Implies the refined output. Best for a narrow / few-value config (cross-product capped).
+    #[arg(long = "config-values", value_name = "NAME=v1,v2,...")]
+    config_values: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2688,8 +2698,8 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// `POST /api/v1/btor2/verify-recoverability`.
 fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<(), String> {
     use mununu_core::adapter::recoverability::{
-        parse_extra_predicate, recoverability_property_str, verify_recoverability_refined,
-        verify_recoverability_with_predicates,
+        parse_config_value_specs, parse_extra_predicate, recoverability_property_str,
+        verify_recoverability_refined, verify_recoverability_with_predicates,
     };
 
     let content = std::fs::read_to_string(&args.file)
@@ -2699,15 +2709,18 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
         .iter()
         .map(|s| parse_extra_predicate(s))
         .collect::<Result<Vec<_>, _>>()?;
+    let config_specs = parse_config_value_specs(&args.config_values)?;
 
     let mut summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "property": recoverability_property_str(&args.target),
     });
-    // `--refine` (refined-verdicts Phase 0): the canonical verdict PLUS a structured, diagnostic-only
-    // refinement carried alongside it (never changes the verdict). Without it, the plain verdict path.
-    let verdict = if args.refine {
-        let (verdict, refinement) = verify_recoverability_refined(&content, &args.target, &extra);
+    // `--refine` / `--config-values` (refined-verdicts): the canonical verdict PLUS a structured,
+    // diagnostic-only refinement (Vacuous / bot-diagnosis / config-partition) — never changes the
+    // verdict. Without either, the plain verdict path.
+    let verdict = if args.refine || !config_specs.is_empty() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(&content, &args.target, &extra, &config_specs);
         summary["refinement"] =
             serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
         verdict
@@ -5311,7 +5324,7 @@ fn sv_verify_liveness_all(args: SvVerifyLivenessAllArgs) -> Result<(), String> {
 /// `mununu sv verify-recoverability` — lift SV and decide `AG EF good`.
 fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), String> {
     use mununu_core::adapter::recoverability::{
-        parse_extra_predicate, recoverability_property_str,
+        parse_config_value_specs, parse_extra_predicate, recoverability_property_str,
     };
     use mununu_core::adapter::sv_verify::{
         sv_verify_recoverability_refined, sv_verify_recoverability_with_predicates,
@@ -5323,14 +5336,16 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
         .iter()
         .map(|s| parse_extra_predicate(s))
         .collect::<Result<Vec<_>, _>>()?;
+    let config_specs = parse_config_value_specs(&args.config_values)?;
     let lift = read_sv_lift(&args.lift)?;
 
     let mut summary = serde_json::json!({
         "file": file,
         "property": recoverability_property_str(&args.target),
     });
-    let verdict = if args.refine {
-        let (verdict, refinement) = sv_verify_recoverability_refined(&lift, &args.target, &extra)?;
+    let verdict = if args.refine || !config_specs.is_empty() {
+        let (verdict, refinement) =
+            sv_verify_recoverability_refined(&lift, &args.target, &extra, &config_specs)?;
         summary["refinement"] =
             serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
         verdict
