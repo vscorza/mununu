@@ -1088,13 +1088,17 @@ pub fn verify_recoverability_refined(
         .unwrap_or(PropertyVerdict::Unknown);
     let mut refinement = VerdictRefinement::default();
 
-    // Config-partition (capability A) — when the caller names config inputs, partition the verdict
-    // over their values (`--config-values`). A concrete decide per config, so it composes with any
-    // canonical verdict (it can even reveal a config that breaks a HOLDS). `None` ⇒ config-independent
-    // or over the enumeration cap.
-    if !config_specs.is_empty()
-        && let Some(part) = config_partition(btor2_content, good, config_specs)
-    {
+    // Config-partition (capability A) — partition the verdict over the config the recovery rides on.
+    // When the caller NAMES config inputs (`--config-values`), partition over their values; otherwise
+    // (bare `--refine`) AUTO-identify the config axis (the detected reset). Either way it is a concrete
+    // decide per config, so it composes with any canonical verdict (it can even reveal a config that
+    // breaks a HOLDS). `None` ⇒ config-independent, no reset detected, or over the enumeration cap.
+    let part = if config_specs.is_empty() {
+        auto_config_partition(btor2_content, good)
+    } else {
+        config_partition(btor2_content, good, config_specs)
+    };
+    if let Some(part) = part {
         refinement.config_partition = Some(part);
     }
 
@@ -1245,6 +1249,38 @@ pub fn config_partition(
         .filter(|c| !c.is_empty())
         .count();
     (nonempty >= 2).then_some(part)
+}
+
+/// Capability A, slice 2b — AUTO config-atom identification. When the caller does not name config
+/// inputs (bare `--refine`), the design's DETECTED RESET is the clearest, lowest-noise config axis:
+/// it is 1-bit (trivially enumerable), structurally identifiable (the reset mux — [`detect_resets`]),
+/// and drives every state cell — so partitioning `AG EF(good)` over {reset-held, operational} surfaces
+/// the branching pair "recoverable held-in-reset / trapped operationally" without the user naming
+/// anything (the OpenTitan `aes_cipher` / `csrng` case). Returns `None` when no reset is detected, when
+/// there are implausibly many resets to enumerate, or when the property is reset-INDEPENDENT
+/// ([`config_partition`] already collapses that to `None`).
+///
+/// Wider / free config atoms (a ≥8-bit mode datapath, an arbitrary config register) exceed the
+/// enumeration cap and need the symbolic `∃config` path — deferred; only the reset axis is
+/// auto-enumerated here.
+///
+/// **Engine (§16):** `exact-symbolic` per-reset-value pin (same as [`config_partition`]); the reset is
+/// discovered by the structural [`crate::adapter::fsm_scan::detect_resets`] reset-mux scan — no tool,
+/// sidecar-free.
+fn auto_config_partition(btor2_content: &str, good: &str) -> Option<ConfigPartition> {
+    let file = crate::adapter::btor2::parser::parse(btor2_content).ok()?;
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    let resets = crate::adapter::fsm_scan::detect_resets(&file, &symbols);
+    // 1-bit resets: 2^n valuations. Keep well under the 256 cap and skip a design with an implausible
+    // number of distinct reset inputs (not the single-reset axis this targets).
+    if resets.is_empty() || resets.len() > 4 {
+        return None;
+    }
+    // Partition over BOTH reset levels {0,1} (`detect_resets` yields only the inactive level; the
+    // property may hold at one and be violated/vacuous at the other — that IS the branching pair to
+    // surface). `config_partition` reports only when the cells genuinely differ.
+    let specs: Vec<(String, Vec<u64>)> = resets.into_iter().map(|(n, _)| (n, vec![0, 1])).collect();
+    config_partition(btor2_content, good, &specs)
 }
 
 /// The cross-product of the per-input candidate value lists → every config valuation.
@@ -3697,6 +3733,96 @@ mod tests {
             .is_none(),
             "recovery independent of `mode` ⇒ no ConfigDependent partition"
         );
+    }
+
+    // `busy` sets on `start` and TRAPS at 1 (operational logic `busy | (start & !busy)` never clears);
+    // the active-low reset `rst_n` (mux `ite(rst_n, op, 0)`) clears it. So held-in-reset (rst_n=0)
+    // `AG EF(busy==0)` HOLDS; operationally (rst_n=1) it is VIOLATED — the branching pair the auto
+    // reset-partition surfaces WITHOUT the user naming `rst_n`.
+    const RESET_DEP: &str = "\
+1 sort bitvec 1
+2 input 1 rst_n
+3 input 1 start
+4 state 1 busy
+5 zero 1
+6 init 1 4 5
+7 not 1 4
+8 and 1 3 7
+9 or 1 4 8
+10 ite 1 2 9 5
+11 next 1 4 10
+";
+
+    /// Slice 2b — AUTO config identification. With NO user-named config, the design's detected reset
+    /// (`rst_n`) is the config axis: `auto_config_partition` partitions `AG EF(busy==0)` over {reset,
+    /// operational} → `ConfigDependent{holds:[rst_n=0], violated:[rst_n=1]}` (the OpenTitan pattern,
+    /// reproduced synthetically).
+    #[test]
+    fn auto_config_partition_reveals_reset_dependent_recoverability() {
+        let part = auto_config_partition(RESET_DEP, "busy == 0")
+            .expect("recovery depends on the detected reset ⇒ a ConfigDependent partition");
+        assert_eq!(
+            part.holds,
+            vec![vec![("rst_n".to_string(), 0)]],
+            "held-in-reset (rst_n=0) recovers"
+        );
+        assert_eq!(
+            part.violated,
+            vec![vec![("rst_n".to_string(), 1)]],
+            "operationally (rst_n=1) `busy` traps"
+        );
+        assert!(part.unknown.is_empty() && part.vacuous.is_empty());
+    }
+
+    /// Slice 2b control — a design whose recovery does NOT depend on its reset (`busy` always clears)
+    /// yields NO auto partition: reset-independent, the bare verdict already says it.
+    #[test]
+    fn auto_config_partition_none_when_reset_independent() {
+        const RESET_INDEP: &str = "\
+1 sort bitvec 1
+2 input 1 rst_n
+3 input 1 start
+4 state 1 busy
+5 zero 1
+6 init 1 4 5
+7 not 1 4
+8 and 1 3 7
+9 ite 1 2 8 5
+10 next 1 4 9
+";
+        assert!(
+            auto_config_partition(RESET_INDEP, "busy == 0").is_none(),
+            "recovery independent of the reset ⇒ no auto partition"
+        );
+    }
+
+    /// Slice 2b control — no reset input, no reset mux ⇒ nothing to auto-identify. (The `mode`-gated
+    /// MODE_DEP IS config-dependent, but on a config REGISTER auto cannot name; the user must pass
+    /// `--config-values mode=…`. This asserts auto stays silent rather than guessing.)
+    #[test]
+    fn auto_config_partition_none_without_a_reset() {
+        assert!(
+            auto_config_partition(MODE_DEP, "busy == 0").is_none(),
+            "no reset detected ⇒ auto abstains (mode is a config register, named via --config-values)"
+        );
+    }
+
+    /// Slice 2b end-to-end — bare `--refine` (empty `config_specs`) auto-populates `config_partition`
+    /// from the detected reset. The canonical verdict stays HOLDS (the free reset can always recover),
+    /// while the refinement reveals the operational trap.
+    #[test]
+    fn verify_recoverability_refined_auto_populates_config_partition_from_reset() {
+        let (verdict, refinement) = verify_recoverability_refined(RESET_DEP, "busy == 0", &[], &[]);
+        assert_eq!(
+            verdict,
+            PropertyVerdict::Holds,
+            "free reset ⇒ EF(busy==0) from every state ⇒ AG EF HOLDS"
+        );
+        let part = refinement
+            .config_partition
+            .expect("bare --refine auto-identifies the reset config axis");
+        assert_eq!(part.holds, vec![vec![("rst_n".to_string(), 0)]]);
+        assert_eq!(part.violated, vec![vec![("rst_n".to_string(), 1)]]);
     }
 
     /// Actionable-⊥ diagnosis — a recovery target riding only NARROW control state localizes NO
