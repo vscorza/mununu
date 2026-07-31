@@ -19,8 +19,9 @@
 //! and composes with [`crate::adapter::btor2::kmts_lift::predicate_cube_lift`] /
 //! [`crate::adapter::btor2::bit_blast`], both of which re-parse the text.
 //!
-//! Reset signals are 1-bit, so only `zero`/`one` constants are emitted; a pin
-//! value other than 0 is treated as 1.
+//! Reset signals are 1-bit → `zero`/`one`; a MULTI-BIT pin value (≥2, e.g. a `mode`
+//! select for the config-partition path) becomes a `constd <sid> <value>` at the
+//! input's sort. So the same helper concretizes a reset OR an arbitrary config input.
 
 use std::collections::HashMap;
 
@@ -72,8 +73,16 @@ fn try_pin_line(line: &str, want: &HashMap<&str, u64>) -> Option<String> {
         return None;
     }
     let value = *want.get(sym)?;
-    let konst = if value == 0 { "zero" } else { "one" };
-    Some(format!("{nid} {konst} {sid} {sym}"))
+    // 0/1 keep the reset-gating `zero`/`one` spelling; a MULTI-BIT config value (≥2, e.g. a `mode`
+    // select for the config-partition path) becomes a `constd` of that value at the input's sort.
+    // `constd sid 0`/`constd sid 1` would be equivalent — the special cases just preserve the existing
+    // reset-gating output the tests pin on.
+    let line = match value {
+        0 => format!("{nid} zero {sid} {sym}"),
+        1 => format!("{nid} one {sid} {sym}"),
+        v => format!("{nid} constd {sid} {v}"),
+    };
+    Some(line)
 }
 
 #[cfg(test)]
@@ -108,6 +117,19 @@ mod tests {
             "active-high reset → zero: {out}"
         );
         assert_eq!(pinned, vec!["rst=0".to_string()]);
+    }
+
+    #[test]
+    fn pins_multi_bit_config_input_to_constd() {
+        // A 2-bit `mode` config input pinned to 3 → `constd` of 3 (not `one`, which would be 1).
+        let btor2 = "1 sort bitvec 2\n2 input 1 mode\n";
+        let (out, pinned) = pin_inputs_to_constants(btor2, &[("mode".into(), 3)]);
+        assert!(
+            out.contains("2 constd 1 3"),
+            "mode pinned to constd 3: {out}"
+        );
+        assert!(!out.contains("2 input 1 mode"));
+        assert_eq!(pinned, vec!["mode=3".to_string()]);
     }
 
     #[test]
