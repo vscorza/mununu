@@ -2307,16 +2307,22 @@ fn init_tracing(quiet: bool) {
 
             tracing::info!(
                 log_file = %log_file.display(),
-                "Logging initialized. Logs are written to both stdout and file."
+                "Logging initialized. Logs are written to both stderr and file."
             );
         }
         Err(e) => {
             eprintln!(
-                "Warning: Failed to set up file logging ({:?}): {}. Logs will only go to stdout.",
+                "Warning: Failed to set up file logging ({:?}): {}. Logs will only go to stderr.",
                 log_file, e
             );
-            // Fall back to stdout-only logging
-            let builder = fmt().with_env_filter(filter).with_target(false).compact();
+            // Fall back to STDERR-only logging. `fmt()`'s default writer is STDOUT, which would
+            // pollute the JSON result stream (`mununu … | jq` breaks) whenever the `logs/` dir is
+            // unwritable (read-only CWD / sandbox / CI). stdout is reserved for the command's data.
+            let builder = fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .compact();
             let _ = builder.try_init();
         }
     }
