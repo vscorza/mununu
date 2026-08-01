@@ -6,6 +6,7 @@
 
 use crate::clts::{Clts, IdStorage, StateId, Transition};
 
+pub mod env_enforce;
 pub mod evaluator;
 pub mod gr1;
 pub mod gr1_build;
