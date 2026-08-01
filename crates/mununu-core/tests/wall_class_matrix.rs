@@ -903,3 +903,90 @@ fn env_strategy_marginal_reach_over_constant_hold() {
         r.holds_under
     );
 }
+
+/// P2.5-E §0.7 — MEASURE-FIRST scan (gates T2/T3). Question: does a REAL-RTL ⊥/VIOLATED recoverability
+/// case have an environment strategy (`exact_env_strategy_exists = Some(true)`) that rescues a NON-Holds
+/// base — i.e. env-strategy has marginal reach beyond the shipped memoryless constant-hold? If only the
+/// synthetic POSITIONAL_TRAP shows the gap and no real RTL row does, the positional/general strategy is a
+/// SYNTHETIC-ONLY capability (the binary-landscape risk) → T2/T3 stay documented-not-headlined.
+/// `#[ignore]` — run on demand: `cargo test -p mununu-core --test wall_class_matrix -- --ignored --nocapture env_strategy_positional_marginal_reach_scan`
+#[test]
+#[ignore]
+#[allow(clippy::type_complexity)] // the scan's row tuple is local + self-documenting
+fn env_strategy_positional_marginal_reach_scan() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_exists;
+    use mununu_core::mu_calculus::parser;
+
+    // Synthetic positive control: per-state safe input, no constant hold works (T1's marginal case).
+    const POSITIONAL_TRAP: &str = "\
+1 sort bitvec 2\n2 sort bitvec 1\n3 input 2 x\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 one 1\n8 constd 1 2\n9 constd 1 3\n10 eq 2 4 5\n11 eq 2 4 7\n12 eq 2 4 8\n13 ite 1 3 9 7\n14 ite 1 3 8 9\n15 ite 1 3 9 5\n16 ite 1 12 15 9\n17 ite 1 11 14 16\n18 ite 1 10 13 17\n19 next 1 4 18\n";
+
+    // `exact_env_strategy_exists` applies the `env_enforce` rewrite internally, so the scan passes the
+    // plain recoverability formula.
+    let recov =
+        |good: &str| parser::parse(&format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)")).unwrap();
+    let rows: Vec<(&str, &str, &str, &[(&str, u64)])> = vec![
+        (
+            "POSITIONAL_TRAP (synthetic control)",
+            POSITIONAL_TRAP,
+            "st == 0",
+            &[],
+        ),
+        ("STALLER (uncond trap, synthetic)", STALLER, "st == 0", &[]),
+        (
+            "aes_cipher (free)",
+            AES_CIPHER,
+            "aes_cipher_ctrl_cs == 9",
+            &[],
+        ),
+        (
+            "aes_cipher (operational rst_ni=1)",
+            AES_CIPHER,
+            "aes_cipher_ctrl_cs == 9",
+            &[("rst_ni", 1)],
+        ),
+        (
+            "csrng (operational rst_ni=1)",
+            CSRNG,
+            "state_q == 55",
+            &[("rst_ni", 1)],
+        ),
+        (
+            "aes_ctr (operational rst_ni=1)",
+            AES_CTR,
+            "aes_ctr_cs == 14",
+            &[("rst_ni", 1)],
+        ),
+    ];
+    println!("\n=== P2.5-E §0.7 env-strategy marginal-reach scan ===");
+    let mut real_gap = 0;
+    for (name, btor2, good, pins) in rows {
+        let src = if pins.is_empty() {
+            btor2.to_string()
+        } else {
+            let p: Vec<(String, u64)> = pins.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+            pin_inputs_to_constants(btor2, &p).0
+        };
+        let base = verify_recoverability(&src, good);
+        let exists = exact_env_strategy_exists(&src, &recov(good));
+        let non_holds = !matches!(base, Ok(PropertyVerdict::Holds));
+        let gap = matches!(exists, Ok(Some(true))) && non_holds;
+        if gap && !name.contains("synthetic") {
+            real_gap += 1;
+        }
+        println!(
+            "{name:38} base={:?}  env_strategy_exists={:?}  {}",
+            base.as_ref().map(|v| v.as_str()).unwrap_or("Err"),
+            exists,
+            if gap {
+                "<-- env-strategy rescues a NON-Holds row"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "\nreal-RTL rows where env-strategy rescues a non-Holds base: {real_gap} \
+         (0 ⇒ positional/general strategy is SYNTHETIC-ONLY ⇒ T2/T3 documented-not-headlined)\n"
+    );
+}
