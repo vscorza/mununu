@@ -256,6 +256,14 @@ const AES_CTR: &str = include_str!("fixtures/wall_classes/aes_ctr_fsm.btor");
 // (progress) — no constant hold works. Free-input `AG EF(state_q==44)` HOLDS (∃ the positional path).
 const EDN_BOOT: &str = include_str!("fixtures/wall_classes/edn_boot_sm.btor");
 
+// RTL — the OpenTitan CSRNG app-command state machine, extracted (verbatim FSM transitions) to
+// examples/recoverability/csrng_main_sm_fsm.sv and lifted (name-preserving, distinct from the anonymous
+// CSRNG fixture above). This is edn's MONOTONE A/B CONTROL: reaching MainSmCmdVld (state_q==16) is a
+// straight assert-to-progress pipeline (Idle→ParseCmd→CmdPrep→CmdVld), so a SINGLE CONSTANT input vector
+// drives it — no input needs a state-dependent (positional) value. The env-strategy lever therefore has
+// ZERO marginal reach here (the shipped constant-hold already suffices), the exact opposite of edn_boot.
+const CSRNG_MAIN_SM: &str = include_str!("fixtures/wall_classes/csrng_main_sm_fsm.btor");
+
 // ARRAY-CONTENT-GATED νµ recoverability (the SPCR class, PR #410). `AG EF(busy==0)` where recovery
 // routes through ARRAY CONTENT read at a latched index: `busy` clears only when `mem[key]==all-ones`.
 // exact-symbolic SKIPs the in-cone `$mem`; the plain cube's must-edge is an AUFBV ∀-over-array query
@@ -1066,5 +1074,48 @@ fn edn_witness_play_exhibits_positional_strategy() {
             .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
         Some(44),
         "the play reaches BootUniAckWait (44)"
+    );
+}
+
+/// P2.5-E — the MONOTONE A/B CONTROL for the edn positional case (the second-case survey payoff). The
+/// OpenTitan CSRNG app-command FSM (`csrng_main_sm_fsm`, extracted verbatim) reaches MainSmCmdVld
+/// (`state_q==16`) through a straight assert-to-progress pipeline. Unlike edn's boot handshake, a SINGLE
+/// CONSTANT input vector drives the command to validation and cycles indefinitely — every gating input
+/// advances the flow when asserted and never needs the opposite value later. So the environment-strategy
+/// lever has ZERO MARGINAL REACH here: the shipped constant-hold (Phase-2a slice 1) already suffices,
+/// where on edn BOTH constant `boot_req_mode_i` holds are VIOLATED and only a positional strategy works.
+///
+/// This is the wall-class-matrix marginal-reach discipline (the RULE) applied to the env-strategy lever:
+/// it must decide the edn-class POSITIONAL case AND leave the csrng-class MONOTONE case unchanged (no
+/// over-firing). Both are real OpenTitan CSRNG-family FSMs. Host-runnable, gates `make ci`.
+#[test]
+fn csrng_command_flow_is_monotone_not_positional() {
+    use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
+    let good = "state_q == 16"; // MainSmCmdVld
+    // Free-input: a command can be driven to validation ⇒ AG EF HOLDS.
+    assert_eq!(
+        verify_recoverability(CSRNG_MAIN_SM, good).ok(),
+        Some(PropertyVerdict::Holds),
+        "free-input the command flow reaches CmdVld"
+    );
+    // MONOTONE: a SINGLE CONSTANT input vector already reaches (and re-reaches) CmdVld — safety inputs
+    // held safe (local_escalate_i=0, enable_i=1), functional inputs all asserted (acmd_i=GEN=3 takes the
+    // no-entropy path). No input needs a state-dependent value ⇒ a constant strategy suffices ⇒ the
+    // env-strategy lever has zero marginal reach (contrast edn, where every constant boot_req VIOLATED).
+    let monotone_hold: &[(String, u64)] = &[
+        ("enable_i".to_string(), 1),
+        ("acmd_avail_i".to_string(), 1),
+        ("acmd_eop_i".to_string(), 1),
+        ("acmd_i".to_string(), 3), // GEN → skips MainSmEntropyReq
+        ("flag0_i".to_string(), 1),
+        ("cmd_rdy_i".to_string(), 1),
+        ("cmd_complete_i".to_string(), 1),
+        ("local_escalate_i".to_string(), 0),
+    ];
+    let (pinned, _) = pin_inputs_to_constants(CSRNG_MAIN_SM, monotone_hold);
+    assert_eq!(
+        verify_recoverability(&pinned, good).ok(),
+        Some(PropertyVerdict::Holds),
+        "a CONSTANT strategy reaches CmdVld — csrng's command flow is monotone, not positional"
     );
 }
