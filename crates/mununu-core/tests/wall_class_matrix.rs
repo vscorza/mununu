@@ -801,3 +801,57 @@ fn auto_config_partition_identifies_reset_on_opentitan_fsms() {
         "auto reset-partition reproduces the csrng branching pair: {part:?}"
     );
 }
+
+/// Capability B (assumption discovery, Phase 2a) — marginal reach on the fixed wall-class set (the
+/// lever RULE). On an INPUT-GATED trap the lever turns a flat VIOLATED into a conditional
+/// `HoldsUnder(input-hold)` — the enabling assumption that keeps the trap unreachable; on an
+/// UNCONDITIONAL trap (no input avoids it, and the only stuck-at-good hold is vacuous) it correctly
+/// finds NOTHING. Measures both the lever's reach and its no-false-positive boundary. The canonical
+/// verdict is UNCHANGED in both (conditional-only). Host-runnable, gates `make ci`.
+#[test]
+fn assumption_discovery_marginal_reach_on_input_gated_trap() {
+    use mununu_core::adapter::recoverability::verify_recoverability_refined;
+    // Input-gated trap: IDLE(0) --go--> WORK(1); WORK --en=0--> FAULT(2, absorbing) / --en=1--> IDLE.
+    // Held `en==1` keeps FAULT unreachable ⇒ a non-vacuous HOLDS ⇒ a discovered assumption.
+    const EN_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 en
+4 input 2 go
+5 state 1 st
+6 zero 1
+7 init 1 5 6
+8 one 1
+9 constd 1 2
+10 eq 2 5 6
+11 eq 2 5 8
+13 ite 1 4 8 6
+14 ite 1 3 6 9
+15 ite 1 11 14 9
+16 ite 1 10 13 15
+17 next 1 5 16
+";
+    let (v, r) = verify_recoverability_refined(EN_TRAP, "st == 0", &[], &[], true);
+    assert_eq!(
+        v,
+        PropertyVerdict::Violated,
+        "free-input the FAULT trap is reachable ⇒ canonical verdict VIOLATED (unchanged)"
+    );
+    assert!(
+        r.holds_under
+            .iter()
+            .any(|a| a.phi == "en == 1" && a.non_vacuous),
+        "assumption discovery REACHES the input-gated-trap class (HoldsUnder(en==1)): {:?}",
+        r.holds_under
+    );
+
+    // Unconditional trap (STALLER): st=1→3→3 absorbing; the only input hold `go==0` keeps st stuck at
+    // IDLE (vacuous — good never left, gate rejects it) and `go==1` leads to the trap ⇒ NO assumption.
+    let (v2, r2) = verify_recoverability_refined(STALLER, "st == 0", &[], &[], true);
+    assert_eq!(v2, PropertyVerdict::Violated);
+    assert!(
+        r2.holds_under.is_empty(),
+        "an unconditional trap has no enabling input-hold ⇒ no false-positive assumption: {:?}",
+        r2.holds_under
+    );
+}
