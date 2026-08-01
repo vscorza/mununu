@@ -264,6 +264,14 @@ const EDN_BOOT: &str = include_str!("fixtures/wall_classes/edn_boot_sm.btor");
 // ZERO marginal reach here (the shipped constant-hold already suffices), the exact opposite of edn_boot.
 const CSRNG_MAIN_SM: &str = include_str!("fixtures/wall_classes/csrng_main_sm_fsm.btor");
 
+// RTL — the OpenTitan OTBN (big-number crypto co-processor) start/stop controller FSM, extracted verbatim
+// to examples/recoverability/otbn_start_stop_fsm.sv and lifted. The SECOND real POSITIONAL env-strategy
+// case, from a DIFFERENT module family than edn (a start/execute/secure-wipe handshake, not a boot flow)
+// and a DIFFERENT positional flavor: reaching Running (state_q==119) needs `urnd_reseed_ack_i=0` in Halt
+// (a stray ACK there hits the spurious-ACK security trap → Locked) AND `=1` in UrndRefresh (to progress)
+// — an "acknowledge only when expected" discipline. No constant ACK hold reaches Running; free HOLDS.
+const OTBN_START_STOP: &str = include_str!("fixtures/wall_classes/otbn_start_stop_fsm.btor");
+
 // ARRAY-CONTENT-GATED νµ recoverability (the SPCR class, PR #410). `AG EF(busy==0)` where recovery
 // routes through ARRAY CONTENT read at a latched index: `busy` clears only when `mem[key]==all-ones`.
 // exact-symbolic SKIPs the in-cone `$mem`; the plain cube's must-edge is an AUFBV ∀-over-array query
@@ -1117,5 +1125,94 @@ fn csrng_command_flow_is_monotone_not_positional() {
         verify_recoverability(&pinned, good).ok(),
         Some(PropertyVerdict::Holds),
         "a CONSTANT strategy reaches CmdVld — csrng's command flow is monotone, not positional"
+    );
+}
+
+/// P2.5-E — the SECOND real POSITIONAL env-strategy case, on the OpenTitan OTBN start/stop controller
+/// (`otbn_start_stop_fsm`, extracted verbatim). A different module family from edn (a compute-engine
+/// start → execute → secure-wipe handshake) and a different positional FLAVOR: reaching Running
+/// (`state_q==119`) needs `urnd_reseed_ack_i` at OPPOSITE values in two states — `=0` at Halt (a stray
+/// ACK outside {Initial, UrndRefresh} hits the spurious-ACK security trap → Locked) and `=1` at
+/// UrndRefresh (to progress to Running). This is an "acknowledge only when expected" discipline: no
+/// CONSTANT ACK hold reaches Running (const-0 never leaves Initial/UrndRefresh; const-1 traps at Halt),
+/// yet a POSITIONAL strategy does. Escalation + RMA held inactive (`escalate_i=0, rma_req_i=0` — normal
+/// operation) to isolate the ACK handshake; the free reset provides the AG-escape from traps.
+/// Host-runnable, gates `make ci`.
+#[test]
+fn otbn_start_stop_ack_is_a_second_positional_env_strategy_case() {
+    use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
+    let good = "state_q == 119"; // OtbnStartStopStateRunning
+    // Escalation + RMA inactive (normal operation); optionally pin one more input to a constant.
+    let inactive = |extra: &[(&str, u64)]| -> String {
+        let mut pins: Vec<(String, u64)> =
+            vec![("escalate_i".to_string(), 0), ("rma_req_i".to_string(), 0)];
+        for (n, v) in extra {
+            pins.push((n.to_string(), *v));
+        }
+        pin_inputs_to_constants(OTBN_START_STOP, &pins).0
+    };
+    // Free (ACK, start, secure_wipe, reset all free): the env CAN drive to Running ⇒ AG EF HOLDS.
+    assert_eq!(
+        verify_recoverability(&inactive(&[]), good).ok(),
+        Some(PropertyVerdict::Holds),
+        "free-input the start/refresh handshake reaches Running (the positional path exists)"
+    );
+    // But NO constant `urnd_reseed_ack_i` hold reaches Running — the ACK discipline is state-dependent.
+    for v in [0u64, 1] {
+        assert_eq!(
+            verify_recoverability(&inactive(&[("urnd_reseed_ack_i", v)]), good).ok(),
+            Some(PropertyVerdict::Violated),
+            "constant urnd_reseed_ack_i={v} cannot reach Running (positional, no constant ACK hold)"
+        );
+    }
+}
+
+/// P2.5-E T2 — the strategy-WITNESS extraction, validated on the SECOND real positional case (OTBN).
+/// `exact_env_strategy_witness` returns a concrete winning play that EXHIBITS the ACK discipline:
+/// `urnd_reseed_ack_i = 0` at Halt (state 1 — a stray ACK there would trap to Locked) and `= 1` at
+/// UrndRefresh (state 242 — to progress), reaching Running (state 119). Escalation + RMA held inactive
+/// (the property's scope). This shows T2 generalizes beyond edn to a second module family + a second
+/// positional flavor (acknowledge-when-expected vs edn's request-then-drop).
+#[test]
+fn otbn_witness_play_exhibits_positional_ack_strategy() {
+    use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_witness;
+    let inactive = pin_inputs_to_constants(
+        OTBN_START_STOP,
+        &[("escalate_i".to_string(), 0), ("rma_req_i".to_string(), 0)],
+    )
+    .0;
+    let play =
+        exact_env_strategy_witness(&inactive, "state_q == 119").expect("a winning play exists");
+    let step = |want_state: u128| -> Option<u128> {
+        play.prefix
+            .iter()
+            .zip(play.inputs.iter())
+            .find_map(|(st, inp)| {
+                let s = st
+                    .iter()
+                    .find(|(k, _)| k.contains("state"))
+                    .map(|(_, v)| *v)?;
+                (s == want_state)
+                    .then(|| inp.get("urnd_reseed_ack_i").copied())
+                    .flatten()
+            })
+    };
+    assert_eq!(
+        step(1),
+        Some(0),
+        "positional: the strategy keeps urnd_reseed_ack_i=0 at Halt (a stray ACK would trap to Locked)"
+    );
+    assert_eq!(
+        step(242),
+        Some(1),
+        "positional: the strategy asserts urnd_reseed_ack_i=1 at UrndRefresh (to progress to Running)"
+    );
+    assert_eq!(
+        play.cycle
+            .first()
+            .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
+        Some(119),
+        "the play reaches Running (119)"
     );
 }
