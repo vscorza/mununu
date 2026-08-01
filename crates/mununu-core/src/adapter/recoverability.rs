@@ -1128,10 +1128,15 @@ pub fn verify_recoverability_refined(
     // `AG EF`, so a `HoldsUnder(φ)` does not transfer unconditionally).
     if discover_assumptions_flag {
         if verdict != PropertyVerdict::Holds {
-            // Base model does not hold ⇒ search for an enabling assumption over the base model.
+            // Base model does not hold ⇒ search for an enabling assumption over the base model. First
+            // the cheap memoryless single-input holds (slice 1); if none, fall back to the symbolic
+            // POSITIONAL environment strategy (Phase 2b) — it finds a per-state recovery discipline no
+            // constant hold expresses (νX. EF(good) ∧ ◇X over the bit-blasted BDD).
             let assumptions = discover_assumptions(btor2_content, good, &[]);
             if !assumptions.is_empty() {
                 refinement.holds_under = assumptions;
+            } else if let Some(env) = synthesize_env_strategy_assumption(btor2_content, good) {
+                refinement.holds_under = vec![env];
             }
         } else if let Some(part) = &refinement.config_partition
             && let Some(operational) = part.violated.first()
@@ -1359,6 +1364,45 @@ fn discover_assumptions(
         }
     }
     found
+}
+
+/// Capability B, Phase 2b — synthesize a symbolic POSITIONAL environment strategy that maintains
+/// `AG EF good`, reported as a [`DiscoveredAssumption`] of [`AssumptionKind::EnvStrategy`]. The
+/// fallback when slice-1's memoryless single-input holds find nothing: the recovery discipline may be
+/// per-state (a positional strategy), which a constant hold cannot express. `None` when the exact
+/// engine cannot build the model (over-cap / array / input-atom → `Inapplicable`), when no strategy
+/// maintains it (`NotMaintainable` — the adversary forces a permanent trap), or when the non-vacuity
+/// gate fails. CONDITIONAL-ONLY: the caller never lifts this to a bare `Holds`.
+///
+/// **Engine (§16):** `exact-symbolic` env-strategy — [`exact_env_strategy`], the `νX. EF(good) ∧ ◇X`
+/// safety game over the bit-blasted BDD (`◇` = ∃input = the environment's move). Tool-free.
+fn synthesize_env_strategy_assumption(
+    btor2_content: &str,
+    good: &str,
+) -> Option<DiscoveredAssumption> {
+    use crate::adapter::btor2::symbolic_bitblast::{EnvStrategyOutcome, exact_env_strategy};
+    // `exact_env_strategy` returns `Maintainable` ONLY when it is strategy-intrinsically non-vacuous
+    // (the environment can leave `good` within the maintained region — see its `ef_within` gate), so no
+    // further free-model non-vacuity check is needed here.
+    let EnvStrategyOutcome::Maintainable { first_move, .. } =
+        exact_env_strategy(btor2_content, good).ok()?
+    else {
+        return None;
+    };
+    let moves = if first_move.is_empty() {
+        String::new()
+    } else {
+        let m: Vec<String> = first_move.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!(" (e.g. first move {})", m.join(", "))
+    };
+    Some(DiscoveredAssumption {
+        phi: format!(
+            "environment strategy maintains recovery — stay in the recoverable region{moves}"
+        ),
+        kind: AssumptionKind::EnvStrategy,
+        non_vacuous: true,
+        engine: "exact-symbolic env-strategy (νX. EF(good) ∧ ◇X)".to_string(),
+    })
 }
 
 /// Capability A (refined-verdicts Phase 1) — partition the `AG EF good` verdict over the CONFIG the
@@ -4106,6 +4150,53 @@ mod tests {
         assert!(
             found.iter().any(|a| a.phi == "en == 1" && a.non_vacuous),
             "output-target non-vacuity gate must resolve `busy` and find HoldsUnder(en==1): {found:?}"
+        );
+    }
+
+    // Phase 2b — a POSITIONAL-strategy trap: st cycles A(0)→B(1)→C(2)→A but the SAFE input DIFFERS per
+    // state (x=0 at A, x=1 at B, x=0 at C); the wrong input at any state drops to TRAP(3, absorbing).
+    // No CONSTANT hold recovers (x=0 traps at B, x=1 traps at A) — only a positional env strategy does.
+    const POSITIONAL_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 x
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 one 1
+8 constd 1 2
+9 constd 1 3
+10 eq 2 4 5
+11 eq 2 4 7
+12 eq 2 4 8
+13 ite 1 3 9 7
+14 ite 1 3 8 9
+15 ite 1 3 9 5
+16 ite 1 12 15 9
+17 ite 1 11 14 16
+18 ite 1 10 13 17
+19 next 1 4 18
+";
+
+    /// Phase 2b end-to-end — `--discover-assumptions` on a positional-trap design where slice-1's
+    /// constant holds find NOTHING falls back to the symbolic env-strategy synthesis and reports an
+    /// `EnvStrategy` assumption. Canonical verdict stays VIOLATED (conditional-only).
+    #[test]
+    fn refined_verdict_falls_back_to_env_strategy_when_no_constant_hold() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(POSITIONAL_TRAP, "st == 0", &[], &[], true);
+        assert_eq!(
+            verdict,
+            PropertyVerdict::Violated,
+            "free-input the positional trap is VIOLATED (unchanged)"
+        );
+        assert!(
+            refinement
+                .holds_under
+                .iter()
+                .any(|a| a.kind == AssumptionKind::EnvStrategy && a.non_vacuous),
+            "no constant hold works ⇒ the symbolic env-strategy is reported: {:?}",
+            refinement.holds_under
         );
     }
 

@@ -2028,6 +2028,70 @@ impl ExactModel {
             .unwrap()
     }
 
+    // ---- Phase 2b: symbolic environment-strategy synthesis ----------------------------------------
+    // `AG EF good` under an environment strategy. The environment OWNS the inputs, so `◇` = ∃input
+    // (`diamond_pre`) is exactly Eve's controllable move; there is no adversary among the inputs (the
+    // design is deterministic given inputs). The synthesis is a 1-player (control) game:
+    //   R = EF(good)              — recoverable region (good reachable via SOME input path)
+    //   S = νX. R ∧ ◇X            — the env can STAY in R forever (a safety game inside R)
+    // `init ⊆ S` ⟺ the environment has a (positional) strategy maintaining `AG EF good` — from every
+    // state on the strategy's path `good` stays reachable. This finds recovery disciplines that no
+    // constant input-hold (Phase-2a slice 1) expresses: the safe move may differ per state.
+
+    /// `EF good = μX. good ∨ ◇X` — the RECOVERABLE region (states from which `good` is reachable under
+    /// some input path). Least fixpoint from ⊥. Mirrors [`BddBitBlaster::not_ef_p`] without the final
+    /// negation.
+    pub fn ef_region(&self, good: &BDDFunction) -> BDDFunction {
+        let mut ef = self.ff.clone();
+        loop {
+            let next = good.or(&self.diamond_pre(&ef)).unwrap();
+            if next == ef {
+                return ef;
+            }
+            ef = next;
+        }
+    }
+
+    /// `νX. r ∧ ◇X` — the ENV-MAINTAINABLE region within `r`: states from which the environment can
+    /// pick inputs to STAY in `r` forever (Eve owns all inputs, `◇` = ∃input is her move). With
+    /// `r = ef_region(good)` this is the set from which an environment strategy keeps `AG EF good`.
+    /// Greatest fixpoint from ⊤.
+    pub fn env_maintain_region(&self, r: &BDDFunction) -> BDDFunction {
+        let mut s = self.tt.clone();
+        loop {
+            let next = r.and(&self.diamond_pre(&s)).unwrap();
+            if next == s {
+                return s;
+            }
+            s = next;
+        }
+    }
+
+    /// The `(state, input)` pairs whose constraint-respecting successor lies in `keep`:
+    /// `to_next(keep) ∧ constraint`. Conjoined with a state set, it is the strategy's admissible
+    /// moves from those states — the raw material for extracting a concrete strategy witness.
+    pub fn move_into(&self, keep: &BDDFunction) -> BDDFunction {
+        self.to_next(keep).and(&self.constraint).unwrap()
+    }
+
+    /// `μX. (region ∧ target) ∨ (region ∧ ◇X)` — states in `region` from which `target` is reachable
+    /// WITHOUT leaving `region`. Least fixpoint from the region-restricted seed. Used to gate an
+    /// environment strategy's non-vacuity: from `init` inside the maintainable region `S`, can the
+    /// environment reach a `¬good` state while staying in `S` (i.e. does the strategy genuinely LEAVE
+    /// `good`, or does it vacuously sit on `good` forever)?
+    pub fn ef_within(&self, region: &BDDFunction, target: &BDDFunction) -> BDDFunction {
+        let seed = target.and(region).unwrap();
+        let mut ef = seed.clone();
+        loop {
+            let step = region.and(&self.diamond_pre(&ef)).unwrap();
+            let next = seed.or(&step).unwrap();
+            if next == ef {
+                return ef;
+            }
+            ef = next;
+        }
+    }
+
     /// D1.2 — evaluate a **2-valued** μ-calculus `formula` over the exact model,
     /// returning the BDD of states that satisfy it. No abstraction ⇒ the answer is
     /// definite (no `⊥`); the whole modal-μ fragment is decided exactly, bounded
@@ -2651,6 +2715,117 @@ fn exact_symbolic_verdict_with_witness_inner(
                 .and_then(|p_bdd| bb.exact_reachable_trap_path(&file, &p_bdd))
         });
     Ok((ExactVerdict::Violated, witness))
+}
+
+/// Phase 2b — the outcome of a symbolic environment-strategy synthesis for `AG EF good`.
+#[derive(Debug, Clone)]
+pub enum EnvStrategyOutcome {
+    /// The environment CAN maintain recoverability: every initial state lies in the env-maintainable
+    /// region `S = νX. EF(good) ∧ ◇X`, so a positional strategy (pick an input keeping the system in
+    /// `S`) keeps `AG EF good` from every reachable state on its path. `first_move` is a concrete
+    /// witness of σ: an input choice at an initial state that stays in `S`.
+    Maintainable {
+        note: String,
+        first_move: std::collections::BTreeMap<String, u128>,
+    },
+    /// No environment strategy suffices — from some initial state the adversary can force a permanent
+    /// trap (`init ⊄ S`). This is the NEGATED game's verdict (`EF AG ¬good`); `trap_path` is the forced
+    /// counter-strategy witness (reach a state from which `good` is unreachable), when extractable.
+    NotMaintainable { trap_path: Option<StallLasso> },
+    /// Not applicable / indeterminate: `good` is not a `REG op VALUE` atom, or the model could not be
+    /// built (over the exact cap, in-cone array, input-atom, …). The caller falls back / abstains.
+    Inapplicable(String),
+}
+
+/// Phase 2b — SYMBOLIC environment-strategy synthesis for `AG EF good` over the bit-blasted BDD.
+///
+/// Reduction (see [`ExactModel::env_maintain_region`]): `R = EF(good)` is the recoverable region; the
+/// env can maintain `AG EF good` iff `init ⊆ S = νX. R ∧ ◇X` (it can stay in `R` forever, `◇` = ∃input
+/// being the environment's move). `init ⊆ S` ⇒ [`EnvStrategyOutcome::Maintainable`] with a first-move
+/// witness; else [`EnvStrategyOutcome::NotMaintainable`] — the DUAL/NEGATED game (`EF AG ¬good`), whose
+/// adversary counter-strategy is the reachable-trap path. Finds POSITIONAL strategies that no constant
+/// input-hold (Phase-2a slice 1) expresses (the safe move may differ per state).
+///
+/// **Engine (§16):** `exact-symbolic` full-state ROBDD (OxiDD) — reuses [`ExactModel`]'s symbolic
+/// transition relation + `diamond_pre` (∃input CPre) + the `EF`/`ν` fixpoints. Tool-free, sidecar-free,
+/// host-runnable. Bounded by the exact engine's cone/bit cap (an over-cap cone ⇒ `Inapplicable`).
+pub fn exact_env_strategy(btor2_content: &str, good: &str) -> Result<EnvStrategyOutcome, String> {
+    use crate::adapter::btor2::parser;
+    let file = parser::parse(btor2_content)
+        .map_err(|e| format!("adapter/btor2/env-strategy: {}", e.message))?;
+    let resolve = |name: &str| -> String {
+        parser::resolve_to_canonical_name(
+            &file,
+            name,
+            parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
+    };
+    // `good` must be a comparison / boolean atom (same admission as the exact verdict path).
+    let expr = match parse_predicate_atom_bool(good) {
+        Ok(e) => resolve_predicate_expr_registers(&e, &resolve),
+        Err(e) => return Ok(EnvStrategyOutcome::Inapplicable(format!("`{good}`: {e}"))),
+    };
+    // Cone-of-influence keep-set from the atom's registers (mirrors the verdict path's scaling).
+    let mut seed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_predicate_registers(&expr, &mut seed);
+    let seed_atoms: Vec<String> = seed.into_iter().collect();
+    let keep_set = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+
+    let bb = match BddBitBlaster::build_with_keep(&file, keep_set.as_ref()) {
+        Ok(bb) => bb,
+        Err(e) => return Ok(EnvStrategyOutcome::Inapplicable(e)),
+    };
+    let exact = bb.exact_model();
+    let good_bdd = match bb.predicate_bdd(&expr) {
+        Ok(b) => b,
+        Err(e) => return Ok(EnvStrategyOutcome::Inapplicable(e)),
+    };
+    let init = bb.initial_state_bdd(&file);
+
+    let r = exact.ef_region(&good_bdd);
+    let s = exact.env_maintain_region(&r);
+    // init ⊆ S ⟺ init ∧ ¬S is empty.
+    let escaping = init.and(&s.not().unwrap()).unwrap();
+    if escaping == *exact.ff() {
+        // NON-VACUITY (strategy-intrinsic): the maintained region must let the environment LEAVE
+        // `good` — else `S ⊆ good` and the "strategy" vacuously sits on `good` forever (AG EF good is
+        // trivially true because you are always AT good). Require `init` to reach a `¬good` state while
+        // staying in `S`. (Free-model non-vacuity is not enough: the strategy, not the free design,
+        // decides whether `good` is left.)
+        let not_good = good_bdd.not().unwrap();
+        let can_leave = init.and(&exact.ef_within(&s, &not_good)).unwrap();
+        if can_leave == *exact.ff() {
+            return Ok(EnvStrategyOutcome::Inapplicable(format!(
+                "an environment strategy would keep the design in `{good}` forever — vacuous, not a \
+                 meaningful recovery"
+            )));
+        }
+        // The environment can maintain recoverability. Witness a first move: an initial state in S
+        // with an admissible input keeping the successor in S — `init ∧ S ∧ move_into(S)`.
+        let move_set = init.and(&s).unwrap().and(&exact.move_into(&s)).unwrap();
+        let first_move = if move_set == *exact.ff() {
+            std::collections::BTreeMap::new()
+        } else {
+            bb.input_assignment(&bb.pick_full_assignment(&move_set))
+        };
+        Ok(EnvStrategyOutcome::Maintainable {
+            note: format!(
+                "the environment can maintain `AG EF({good})`: from every initial state it can choose \
+                 inputs keeping the design in the recoverable region `EF({good})` forever (a positional \
+                 strategy, not necessarily a constant hold)"
+            ),
+            first_move,
+        })
+    } else {
+        // The adversary forces a permanent trap from some initial state — the NEGATED game. Emit the
+        // forced-trap counter-strategy witness (reachable state from which `good` is unreachable).
+        let trap_path = bb.exact_reachable_trap_path(&file, &good_bdd);
+        Ok(EnvStrategyOutcome::NotMaintainable { trap_path })
+    }
 }
 
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
@@ -6017,5 +6192,119 @@ mod tests {
                 "{why} must be an honest error over a cube, not a verdict: `{formula_str}`"
             );
         }
+    }
+
+    // ---- Phase 2b: symbolic environment-strategy synthesis ----------------------------------------
+
+    // A POSITIONAL-strategy trap: st cycles A(0)→B(1)→C(2)→A, but the SAFE input DIFFERS per state —
+    // x=0 at A, x=1 at B, x=0 at C — and the WRONG input at any state drops to TRAP(3, absorbing). So
+    // no CONSTANT input-hold recovers (x=0 traps at B; x=1 traps at A), but a POSITIONAL environment
+    // strategy stays in the recoverable region {A,B,C}. Free-input `AG EF(st==0)` is VIOLATED.
+    const POSITIONAL_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 x
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 one 1
+8 constd 1 2
+9 constd 1 3
+10 eq 2 4 5
+11 eq 2 4 7
+12 eq 2 4 8
+13 ite 1 3 9 7
+14 ite 1 3 8 9
+15 ite 1 3 9 5
+16 ite 1 12 15 9
+17 ite 1 11 14 16
+18 ite 1 10 13 17
+19 next 1 4 18
+";
+
+    /// Phase 2b — the symbolic env-strategy synthesizes a POSITIONAL strategy that maintains
+    /// `AG EF(st==0)` on `POSITIONAL_TRAP`, where NO constant input-hold works (the marginal reach
+    /// over Phase-2a slice 1). `init ⊆ S` ⇒ Maintainable with a first-move witness.
+    #[test]
+    fn env_strategy_finds_positional_maintenance_where_no_constant_hold_works() {
+        match exact_env_strategy(POSITIONAL_TRAP, "st == 0").expect("synthesis runs") {
+            EnvStrategyOutcome::Maintainable { first_move, .. } => {
+                assert!(
+                    first_move.contains_key("x"),
+                    "the first move should choose the input `x`: {first_move:?}"
+                );
+            }
+            other => panic!("expected Maintainable (positional strategy exists): {other:?}"),
+        }
+        // Cross-check the marginal reach: a single-input CONSTANT hold does NOT maintain it — the
+        // free-input verdict is VIOLATED and neither x=0 nor x=1 keeps the design recoverable.
+        assert_eq!(
+            crate::adapter::recoverability::verify_recoverability(POSITIONAL_TRAP, "st == 0").ok(),
+            Some(crate::verdict::PropertyVerdict::Violated),
+            "free-input the positional trap is VIOLATED (a constant hold cannot fix it)"
+        );
+    }
+
+    /// Phase 2b — an UNRECOVERABLE design (`st` unconditionally drops to an absorbing TRAP, `st==0`
+    /// only at reset): NO environment strategy maintains recovery (`init ⊄ S`), so the synthesis
+    /// reports NotMaintainable — the negated game's forced-trap counter-strategy.
+    #[test]
+    fn env_strategy_reports_not_maintainable_on_forced_trap() {
+        // A(0) --any x--> TRAP(1, absorbing); good = st==0 reachable only initially.
+        const FORCED_TRAP: &str = "\
+1 sort bitvec 1
+2 input 1 x
+3 state 1 st
+4 zero 1
+5 init 1 3 4
+6 one 1
+7 next 1 3 6
+";
+        match exact_env_strategy(FORCED_TRAP, "st == 0").expect("synthesis runs") {
+            EnvStrategyOutcome::NotMaintainable { .. } => {}
+            other => panic!("expected NotMaintainable (forced trap, no strategy): {other:?}"),
+        }
+    }
+
+    /// Phase 2b SOUNDNESS CONTROL — a strategy that would keep the design in `good` forever is VACUOUS
+    /// and must NOT be reported. `go=0` keeps `st` at IDLE(0) forever, so the maintained region ⊆ good
+    /// (the env never leaves good) ⇒ Inapplicable, not a spurious Maintainable.
+    #[test]
+    fn env_strategy_rejects_vacuous_stay_in_good() {
+        // st=A(0) --go=1--> B(1) --> TRAP(3); good = st==0. Holding go=0 keeps st at 0 forever (vacuous).
+        const STALLER: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 st
+4 zero 1
+5 init 1 3 4
+6 input 2 go
+7 one 1
+8 constd 1 2
+9 constd 1 3
+10 eq 2 3 4
+11 eq 2 3 7
+12 ite 1 6 7 4
+13 ite 1 11 9 3
+14 ite 1 10 12 13
+15 next 1 3 14
+";
+        assert!(
+            matches!(
+                exact_env_strategy(STALLER, "st == 0").expect("runs"),
+                EnvStrategyOutcome::Inapplicable(_)
+            ),
+            "a stay-in-good strategy is vacuous ⇒ must not be reported as Maintainable"
+        );
+    }
+
+    /// Phase 2b — a non-`REG op VALUE` / unresolvable atom is Inapplicable (the caller abstains),
+    /// never a spurious strategy.
+    #[test]
+    fn env_strategy_inapplicable_on_non_atom() {
+        assert!(matches!(
+            exact_env_strategy(POSITIONAL_TRAP, "not a valid atom").expect("runs"),
+            EnvStrategyOutcome::Inapplicable(_)
+        ));
     }
 }
