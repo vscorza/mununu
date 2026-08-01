@@ -250,6 +250,12 @@ const AES_CIPHER: &str = include_str!("fixtures/wall_classes/aes_cipher_control_
 const CSRNG: &str = include_str!("fixtures/wall_classes/csrng_main_sm.btor");
 const AES_CTR: &str = include_str!("fixtures/wall_classes/aes_ctr_fsm.btor");
 
+// RTL — the OpenTitan EDN main state machine's boot handshake, extracted (verbatim FSM transitions) to
+// examples/recoverability/edn_boot_sm.sv and lifted. The corpus's genuine POSITIONAL env-strategy case:
+// reaching BootUniAckWait (state_q==44) needs `boot_req_mode_i=1` in Idle (start) AND `=0` in BootDone
+// (progress) — no constant hold works. Free-input `AG EF(state_q==44)` HOLDS (∃ the positional path).
+const EDN_BOOT: &str = include_str!("fixtures/wall_classes/edn_boot_sm.btor");
+
 // ARRAY-CONTENT-GATED νµ recoverability (the SPCR class, PR #410). `AG EF(busy==0)` where recovery
 // routes through ARRAY CONTENT read at a latched index: `busy` clears only when `mem[key]==all-ones`.
 // exact-symbolic SKIPs the in-cone `$mem`; the plain cube's must-edge is an AUFBV ∀-over-array query
@@ -904,6 +910,34 @@ fn env_strategy_marginal_reach_over_constant_hold() {
     );
 }
 
+/// P2.5-E — the REAL-RTL positional env-strategy case (the §0.7 search payoff). The OpenTitan EDN boot
+/// handshake (`edn_boot_sm`, extracted verbatim) needs `boot_req_mode_i=1` in Idle to START the boot flow
+/// and `=0` in BootDone to PROGRESS to BootUniAckWait — opposite values in two states, so NO constant
+/// input-hold drives a full boot, but a POSITIONAL strategy does. Confirmed signature: free-input
+/// `AG EF(state_q==44)` HOLDS (∃ the positional path) yet BOTH constant `boot_req_mode_i` holds are
+/// VIOLATED. This is the genuine real-RTL demand for the strategy-witness machinery (T2). Host-runnable
+/// (small FSM), gates `make ci`.
+#[test]
+fn edn_boot_handshake_is_a_positional_env_strategy_case() {
+    use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
+    let good = "state_q == 44"; // BootUniAckWait
+    // Free-input: the environment CAN drive the full boot handshake ⇒ AG EF HOLDS.
+    assert_eq!(
+        verify_recoverability(EDN_BOOT, good).ok(),
+        Some(PropertyVerdict::Holds),
+        "free-input the boot handshake is completable (the positional path exists)"
+    );
+    // But NO constant `boot_req_mode_i` hold works — the recovering discipline is state-dependent.
+    for v in [0u64, 1] {
+        let (pinned, _) = pin_inputs_to_constants(EDN_BOOT, &[("boot_req_mode_i".to_string(), v)]);
+        assert_eq!(
+            verify_recoverability(&pinned, good).ok(),
+            Some(PropertyVerdict::Violated),
+            "constant boot_req_mode_i={v} cannot complete the boot (positional, no constant hold)"
+        );
+    }
+}
+
 /// P2.5-E §0.7 — MEASURE-FIRST scan (gates T2/T3). Question: does a REAL-RTL ⊥/VIOLATED recoverability
 /// case have an environment strategy (`exact_env_strategy_exists = Some(true)`) that rescues a NON-Holds
 /// base — i.e. env-strategy has marginal reach beyond the shipped memoryless constant-hold? If only the
@@ -988,5 +1022,49 @@ fn env_strategy_positional_marginal_reach_scan() {
     println!(
         "\nreal-RTL rows where env-strategy rescues a non-Holds base: {real_gap} \
          (0 ⇒ positional/general strategy is SYNTHETIC-ONLY ⇒ T2/T3 documented-not-headlined)\n"
+    );
+}
+
+/// P2.5-E T2 — the strategy-WITNESS extraction, validated on the real OpenTitan EDN boot handshake.
+/// `exact_env_strategy_witness` returns a concrete winning play that EXHIBITS the positional discipline:
+/// `boot_req_mode_i = 1` at Idle (state 193, to START the boot flow) and `= 0` at BootDone (state 240,
+/// to PROGRESS to BootLoadUni) — the same input at opposite values in two states, the strategy no
+/// constant hold can express. This is the deeper machinery (T2) doing real work on real RTL.
+#[test]
+fn edn_witness_play_exhibits_positional_strategy() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_witness;
+    let play =
+        exact_env_strategy_witness(EDN_BOOT, "state_q == 44").expect("a winning play exists");
+    // Per-step (state, boot_req) pairs from the play (state cell resolves to `state_d` post-async2sync).
+    let step = |want_state: u128| -> Option<u128> {
+        play.prefix
+            .iter()
+            .zip(play.inputs.iter())
+            .find_map(|(st, inp)| {
+                let s = st
+                    .iter()
+                    .find(|(k, _)| k.contains("state"))
+                    .map(|(_, v)| *v)?;
+                (s == want_state)
+                    .then(|| inp.get("boot_req_mode_i").copied())
+                    .flatten()
+            })
+    };
+    assert_eq!(
+        step(193),
+        Some(1),
+        "positional: the strategy asserts boot_req_mode_i=1 at Idle (193) to start the boot"
+    );
+    assert_eq!(
+        step(240),
+        Some(0),
+        "positional: the strategy deasserts boot_req_mode_i=0 at BootDone (240) to progress"
+    );
+    assert_eq!(
+        play.cycle
+            .first()
+            .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
+        Some(44),
+        "the play reaches BootUniAckWait (44)"
     );
 }
