@@ -4071,6 +4071,44 @@ mod tests {
         );
     }
 
+    // Like the real lift: the recovery target `busy` is a combinational OUTPUT (`busy = st != IDLE`),
+    // NOT a state cell. IDLE(0)--go-->WORK(1); WORK--en=0-->FAULT(2,absorbing)/--en=1-->IDLE. `busy==0`
+    // ⇔ `st==0`. Exercises the output-port resolution in the non-vacuity gate (`emit_ag_state_atom_monitor`
+    // output fallback) — without it the gate errors on every `busy`/`done`/`valid`/`ready` output target.
+    const EN_TRAP_OUTPUT: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 en
+4 input 2 go
+5 state 1 st
+6 zero 1
+7 init 1 5 6
+8 one 1
+9 constd 1 2
+10 eq 2 5 6
+11 eq 2 5 8
+13 ite 1 4 8 6
+14 ite 1 3 6 9
+15 ite 1 11 14 9
+16 ite 1 10 13 15
+17 next 1 5 16
+18 neq 2 5 6
+19 output 18 busy
+";
+
+    /// Capability B slice 1 — the recovery target is a combinational OUTPUT (`busy`), the common real-RTL
+    /// shape. Assumption discovery must find the non-vacuous `en == 1` hold, which requires the
+    /// non-vacuity gate to resolve `busy` via the OUTPUT-port fallback (not just state cells). This is the
+    /// exact gap that blocked the composition on the `compute_engine_faulty` lift (`busy` is an output).
+    #[test]
+    fn discover_assumptions_resolves_output_target() {
+        let found = discover_assumptions(EN_TRAP_OUTPUT, "busy == 0", &[]);
+        assert!(
+            found.iter().any(|a| a.phi == "en == 1" && a.non_vacuous),
+            "output-target non-vacuity gate must resolve `busy` and find HoldsUnder(en==1): {found:?}"
+        );
+    }
+
     /// Capability B slice 1 SOUNDNESS CONTROL — a structurally-dead target (`st` stuck at 1, `st==0`
     /// unreachable regardless of the input `x`) must yield NO discovered assumption: no input hold can
     /// make an unreachable `good` non-vacuously hold, so assumption discovery must NOT fabricate a φ.

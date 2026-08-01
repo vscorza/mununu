@@ -188,12 +188,21 @@ pub fn emit_ag_state_atom_monitor(
         e
     })?;
 
-    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned).ok_or_else(|| {
-        err(format!(
-            "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell \
-             (the AG(state-atom) monitor requires a state register or a value-alias of one)"
-        ))
-    })?;
+    // Resolve the atom's signal to its per-cycle value net: a STATE register (value-alias / reset-mux
+    // aware) first, else a combinational OUTPUT port (its driver net). Many real recoverability targets
+    // (`busy` / `done` / `valid` / `ready`) are outputs driven from the FSM (e.g. `state != IDLE`), not
+    // state cells — comparing the driver's value is the same sound per-cycle observation. Without the
+    // output fallback the `EF(atom)` reachability monitor (used by `probe_vacuous` and the assumption
+    // non-vacuity gate) fails on every output target.
+    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned)
+        .or_else(|| output_nid_and_sort(&file, signal))
+        .ok_or_else(|| {
+            err(format!(
+                "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell or output port \
+                 (the AG(state-atom) monitor requires a state register, a value-alias of one, or an \
+                 output net)"
+            ))
+        })?;
 
     let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
     let mut appended: Vec<String> = Vec::new();
