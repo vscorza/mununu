@@ -808,19 +808,27 @@ pub async fn btor2_verify_recoverability_handler(
             details: None,
         }
     })?;
-    // `refine`/`config_values` (refined-verdicts): canonical verdict PLUS a diagnostic-only refinement.
-    let (verdict, refinement) = if request.refine || !config_specs.is_empty() {
-        let (v, r) =
-            verify_recoverability_refined(&request.content, &request.target, &extra, &config_specs);
-        (v, Some(r))
-    } else {
-        let v = verify_recoverability_with_predicates(&request.content, &request.target, &extra)
-            .map_err(|message| ApiError::BadRequest {
-                message,
-                details: None,
-            })?;
-        (v, None)
-    };
+    // `refine`/`config_values`/`discover_assumptions` (refined-verdicts): canonical verdict PLUS a
+    // diagnostic-only refinement.
+    let (verdict, refinement) =
+        if request.refine || !config_specs.is_empty() || request.discover_assumptions {
+            let (v, r) = verify_recoverability_refined(
+                &request.content,
+                &request.target,
+                &extra,
+                &config_specs,
+                request.discover_assumptions,
+            );
+            (v, Some(r))
+        } else {
+            let v =
+                verify_recoverability_with_predicates(&request.content, &request.target, &extra)
+                    .map_err(|message| ApiError::BadRequest {
+                        message,
+                        details: None,
+                    })?;
+            (v, None)
+        };
 
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
@@ -1057,23 +1065,28 @@ pub async fn sv_verify_recoverability_handler(
             crate::adapter::yosys::SvFrontend::Auto
         },
     };
-    let (verdict, refinement) = if request.refine || !config_specs.is_empty() {
-        let (v, r) =
-            sv_verify_recoverability_refined(&lift, &request.target, &extra, &config_specs)
+    let (verdict, refinement) =
+        if request.refine || !config_specs.is_empty() || request.discover_assumptions {
+            let (v, r) = sv_verify_recoverability_refined(
+                &lift,
+                &request.target,
+                &extra,
+                &config_specs,
+                request.discover_assumptions,
+            )
+            .map_err(|message| ApiError::BadRequest {
+                message,
+                details: None,
+            })?;
+            (v, Some(r))
+        } else {
+            let v = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra)
                 .map_err(|message| ApiError::BadRequest {
                     message,
                     details: None,
                 })?;
-        (v, Some(r))
-    } else {
-        let v = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra).map_err(
-            |message| ApiError::BadRequest {
-                message,
-                details: None,
-            },
-        )?;
-        (v, None)
-    };
+            (v, None)
+        };
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
         property,
@@ -4462,6 +4475,7 @@ members = ["x"]
             predicates: Vec::new(),
             refine: false,
             config_values: Vec::new(),
+            discover_assumptions: false,
         };
         let Json(out) = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4483,6 +4497,7 @@ members = ["x"]
             predicates: Vec::new(),
             refine: true,
             config_values: Vec::new(),
+            discover_assumptions: false,
         };
         let Json(out) = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4506,6 +4521,7 @@ members = ["x"]
             predicates: Vec::new(),
             refine: false,
             config_values: vec!["mode=0,1,2,3".to_string()],
+            discover_assumptions: false,
         };
         let Json(out) = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4519,6 +4535,37 @@ members = ["x"]
     }
 
     #[tokio::test]
+    async fn btor2_verify_recoverability_discover_assumptions_finds_enabling_hold() {
+        // IDLE(0) --go--> WORK(1); WORK --en=0--> FAULT(2, absorbing) / --en=1--> IDLE. Free-input the
+        // FAULT trap is reachable ⇒ VIOLATED; held `en==1` keeps it unreachable ⇒ a non-vacuous HOLDS.
+        const EN_TRAP: &str = "1 sort bitvec 2\n2 sort bitvec 1\n3 input 2 en\n4 input 2 go\n\
+5 state 1 st\n6 zero 1\n7 init 1 5 6\n8 one 1\n9 constd 1 2\n10 eq 2 5 6\n11 eq 2 5 8\n\
+13 ite 1 4 8 6\n14 ite 1 3 6 9\n15 ite 1 11 14 9\n16 ite 1 10 13 15\n17 next 1 5 16\n";
+        let request = Btor2VerifyRecoverabilityRequest {
+            content: EN_TRAP.to_string(),
+            target: "st == 0".to_string(),
+            predicates: Vec::new(),
+            refine: false,
+            config_values: Vec::new(),
+            discover_assumptions: true,
+        };
+        let Json(out) = btor2_verify_recoverability_handler(Json(request))
+            .await
+            .expect("verify-recoverability --discover-assumptions runs");
+        assert_eq!(
+            out.verdict, "violated",
+            "canonical verdict is unchanged (conditional-only)"
+        );
+        let holds_under = out.refinement.map(|r| r.holds_under).unwrap_or_default();
+        assert!(
+            holds_under
+                .iter()
+                .any(|a| a.phi == "en == 1" && a.non_vacuous),
+            "discovers the enabling assumption en == 1: {holds_under:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn btor2_verify_recoverability_handler_rejects_malformed_target() {
         let request = Btor2VerifyRecoverabilityRequest {
             content: LIVENESS_STALLER.to_string(),
@@ -4526,6 +4573,7 @@ members = ["x"]
             predicates: Vec::new(),
             refine: false,
             config_values: Vec::new(),
+            discover_assumptions: false,
         };
         let err = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4621,6 +4669,7 @@ members = ["x"]
             predicates: Vec::new(),
             refine: false,
             config_values: Vec::new(),
+            discover_assumptions: false,
         };
         let err = sv_verify_recoverability_handler(Json(request))
             .await

@@ -135,14 +135,16 @@ pub fn sv_verify_recoverability_with_predicates(
 }
 
 /// `sv verify-recoverability --refine` — lift SV and decide `AG EF target`, returning the canonical
-/// verdict PLUS a structured [`VerdictRefinement`] (the `Vacuous`/`bot_diagnosis` today; the config
-/// partition and discovered assumptions in later phases). The refinement is diagnostic-only — it never
-/// changes the canonical verdict. Sidecar-free (operates on the same lift as the plain verb).
+/// verdict PLUS a structured [`VerdictRefinement`]: a `Vacuous` witness, an auto `config_partition`
+/// over the detected reset, a `bot_diagnosis` hint, and — when `discover_assumptions` is set and the
+/// property does not hold — discovered `holds_under` assumptions. The refinement is diagnostic-only — it
+/// never changes the canonical verdict. Sidecar-free (operates on the same lift as the plain verb).
 pub fn sv_verify_recoverability_refined(
     lift: &SvLift,
     target: &str,
     extra_predicates: &[PredicateSpec],
     config_specs: &[(String, Vec<u64>)],
+    discover_assumptions: bool,
 ) -> Result<(PropertyVerdict, crate::verdict::VerdictRefinement), String> {
     parse_predicate_expr(target).map_err(|e| {
         format!("recoverability target `{target}` is not a register-comparison atom: {e:?}")
@@ -154,6 +156,7 @@ pub fn sv_verify_recoverability_refined(
             target,
             extra_predicates,
             config_specs,
+            discover_assumptions,
         ),
     )
 }
