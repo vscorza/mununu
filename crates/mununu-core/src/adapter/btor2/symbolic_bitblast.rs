@@ -2828,6 +2828,37 @@ pub fn exact_env_strategy(btor2_content: &str, good: &str) -> Result<EnvStrategy
     }
 }
 
+/// P2.5-E T1 — env-strategy EXISTENCE for ANY μ-calculus property, over the bit-blasted BDD.
+///
+/// An environment strategy can enforce `formula` from the initial state iff `init ⊆ W`, where
+/// `W = evaluate(env_enforce(formula))` is the winning region of the 1-player control game (the
+/// environment owns every transition; the `□→◇` [`env_enforce`] rewrite makes each modality the
+/// environment's move). Since `exact_symbolic_verdict` already returns `Holds` exactly when `init ⊆
+/// evaluate(φ)`, existence is simply `exact_symbolic_verdict(env_enforce(formula)) == Holds`.
+///
+/// Returns `Ok(Some(true))` (a strategy exists), `Ok(Some(false))` (the adversary can force `¬formula` —
+/// solve `invert(formula)`'s game for the counter-strategy region), or `Ok(None)` when the exact engine
+/// cannot decide (over the cone/bit cap, in-cone array, input-atom — the caller abstains). GENERALIZES
+/// [`exact_env_strategy`] (recoverability shape), which stays as the differential oracle + the witness/
+/// non-vacuity path; strategy-WITNESS extraction for arbitrary `formula` is T2. CONDITIONAL-ONLY: this
+/// never changes a canonical verdict.
+///
+/// **Engine (§16):** `exact-symbolic` full-state ROBDD (OxiDD) — `evaluate(env_enforce(φ))` reuses the
+/// existing `diamond_pre` (∃input = the env's move) + Kleene fixpoint; no `Control`-honoring needed in the
+/// 1-player case (⟨ctrl⟩ ≡ ◇ when the env owns all inputs). Tool-free, host-runnable.
+pub fn exact_env_strategy_exists(
+    btor2_content: &str,
+    formula: &Formula,
+) -> Result<Option<bool>, String> {
+    let enforced = crate::mu_calculus::env_enforce::env_enforce(formula);
+    match exact_symbolic_verdict(btor2_content, &enforced) {
+        Ok(ExactVerdict::Holds) => Ok(Some(true)),
+        Ok(ExactVerdict::Violated) => Ok(Some(false)),
+        // The exact engine abstained (over-cap / in-cone array / input-atom) — undecided, not a strategy.
+        Err(_) => Ok(None),
+    }
+}
+
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
 /// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
 /// - bare `AF p` = `μX. (p ∨ [] X)`,
@@ -6295,6 +6326,44 @@ mod tests {
                 EnvStrategyOutcome::Inapplicable(_)
             ),
             "a stay-in-good strategy is vacuous ⇒ must not be reported as Maintainable"
+        );
+    }
+
+    /// P2.5-E T1 — env-strategy EXISTENCE, GENERALIZED. `exact_env_strategy_exists` decides env-enforce
+    /// for ANY μ-calculus formula. On the recoverability formula it AGREES with the bespoke
+    /// `exact_env_strategy` (subsumption: Maintainable ⟺ Some(true)); it also decides a SAFETY property
+    /// (env-can-stay-out-of-the-trap) — a shape the recoverability-specific synth cannot express.
+    #[test]
+    fn env_strategy_exists_generalizes_over_mu_calculus() {
+        use crate::mu_calculus::parser::parse;
+        // (a) Recoverability formula on POSITIONAL_TRAP — subsumes exact_env_strategy (Maintainable).
+        let recov = parse("nu Y. ((mu X. ((st == 0) || <> X)) && [] Y)").expect("parse");
+        assert_eq!(
+            exact_env_strategy_exists(POSITIONAL_TRAP, &recov).expect("runs"),
+            Some(true),
+            "env can enforce AG EF(st==0) via a positional strategy"
+        );
+        assert!(
+            matches!(
+                exact_env_strategy(POSITIONAL_TRAP, "st == 0").expect("runs"),
+                EnvStrategyOutcome::Maintainable { .. }
+            ),
+            "the general existence must AGREE with the bespoke recoverability synth"
+        );
+        // (b) SAFETY property (generality) — the env can keep `st` out of the TRAP(3) forever.
+        let safety = parse("nu X. ((! (st == 3)) && [] X)").expect("parse");
+        assert_eq!(
+            exact_env_strategy_exists(POSITIONAL_TRAP, &safety).expect("runs"),
+            Some(true),
+            "env can stay out of the trap (a safety objective, not recoverability)"
+        );
+        // (c) NO strategy — a forced trap: st=A(0) --any--> TRAP(1), so the env cannot avoid `st==1`.
+        const FORCED: &str = "1 sort bitvec 1\n2 input 1 x\n3 state 1 st\n4 zero 1\n5 init 1 3 4\n6 one 1\n7 next 1 3 6\n";
+        let avoid = parse("nu X. ((! (st == 1)) && [] X)").expect("parse");
+        assert_eq!(
+            exact_env_strategy_exists(FORCED, &avoid).expect("runs"),
+            Some(false),
+            "the env cannot avoid the forced trap ⇒ no strategy"
         );
     }
 
