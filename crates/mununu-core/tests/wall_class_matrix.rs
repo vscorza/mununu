@@ -855,3 +855,51 @@ fn assumption_discovery_marginal_reach_on_input_gated_trap() {
         r2.holds_under
     );
 }
+
+/// Phase 2b (symbolic env-strategy synthesis, EnvStrategy lever) — marginal reach on the fixed set (the
+/// lever RULE). On a POSITIONAL-strategy trap (the safe input DIFFERS per state, so no CONSTANT hold
+/// recovers) the symbolic safety game `νX. EF(good) ∧ ◇X` finds a maintaining strategy that slice-1's
+/// constant holds CANNOT — the marginal reach over Phase-2a slice 1. STALLER (unconditional trap) is
+/// the no-false-positive control (already asserted above: no EnvStrategy either). Canonical verdict
+/// stays VIOLATED (conditional-only). Host-runnable, gates `make ci`.
+#[test]
+fn env_strategy_marginal_reach_over_constant_hold() {
+    use mununu_core::adapter::recoverability::verify_recoverability_refined;
+    // A(0)→B(1)→C(2)→A cycle; safe input is x=0 at A, x=1 at B, x=0 at C; the wrong input drops to
+    // TRAP(3). No constant hold recovers; a positional env strategy stays in {A,B,C}.
+    const POSITIONAL_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 x
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 one 1
+8 constd 1 2
+9 constd 1 3
+10 eq 2 4 5
+11 eq 2 4 7
+12 eq 2 4 8
+13 ite 1 3 9 7
+14 ite 1 3 8 9
+15 ite 1 3 9 5
+16 ite 1 12 15 9
+17 ite 1 11 14 16
+18 ite 1 10 13 17
+19 next 1 4 18
+";
+    let (v, r) = verify_recoverability_refined(POSITIONAL_TRAP, "st == 0", &[], &[], true);
+    assert_eq!(
+        v,
+        PropertyVerdict::Violated,
+        "free-input the positional trap is VIOLATED (unchanged, conditional-only)"
+    );
+    assert!(
+        r.holds_under.iter().any(|a| matches!(
+            a.kind,
+            mununu_core::verdict::AssumptionKind::EnvStrategy
+        ) && a.non_vacuous),
+        "the symbolic env-strategy REACHES the positional-trap class where a constant hold cannot: {:?}",
+        r.holds_under
+    );
+}
