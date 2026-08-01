@@ -735,6 +735,13 @@ struct Btor2VerifyRecoverabilityArgs {
     /// "why ⊥ / what would decide it" hint. Diagnostic-only — it never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,
+    /// Assumption discovery (refined-verdicts capability B): when the property does NOT hold, search
+    /// for an environment assumption φ (a single narrow input held at a value) under which it becomes a
+    /// NON-VACUOUS HOLDS → the refinement reports `holds_under`. CONDITIONAL-only: it never changes the
+    /// canonical verdict (assumptions are not monotone for `AG EF`). Implies the refined output; opt-in
+    /// (it costs extra decide runs).
+    #[arg(long = "discover-assumptions")]
+    discover_assumptions: bool,
     /// Config-partition (refined-verdicts capability A): name config INPUTS to split the verdict over,
     /// each `NAME=v1,v2,...` (repeatable). The refinement then reports a `config_partition` — "holds
     /// for configs {A}, violated for {B}" — decided exactly per config (sound per cell). Implies the
@@ -1824,6 +1831,12 @@ struct SvVerifyRecoverabilityArgs {
     /// never changes the canonical verdict.
     #[arg(long = "refine")]
     refine: bool,
+    /// Assumption discovery (refined-verdicts capability B): when the property does NOT hold, search for
+    /// an environment assumption φ (a single narrow input held at a value) under which it becomes a
+    /// NON-VACUOUS HOLDS → the refinement reports `holds_under`. CONDITIONAL-only (never changes the
+    /// canonical verdict). Implies the refined output; opt-in (it costs extra decide runs).
+    #[arg(long = "discover-assumptions")]
+    discover_assumptions: bool,
     /// Config-partition (refined-verdicts capability A): name config INPUTS to split the verdict over,
     /// each `NAME=v1,v2,...` (repeatable) → the refinement reports a `config_partition`, decided exactly
     /// per config. Implies the refined output. Best for a narrow / few-value config (cross-product capped).
@@ -2717,12 +2730,17 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
         "file": args.file.display().to_string(),
         "property": recoverability_property_str(&args.target),
     });
-    // `--refine` / `--config-values` (refined-verdicts): the canonical verdict PLUS a structured,
-    // diagnostic-only refinement (Vacuous / bot-diagnosis / config-partition) — never changes the
-    // verdict. Without either, the plain verdict path.
-    let verdict = if args.refine || !config_specs.is_empty() {
-        let (verdict, refinement) =
-            verify_recoverability_refined(&content, &args.target, &extra, &config_specs);
+    // `--refine` / `--config-values` / `--discover-assumptions` (refined-verdicts): the canonical
+    // verdict PLUS a structured, diagnostic-only refinement (Vacuous / bot-diagnosis / config-partition
+    // / holds_under) — never changes the verdict. Without any, the plain verdict path.
+    let verdict = if args.refine || !config_specs.is_empty() || args.discover_assumptions {
+        let (verdict, refinement) = verify_recoverability_refined(
+            &content,
+            &args.target,
+            &extra,
+            &config_specs,
+            args.discover_assumptions,
+        );
         summary["refinement"] =
             serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
         verdict
@@ -5345,9 +5363,14 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
         "file": file,
         "property": recoverability_property_str(&args.target),
     });
-    let verdict = if args.refine || !config_specs.is_empty() {
-        let (verdict, refinement) =
-            sv_verify_recoverability_refined(&lift, &args.target, &extra, &config_specs)?;
+    let verdict = if args.refine || !config_specs.is_empty() || args.discover_assumptions {
+        let (verdict, refinement) = sv_verify_recoverability_refined(
+            &lift,
+            &args.target,
+            &extra,
+            &config_specs,
+            args.discover_assumptions,
+        )?;
         summary["refinement"] =
             serde_json::to_value(&refinement).map_err(|e| format!("serialize refinement: {e}"))?;
         verdict

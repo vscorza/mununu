@@ -49,7 +49,10 @@ use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
 use crate::mu_calculus::Environment;
 use crate::mu_calculus::parser as mu_parser;
 use crate::mu_calculus::trit::Trit;
-use crate::verdict::{ConfigPartition, PropertyVerdict, VacuityWitness, VerdictRefinement};
+use crate::verdict::{
+    AssumptionKind, ConfigPartition, DiscoveredAssumption, PropertyVerdict, VacuityWitness,
+    VerdictRefinement,
+};
 
 /// Max CEGAR refinement iterations for the scalable recoverability path — a sensible
 /// default: a pure state-atom `AG EF` target either decides at the seed abstraction or
@@ -1083,6 +1086,7 @@ pub fn verify_recoverability_refined(
     good: &str,
     extra_predicates: &[PredicateSpec],
     config_specs: &[(String, Vec<u64>)],
+    discover_assumptions_flag: bool,
 ) -> (PropertyVerdict, VerdictRefinement) {
     let verdict = verify_recoverability_with_predicates(btor2_content, good, extra_predicates)
         .unwrap_or(PropertyVerdict::Unknown);
@@ -1116,6 +1120,17 @@ pub fn verify_recoverability_refined(
         let diag = diagnose_recoverability_bot(btor2_content, good);
         if !diag.is_empty() {
             refinement.bot_diagnosis = Some(diag);
+        }
+    }
+
+    // Assumption discovery (capability B) — only when the UNCONSTRAINED property does NOT hold (an
+    // enabling assumption is only interesting for a ⊥/VIOLATED design) and the caller opted in (it
+    // costs runs). CONDITIONAL-ONLY: the discovered `holds_under` NEVER changes the canonical verdict —
+    // assumptions are not monotone for `AG EF`, so a `HoldsUnder(φ)` does not transfer unconditionally.
+    if discover_assumptions_flag && verdict != PropertyVerdict::Holds {
+        let assumptions = discover_assumptions(btor2_content, good);
+        if !assumptions.is_empty() {
+            refinement.holds_under = assumptions;
         }
     }
     (verdict, refinement)
@@ -1180,6 +1195,112 @@ fn probe_vacuous(btor2_content: &str, good: &str) -> Option<VacuityWitness> {
         }),
         _ => None, // Reachable, or Unknown/Contradiction ⇒ not (soundly) vacuous
     }
+}
+
+/// The MANDATORY non-vacuity gate for a discovered `HoldsUnder` (the i2c I1 / P1.2 lesson): an
+/// `AG EF(REG == VALUE)` HOLDS is meaningful ONLY if `good` is genuinely REACHED *and* genuinely LEFT
+/// under the assumption. Otherwise it is trivially true — `good` unreachable (nothing to recover to),
+/// or `good` stuck-true (the system never leaves it) — and the φ is worthless. Both directions via the
+/// sound [`decide_reach_portfolio`]; a `Reachable` on each is required. Any non-`Reachable` (including
+/// `Unknown`) fails the gate — we NEVER report a `HoldsUnder` we cannot certify is non-vacuous.
+fn good_nonvacuous_under(content: &str, register: &str, value: u64) -> bool {
+    use crate::adapter::btor2::bad_monitor::emit_ag_state_atom_monitor;
+    use crate::adapter::reach_portfolio::{ReachVerdict, decide_reach_portfolio};
+    let reachable = |op: CmpOp| -> bool {
+        let Ok(m) = emit_ag_state_atom_monitor(content, register, op, value as u128, false) else {
+            return false;
+        };
+        let Ok(f) = crate::adapter::btor2::parser::parse(&m) else {
+            return false;
+        };
+        matches!(decide_reach_portfolio(&f).verdict, ReachVerdict::Reachable)
+    };
+    // good REACHED: `EF(REG == VALUE)` — the `AG(REG != VALUE)` monitor's `bad` is `(REG == VALUE)`.
+    // good LEFT (not stuck-true): `EF(REG != VALUE)` — the `AG(REG == VALUE)` monitor's `bad` is `(REG != VALUE)`.
+    reachable(CmpOp::Ne) && reachable(CmpOp::Eq)
+}
+
+/// Capability B (refined-verdicts Phase 2) — DISCOVER an environment assumption φ under which an
+/// otherwise ⊥/VIOLATED `AG EF good` becomes a NON-VACUOUS HOLDS. Slice 1 searches single-input HOLDS
+/// assumptions: for each NARROW named primary input, pin it to each value, re-decide with the exact
+/// engine, and keep the pins that yield a HOLDS whose `good` passes the non-vacuity gate
+/// ([`good_nonvacuous_under`]). Each returned [`DiscoveredAssumption`] is CONDITIONAL — the caller's
+/// canonical verdict is UNCHANGED (assumptions are not monotone for `AG EF`; a `HoldsUnder(φ)` does not
+/// transfer to the unconstrained system). Conjunctive / wide-input / temporal (`ResetEventually`) /
+/// env-strategy assumptions are deferred to later Phase-2 slices; an empty result is the honest
+/// "no single-input assumption found."
+///
+/// **Engine (§16):** `exact-symbolic` full-state ROBDD (OxiDD) on each [`pin_inputs_to_constants`]
+/// concrete model (2-valued sound per pin) + the `decide_reach_portfolio` reachability engine for the
+/// non-vacuity gate. Tool-free, sidecar-free. A candidate cap + a total wall-clock budget
+/// (`MUNUNU_ASSUMPTION_BUDGET_MS`, default 90 s) bound the enumeration on wide designs.
+fn discover_assumptions(btor2_content: &str, good: &str) -> Vec<DiscoveredAssumption> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::pin::pin_inputs_to_constants;
+    const MAX_INPUT_BITS: u32 = 3; // ≤ 8 values per input — a narrow control/enable, not a datapath
+    const MAX_CANDIDATE_PINS: usize = 48;
+    let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let start = std::time::Instant::now();
+
+    // Only `REG == VALUE` targets — the non-vacuity gate needs the register + value.
+    let (register, value) = match parse_predicate_expr(good).ok() {
+        Some(PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        }) => (register, value),
+        _ => return Vec::new(),
+    };
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return Vec::new();
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+
+    // Candidate hold-axes = the design's NARROW named primary inputs. A pin that does not affect the
+    // recovery cone simply won't flip the verdict (so it is never reported) — the re-verify IS the
+    // relevance filter — so no explicit cone restriction is needed here.
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for line in &file.lines {
+        if let Node::Input { sort, .. } = &line.node
+            && let Some(name) = symbols.get(&line.nid)
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+            && w <= MAX_INPUT_BITS
+        {
+            candidates.push((name.clone(), w));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut found: Vec<DiscoveredAssumption> = Vec::new();
+    let mut pins_tried = 0usize;
+    'outer: for (name, w) in candidates {
+        for c in 0..(1u64 << w) {
+            if pins_tried >= MAX_CANDIDATE_PINS || start.elapsed().as_millis() > budget_ms {
+                break 'outer;
+            }
+            pins_tried += 1;
+            let (pinned, _) = pin_inputs_to_constants(btor2_content, &[(name.clone(), c)]);
+            // SOUNDNESS: each pinned model is CONCRETE ⇒ exact-symbolic on it is 2-valued sound; the
+            // non-vacuity gate rejects a HOLDS whose `good` is unreachable or stuck-true. The REPORT
+            // stays conditional-only (the caller never lifts it to a bare Holds).
+            if verify_recoverability_with_predicates(&pinned, good, &[]).ok()
+                == Some(PropertyVerdict::Holds)
+                && good_nonvacuous_under(&pinned, &register, value)
+            {
+                found.push(DiscoveredAssumption {
+                    phi: format!("{name} == {c}"),
+                    kind: AssumptionKind::InputHold,
+                    non_vacuous: true,
+                    engine: "exact-symbolic under single-input hold".to_string(),
+                });
+            }
+        }
+    }
+    found
 }
 
 /// Capability A (refined-verdicts Phase 1) — partition the `AG EF good` verdict over the CONFIG the
@@ -3632,7 +3753,8 @@ mod tests {
     fn refined_verdict_holds_design_has_empty_refinement() {
         const TOGGLE: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 not 1 2\n6 next 1 2 5\n";
-        let (verdict, refinement) = verify_recoverability_refined(TOGGLE, "flag == 0", &[], &[]);
+        let (verdict, refinement) =
+            verify_recoverability_refined(TOGGLE, "flag == 0", &[], &[], false);
         assert_eq!(verdict, PropertyVerdict::Holds);
         assert!(
             refinement.is_empty(),
@@ -3647,7 +3769,8 @@ mod tests {
     fn refined_verdict_vacuous_target_is_flagged() {
         const STUCK: &str =
             "1 sort bitvec 1\n2 state 1 flag\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
-        let (verdict, refinement) = verify_recoverability_refined(STUCK, "flag == 1", &[], &[]);
+        let (verdict, refinement) =
+            verify_recoverability_refined(STUCK, "flag == 1", &[], &[], false);
         assert_ne!(
             verdict,
             PropertyVerdict::Holds,
@@ -3812,7 +3935,8 @@ mod tests {
     /// while the refinement reveals the operational trap.
     #[test]
     fn verify_recoverability_refined_auto_populates_config_partition_from_reset() {
-        let (verdict, refinement) = verify_recoverability_refined(RESET_DEP, "busy == 0", &[], &[]);
+        let (verdict, refinement) =
+            verify_recoverability_refined(RESET_DEP, "busy == 0", &[], &[], false);
         assert_eq!(
             verdict,
             PropertyVerdict::Holds,
@@ -3823,6 +3947,102 @@ mod tests {
             .expect("bare --refine auto-identifies the reset config axis");
         assert_eq!(part.holds, vec![vec![("rst_n".to_string(), 0)]]);
         assert_eq!(part.violated, vec![vec![("rst_n".to_string(), 1)]]);
+    }
+
+    // A trap FSM: IDLE(0) --go--> WORK(1); WORK --en=0--> FAULT(2, absorbing) / --en=1--> IDLE.
+    // Free-input: FAULT is reachable (IDLE→WORK→en=0) and absorbing ⇒ `AG EF(st==0)` VIOLATED. Held
+    // `en==1`: WORK always returns to IDLE and FAULT becomes UNREACHABLE ⇒ AG (over reachable states)
+    // HOLDS — the non-monotone flip that assumption discovery surfaces as `HoldsUnder(en==1)`. Holding
+    // `go==0` also makes it "HOLD" but VACUOUSLY (st never leaves 0) ⇒ the non-vacuity gate must reject it.
+    const EN_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 en
+4 input 2 go
+5 state 1 st
+6 zero 1
+7 init 1 5 6
+8 one 1
+9 constd 1 2
+10 eq 2 5 6
+11 eq 2 5 8
+13 ite 1 4 8 6
+14 ite 1 3 6 9
+15 ite 1 11 14 9
+16 ite 1 10 13 15
+17 next 1 5 16
+";
+
+    /// Capability B slice 1 — assumption discovery finds the single-input hold `en == 1` under which the
+    /// free-input-VIOLATED `AG EF(st==0)` becomes a NON-VACUOUS HOLDS (holding `en` high keeps the FAULT
+    /// trap unreachable). The vacuous `go == 0` hold (st never leaves IDLE) must be REJECTED by the gate.
+    #[test]
+    fn discover_assumptions_finds_nonvacuous_input_hold() {
+        let found = discover_assumptions(EN_TRAP, "st == 0");
+        assert!(
+            found.iter().any(|a| a.phi == "en == 1"
+                && a.kind == AssumptionKind::InputHold
+                && a.non_vacuous),
+            "expected a non-vacuous HoldsUnder(en == 1): {found:?}"
+        );
+        assert!(
+            !found.iter().any(|a| a.phi == "go == 0"),
+            "the vacuous `go==0` hold (st stuck at IDLE) must fail the non-vacuity gate: {found:?}"
+        );
+    }
+
+    /// Capability B slice 1 — end-to-end via `verify_recoverability_refined` (opt-in flag): the
+    /// discovered assumption rides in `holds_under`, and the CANONICAL verdict stays VIOLATED (the
+    /// conditional-only guard — assumptions are not monotone for `AG EF`, so a HoldsUnder never lifts
+    /// the verdict to a bare Holds).
+    #[test]
+    fn refined_verdict_carries_discovered_assumption_without_changing_verdict() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(EN_TRAP, "st == 0", &[], &[], true);
+        assert_eq!(
+            verdict,
+            PropertyVerdict::Violated,
+            "free-input the FAULT trap is reachable ⇒ canonical verdict stays VIOLATED"
+        );
+        assert!(
+            refinement
+                .holds_under
+                .iter()
+                .any(|a| a.phi == "en == 1" && a.non_vacuous),
+            "the enabling assumption rides in holds_under: {refinement:?}"
+        );
+    }
+
+    /// Capability B slice 1 SOUNDNESS CONTROL — a structurally-dead target (`st` stuck at 1, `st==0`
+    /// unreachable regardless of the input `x`) must yield NO discovered assumption: no input hold can
+    /// make an unreachable `good` non-vacuously hold, so assumption discovery must NOT fabricate a φ.
+    #[test]
+    fn discover_assumptions_none_for_structurally_dead_target() {
+        const DEAD: &str = "\
+1 sort bitvec 1
+2 input 1 x
+3 state 1 st
+4 one 1
+5 init 1 3 4
+6 next 1 3 4
+";
+        assert!(
+            discover_assumptions(DEAD, "st == 0").is_empty(),
+            "no input hold makes an unreachable target non-vacuously hold ⇒ no spurious assumption"
+        );
+    }
+
+    /// Capability B slice 1 CONTROL — a design that already HOLDS free-input needs no assumption: with
+    /// the flag set, discovery does not run (verdict == Holds) ⇒ `holds_under` stays empty (no noise).
+    #[test]
+    fn refined_verdict_no_assumption_when_already_holds() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(RESET_DEP, "busy == 0", &[], &[], true);
+        assert_eq!(verdict, PropertyVerdict::Holds);
+        assert!(
+            refinement.holds_under.is_empty(),
+            "a free-HOLDS design needs no enabling assumption: {refinement:?}"
+        );
     }
 
     /// Actionable-⊥ diagnosis — a recovery target riding only NARROW control state localizes NO

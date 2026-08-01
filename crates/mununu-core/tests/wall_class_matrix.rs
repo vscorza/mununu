@@ -780,7 +780,8 @@ fn config_partition_over_reset_partitions_opentitan_fsms() {
 fn auto_config_partition_identifies_reset_on_opentitan_fsms() {
     use mununu_core::adapter::recoverability::verify_recoverability_refined;
 
-    let (_v, aes) = verify_recoverability_refined(AES_CIPHER, "aes_cipher_ctrl_cs == 9", &[], &[]);
+    let (_v, aes) =
+        verify_recoverability_refined(AES_CIPHER, "aes_cipher_ctrl_cs == 9", &[], &[], false);
     let part = aes
         .config_partition
         .expect("bare --refine auto-identifies rst_ni on aes_cipher");
@@ -790,7 +791,7 @@ fn auto_config_partition_identifies_reset_on_opentitan_fsms() {
         "auto reset-partition reproduces the aes_cipher branching pair: {part:?}"
     );
 
-    let (_v, csrng) = verify_recoverability_refined(CSRNG, "state_q == 55", &[], &[]);
+    let (_v, csrng) = verify_recoverability_refined(CSRNG, "state_q == 55", &[], &[], false);
     let part = csrng
         .config_partition
         .expect("bare --refine auto-identifies rst_ni on csrng");

@@ -1019,6 +1019,12 @@ pub struct Btor2VerifyRecoverabilityRequest {
     /// Implies the refined output. Mirrors the CLI `--config-values`.
     #[serde(default)]
     pub config_values: Vec<String>,
+    /// Assumption discovery (capability B): when the property does NOT hold, search for an environment
+    /// assumption φ under which it becomes a non-vacuous HOLDS → the refinement carries `holds_under`.
+    /// CONDITIONAL-only (never changes the canonical verdict). Implies the refined output. Mirrors the
+    /// CLI `--discover-assumptions`.
+    #[serde(default)]
+    pub discover_assumptions: bool,
 }
 
 /// Response for `POST /api/v1/btor2/verify-recoverability`.
@@ -1185,6 +1191,10 @@ pub struct SvVerifyRecoverabilityRequest {
     /// Config-partition config inputs, each `"NAME=v1,v2,..."` (mirrors the CLI `--config-values`).
     #[serde(default)]
     pub config_values: Vec<String>,
+    /// Assumption discovery (capability B): search for an enabling φ when the property does not hold →
+    /// `holds_under` (conditional-only). Mirrors the CLI `--discover-assumptions`.
+    #[serde(default)]
+    pub discover_assumptions: bool,
 }
 
 /// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width
