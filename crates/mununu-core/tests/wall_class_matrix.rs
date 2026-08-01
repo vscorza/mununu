@@ -1024,3 +1024,47 @@ fn env_strategy_positional_marginal_reach_scan() {
          (0 ⇒ positional/general strategy is SYNTHETIC-ONLY ⇒ T2/T3 documented-not-headlined)\n"
     );
 }
+
+/// P2.5-E T2 — the strategy-WITNESS extraction, validated on the real OpenTitan EDN boot handshake.
+/// `exact_env_strategy_witness` returns a concrete winning play that EXHIBITS the positional discipline:
+/// `boot_req_mode_i = 1` at Idle (state 193, to START the boot flow) and `= 0` at BootDone (state 240,
+/// to PROGRESS to BootLoadUni) — the same input at opposite values in two states, the strategy no
+/// constant hold can express. This is the deeper machinery (T2) doing real work on real RTL.
+#[test]
+fn edn_witness_play_exhibits_positional_strategy() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_witness;
+    let play =
+        exact_env_strategy_witness(EDN_BOOT, "state_q == 44").expect("a winning play exists");
+    // Per-step (state, boot_req) pairs from the play (state cell resolves to `state_d` post-async2sync).
+    let step = |want_state: u128| -> Option<u128> {
+        play.prefix
+            .iter()
+            .zip(play.inputs.iter())
+            .find_map(|(st, inp)| {
+                let s = st
+                    .iter()
+                    .find(|(k, _)| k.contains("state"))
+                    .map(|(_, v)| *v)?;
+                (s == want_state)
+                    .then(|| inp.get("boot_req_mode_i").copied())
+                    .flatten()
+            })
+    };
+    assert_eq!(
+        step(193),
+        Some(1),
+        "positional: the strategy asserts boot_req_mode_i=1 at Idle (193) to start the boot"
+    );
+    assert_eq!(
+        step(240),
+        Some(0),
+        "positional: the strategy deasserts boot_req_mode_i=0 at BootDone (240) to progress"
+    );
+    assert_eq!(
+        play.cycle
+            .first()
+            .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
+        Some(44),
+        "the play reaches BootUniAckWait (44)"
+    );
+}

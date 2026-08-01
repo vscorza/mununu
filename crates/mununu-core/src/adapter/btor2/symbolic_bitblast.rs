@@ -2859,6 +2859,48 @@ pub fn exact_env_strategy_exists(
     }
 }
 
+/// Shared setup for the env-strategy witness: parse + resolve `good` to a state-atom BDD (via the sound
+/// Strict alias resolution) + build the cone-restricted exact bit-blaster. `None` when `good` is not a
+/// resolvable `REG op VALUE` atom or the model cannot be built (over-cap / array / input-atom).
+fn build_atom_model(
+    btor2_content: &str,
+    good: &str,
+) -> Option<(BddBitBlaster, Btor2File, BDDFunction)> {
+    use crate::adapter::btor2::parser;
+    let file = parser::parse(btor2_content).ok()?;
+    let resolve = |name: &str| -> String {
+        parser::resolve_to_canonical_name(
+            &file,
+            name,
+            parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
+    };
+    let expr = resolve_predicate_expr_registers(&parse_predicate_atom_bool(good).ok()?, &resolve);
+    let mut seed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_predicate_registers(&expr, &mut seed);
+    let seed_atoms: Vec<String> = seed.into_iter().collect();
+    let keep_set = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref()).ok()?;
+    let good_bdd = bb.predicate_bdd(&expr).ok()?;
+    Some((bb, file, good_bdd))
+}
+
+/// P2.5-E T2 — extract a concrete env-strategy WITNESS for `AG EF good`: the positional input discipline
+/// that drives the design to `good`, as a `(state, input)` winning play ([`BddBitBlaster::reach_good_play`]).
+/// The trace exhibits a POSITIONAL strategy directly — the same input at different values in different
+/// states (the shape no constant hold can express). `None` when `good` is not a resolvable atom, the
+/// model can't be built, or `good` is unreachable from the initial state.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD — the `EF(good)` attractor + concrete minterm descent.
+pub fn exact_env_strategy_witness(btor2_content: &str, good: &str) -> Option<StallLasso> {
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good)?;
+    bb.reach_good_play(&file, &good_bdd)
+}
+
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
 /// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
 /// - bare `AF p` = `μX. (p ∨ [] X)`,
@@ -3266,6 +3308,68 @@ impl BddBitBlaster {
                 });
             }
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            s = ns;
+        }
+        None
+    }
+
+    /// P2.5-E T2 — a concrete WINNING PLAY for `AG EF good`: the environment's positional strategy
+    /// exhibited as a `(state, input)` trajectory from the initial state that REACHES `p` (`good`). It is
+    /// the DUAL of [`Self::exact_reachable_trap_path`] (which descends toward the trap): here we descend
+    /// the `EF(good)` attractor toward `good`, and at each state pick an input that strictly decreases the
+    /// reachability rank. A POSITIONAL discipline surfaces directly in the trace — the SAME input takes
+    /// different values in different states (e.g. `boot_req=1` at Idle, `boot_req=0` at BootDone) — which
+    /// no constant hold can express. `prefix`/`inputs` are the play; `cycle` holds the reached `good`
+    /// state. `None` if `good` is unreachable from the initial state.
+    ///
+    /// **Engine (§16):** `exact-symbolic` ROBDD — the `EF` attractor layers (`diamond_pre` = ∃input) +
+    /// the concrete minterm descent (`pick_full_assignment`/`eval_step`), reusing the trap-path machinery.
+    pub fn reach_good_play(&self, file: &Btor2File, p: &BDDFunction) -> Option<StallLasso> {
+        let exact = self.exact_model();
+        // EF(good) attractor layers toward `good`: L_0 = good, L_k = L_{k-1} ∨ ◇L_{k-1}.
+        let mut layers = vec![p.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.diamond_pre(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let init = self.initial_state_bdd(file);
+        let reachable = init.and(layers.last().unwrap()).unwrap();
+        if reachable == self.ff {
+            return None; // good unreachable from init
+        }
+        let mut s = self.pick_state_assignment(&reachable);
+        let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if self.state_minterm(&s).and(p).unwrap() != self.ff {
+                return Some(StallLasso {
+                    prefix,
+                    cycle: vec![s],
+                    inputs,
+                });
+            }
+            prefix.push(s.clone());
+            // Current attractor rank `k`; pick an input stepping into layer `k-1` (rank strictly down).
+            let k = (1..layers.len())
+                .find(|&k| self.state_minterm(&s).and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(1);
+            let step = self
+                .state_minterm(&s)
+                .and(&exact.to_next(&layers[k - 1]))
+                .unwrap();
+            if step == self.ff {
+                return None; // no rank-decreasing move (should not happen inside the attractor)
+            }
+            let full = self.pick_full_assignment(&step);
             inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
@@ -6365,6 +6469,43 @@ mod tests {
             Some(false),
             "the env cannot avoid the forced trap ⇒ no strategy"
         );
+    }
+
+    /// P2.5-E T2 — the strategy WITNESS (winning play) exhibits a POSITIONAL discipline. POS_REACH: from
+    /// A(0) reach GOAL(2) requires `x=1` at A (→B) then `x=0` at B (→GOAL) — opposite input values in two
+    /// states, no constant hold works. `exact_env_strategy_witness` returns the play showing exactly that.
+    #[test]
+    fn env_strategy_witness_exhibits_positional_play() {
+        const POS_REACH: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 x
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 one 1
+8 constd 1 2
+9 eq 2 4 5
+10 eq 2 4 7
+11 ite 1 3 7 5
+12 ite 1 3 7 8
+13 ite 1 10 12 8
+14 ite 1 9 11 13
+15 next 1 4 14
+";
+        let play =
+            exact_env_strategy_witness(POS_REACH, "st == 2").expect("a winning play to GOAL");
+        let at = |s: u128| -> Option<u128> {
+            play.prefix
+                .iter()
+                .zip(play.inputs.iter())
+                .find_map(|(st, inp)| {
+                    let v = st.iter().find(|(k, _)| k.contains("st")).map(|(_, v)| *v)?;
+                    (v == s).then(|| inp.get("x").copied()).flatten()
+                })
+        };
+        assert_eq!(at(0), Some(1), "positional: x=1 at A(0) to advance to B");
+        assert_eq!(at(1), Some(0), "positional: x=0 at B(1) to reach GOAL");
     }
 
     /// Phase 2b — a non-`REG op VALUE` / unresolvable atom is Inapplicable (the caller abstains),
