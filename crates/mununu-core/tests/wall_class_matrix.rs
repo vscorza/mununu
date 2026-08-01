@@ -912,14 +912,17 @@ fn env_strategy_marginal_reach_over_constant_hold() {
 /// `#[ignore]` — run on demand: `cargo test -p mununu-core --test wall_class_matrix -- --ignored --nocapture env_strategy_positional_marginal_reach_scan`
 #[test]
 #[ignore]
+#[allow(clippy::type_complexity)] // the scan's row tuple is local + self-documenting
 fn env_strategy_positional_marginal_reach_scan() {
     use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_exists;
-    use mununu_core::mu_calculus::{env_enforce::env_enforce, parser};
+    use mununu_core::mu_calculus::parser;
 
     // Synthetic positive control: per-state safe input, no constant hold works (T1's marginal case).
     const POSITIONAL_TRAP: &str = "\
 1 sort bitvec 2\n2 sort bitvec 1\n3 input 2 x\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 one 1\n8 constd 1 2\n9 constd 1 3\n10 eq 2 4 5\n11 eq 2 4 7\n12 eq 2 4 8\n13 ite 1 3 9 7\n14 ite 1 3 8 9\n15 ite 1 3 9 5\n16 ite 1 12 15 9\n17 ite 1 11 14 16\n18 ite 1 10 13 17\n19 next 1 4 18\n";
 
+    // `exact_env_strategy_exists` applies the `env_enforce` rewrite internally, so the scan passes the
+    // plain recoverability formula.
     let recov =
         |good: &str| parser::parse(&format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)")).unwrap();
     let rows: Vec<(&str, &str, &str, &[(&str, u64)])> = vec![
