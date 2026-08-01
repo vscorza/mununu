@@ -1123,14 +1123,34 @@ pub fn verify_recoverability_refined(
         }
     }
 
-    // Assumption discovery (capability B) — only when the UNCONSTRAINED property does NOT hold (an
-    // enabling assumption is only interesting for a ⊥/VIOLATED design) and the caller opted in (it
-    // costs runs). CONDITIONAL-ONLY: the discovered `holds_under` NEVER changes the canonical verdict —
-    // assumptions are not monotone for `AG EF`, so a `HoldsUnder(φ)` does not transfer unconditionally.
-    if discover_assumptions_flag && verdict != PropertyVerdict::Holds {
-        let assumptions = discover_assumptions(btor2_content, good);
-        if !assumptions.is_empty() {
-            refinement.holds_under = assumptions;
+    // Assumption discovery (capability B) — the caller opted in (it costs runs). CONDITIONAL-ONLY: the
+    // discovered `holds_under` NEVER changes the canonical verdict (assumptions are not monotone for
+    // `AG EF`, so a `HoldsUnder(φ)` does not transfer unconditionally).
+    if discover_assumptions_flag {
+        if verdict != PropertyVerdict::Holds {
+            // Base model does not hold ⇒ search for an enabling assumption over the base model.
+            let assumptions = discover_assumptions(btor2_content, good, &[]);
+            if !assumptions.is_empty() {
+                refinement.holds_under = assumptions;
+            }
+        } else if let Some(part) = &refinement.config_partition
+            && let Some(operational) = part.violated.first()
+        {
+            // A→B COMPOSITION: the base HOLDS (e.g. a free reset trivially recovers `AG EF`), but
+            // `config_partition` found an operational config cell that is VIOLATED. Discover the
+            // enabling assumption WITHIN that operational config — capability A localizes the bad
+            // config, capability B explains how to still recover under it (e.g. free-reset HOLDS, but
+            // operationally (`rst=1`) it traps unless a fault strobe is held low).
+            //
+            // Pinning the reset inactive removes the async reset that establishes the FSM's start state,
+            // so on real RTL the operational model would have a HAVOC initial state (it could START in the
+            // trap ⇒ no constant hold recovers). `operational_reset_init_model` injects the post-reset
+            // init first, so the search asks the meaningful "from the reset state, operationally" question.
+            let op_model = operational_reset_init_model(btor2_content);
+            let assumptions = discover_assumptions(&op_model, good, operational);
+            if !assumptions.is_empty() {
+                refinement.holds_under = assumptions;
+            }
         }
     }
     (verdict, refinement)
@@ -1234,7 +1254,27 @@ fn good_nonvacuous_under(content: &str, register: &str, value: u64) -> bool {
 /// concrete model (2-valued sound per pin) + the `decide_reach_portfolio` reachability engine for the
 /// non-vacuity gate. Tool-free, sidecar-free. A candidate cap + a total wall-clock budget
 /// (`MUNUNU_ASSUMPTION_BUDGET_MS`, default 90 s) bound the enumeration on wide designs.
-fn discover_assumptions(btor2_content: &str, good: &str) -> Vec<DiscoveredAssumption> {
+/// Build the faithful OPERATIONAL model for the A→B composition: an async-reset design derives its
+/// start state FROM the reset, so pinning the reset inactive (to ask the operational question) would
+/// leave a HAVOC initial state — the trap becomes reachable as an initial state and no constant hold
+/// can recover. [`inject_reset_init`] simulates one reset-asserted cycle and appends the post-reset
+/// `init` lines, so the operational search starts from the reset state. No-op when the design has no
+/// detected reset or already carries authoritative `init` lines (then it is returned unchanged).
+fn operational_reset_init_model(btor2_content: &str) -> String {
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return btor2_content.to_string();
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    let resets = crate::adapter::fsm_scan::detect_resets(&file, &symbols);
+    crate::adapter::btor2::reset_init::inject_reset_init(btor2_content, &resets)
+        .unwrap_or_else(|_| btor2_content.to_string())
+}
+
+fn discover_assumptions(
+    btor2_content: &str,
+    good: &str,
+    context: &[(String, u64)],
+) -> Vec<DiscoveredAssumption> {
     use crate::adapter::btor2::ast::Node;
     use crate::adapter::btor2::pin::pin_inputs_to_constants;
     const MAX_INPUT_BITS: u32 = 3; // ≤ 8 values per input — a narrow control/enable, not a datapath
@@ -1254,7 +1294,25 @@ fn discover_assumptions(btor2_content: &str, good: &str) -> Vec<DiscoveredAssump
         }) => (register, value),
         _ => return Vec::new(),
     };
-    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+    // `context` = config pins applied FIRST (the A→B composition: the operational config the recovery
+    // rides on, e.g. `rst_ni=1` from a VIOLATED `config_partition` cell). Enumerate candidates over the
+    // context-pinned model so the context inputs are already constants (not re-searched), and prefix each
+    // discovered φ with the context so the reported assumption is the FULL enabling condition.
+    let base = if context.is_empty() {
+        btor2_content.to_string()
+    } else {
+        pin_inputs_to_constants(btor2_content, context).0
+    };
+    let ctx_prefix: String = context
+        .iter()
+        .map(|(n, v)| format!("{n} == {v} && "))
+        .collect();
+    let engine = if context.is_empty() {
+        "exact-symbolic under single-input hold".to_string()
+    } else {
+        "exact-symbolic under config-scoped input hold".to_string()
+    };
+    let Ok(file) = crate::adapter::btor2::parser::parse(&base) else {
         return Vec::new();
     };
     let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
@@ -1283,7 +1341,7 @@ fn discover_assumptions(btor2_content: &str, good: &str) -> Vec<DiscoveredAssump
                 break 'outer;
             }
             pins_tried += 1;
-            let (pinned, _) = pin_inputs_to_constants(btor2_content, &[(name.clone(), c)]);
+            let (pinned, _) = pin_inputs_to_constants(&base, &[(name.clone(), c)]);
             // SOUNDNESS: each pinned model is CONCRETE ⇒ exact-symbolic on it is 2-valued sound; the
             // non-vacuity gate rejects a HOLDS whose `good` is unreachable or stuck-true. The REPORT
             // stays conditional-only (the caller never lifts it to a bare Holds).
@@ -1292,10 +1350,10 @@ fn discover_assumptions(btor2_content: &str, good: &str) -> Vec<DiscoveredAssump
                 && good_nonvacuous_under(&pinned, &register, value)
             {
                 found.push(DiscoveredAssumption {
-                    phi: format!("{name} == {c}"),
+                    phi: format!("{ctx_prefix}{name} == {c}"),
                     kind: AssumptionKind::InputHold,
                     non_vacuous: true,
-                    engine: "exact-symbolic under single-input hold".to_string(),
+                    engine: engine.clone(),
                 });
             }
         }
@@ -3978,7 +4036,7 @@ mod tests {
     /// trap unreachable). The vacuous `go == 0` hold (st never leaves IDLE) must be REJECTED by the gate.
     #[test]
     fn discover_assumptions_finds_nonvacuous_input_hold() {
-        let found = discover_assumptions(EN_TRAP, "st == 0");
+        let found = discover_assumptions(EN_TRAP, "st == 0", &[]);
         assert!(
             found.iter().any(|a| a.phi == "en == 1"
                 && a.kind == AssumptionKind::InputHold
@@ -4027,13 +4085,16 @@ mod tests {
 6 next 1 3 4
 ";
         assert!(
-            discover_assumptions(DEAD, "st == 0").is_empty(),
+            discover_assumptions(DEAD, "st == 0", &[]).is_empty(),
             "no input hold makes an unreachable target non-vacuously hold ⇒ no spurious assumption"
         );
     }
 
     /// Capability B slice 1 CONTROL — a design that already HOLDS free-input needs no assumption: with
-    /// the flag set, discovery does not run (verdict == Holds) ⇒ `holds_under` stays empty (no noise).
+    /// the flag set: the base HOLDS and the A→B composition runs on the operational cell (rst_n=1) but
+    /// finds NO non-vacuous hold — RESET_DEP's operational trap (once `busy` is set via `start` it sticks)
+    /// is unavoidable by a constant input hold (holding `start=0` is vacuous — `busy` never leaves 0). So
+    /// `holds_under` stays empty (no noise / no false positive from the composition).
     #[test]
     fn refined_verdict_no_assumption_when_already_holds() {
         let (verdict, refinement) =
@@ -4041,7 +4102,116 @@ mod tests {
         assert_eq!(verdict, PropertyVerdict::Holds);
         assert!(
             refinement.holds_under.is_empty(),
-            "a free-HOLDS design needs no enabling assumption: {refinement:?}"
+            "the operational trap is unavoidable by a constant hold ⇒ no enabling assumption: {refinement:?}"
+        );
+    }
+
+    // Free reset `rst` (active-low mux `ite(rst, op, 0)`) escapes any trap ⇒ base `AG EF(st==0)` HOLDS.
+    // Operationally (rst=1) it is an INPUT-GATED trap: IDLE(0)--go-->WORK(1); WORK--en=0-->FAULT(2,
+    // absorbing) / --en=1-->IDLE. `config_partition` localizes violated:[rst=1]; the A→B composition then
+    // discovers the OPERATIONAL enabling hold `en==1` within that config.
+    const RESET_GATE_TRAP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 rst
+4 input 2 go
+5 input 2 en
+6 state 1 st
+7 zero 1
+8 init 1 6 7
+9 one 1
+10 constd 1 2
+11 eq 2 6 7
+12 eq 2 6 9
+13 ite 1 4 9 7
+14 ite 1 5 7 10
+15 ite 1 12 14 10
+16 ite 1 11 13 15
+17 ite 1 3 16 7
+18 next 1 6 17
+";
+
+    // Like the LIFTED async-reset RTL (e.g. compute_engine_faulty): the reset mux establishes the start
+    // state and there is NO `init` line. Active-low reset `rst_n`; operationally (rst_n=1) IDLE--start-->
+    // WORK; WORK--err=1-->FAULT(absorbing) / --err=0-->IDLE. Without inject_reset_init, pinning rst_n=1
+    // leaves a havoc init (could start in FAULT) ⇒ no hold recovers; WITH it the operational search starts
+    // from the reset state (IDLE) ⇒ `rst_n==1 && err==0` recovers. This is the real-RTL composition shape.
+    const CEF_LIKE_NO_INIT: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 input 2 rst_n
+4 input 2 start
+5 input 2 err
+6 state 1 st
+7 zero 1
+9 one 1
+10 constd 1 2
+11 eq 2 6 7
+12 eq 2 6 9
+13 ite 1 4 9 7
+14 ite 1 5 10 7
+15 ite 1 12 14 10
+16 ite 1 11 13 15
+17 ite 1 3 16 7
+18 next 1 6 17
+";
+
+    /// A→B COMPOSITION on the REAL-RTL shape (async reset, NO init line) — proves `inject_reset_init` in
+    /// `operational_reset_init_model` is what makes the composition reach lifted RTL: the operational model
+    /// starts from the reset state (IDLE), so discovery finds `rst_n == 1 && err == 0` (avoid the fault
+    /// strobe). Without the init injection, the havoc start would leave `holds_under` empty.
+    #[test]
+    fn refined_verdict_composition_reaches_no_init_async_reset_shape() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(CEF_LIKE_NO_INIT, "st == 0", &[], &[], true);
+        assert_eq!(verdict, PropertyVerdict::Holds, "free reset ⇒ base HOLDS");
+        assert!(
+            refinement
+                .config_partition
+                .as_ref()
+                .is_some_and(|p| p.violated.contains(&vec![("rst_n".to_string(), 1)])),
+            "config_partition localizes operational rst_n=1: {:?}",
+            refinement.config_partition
+        );
+        assert!(
+            refinement
+                .holds_under
+                .iter()
+                .any(|a| a.phi == "rst_n == 1 && err == 0" && a.non_vacuous),
+            "reset-init operational composition finds rst_n==1 && err==0: {:?}",
+            refinement.holds_under
+        );
+    }
+
+    /// A→B COMPOSITION — the base `AG EF(st==0)` HOLDS via the free-reset escape, so `config_partition`
+    /// (capability A) localizes the operational trap (violated:[rst=1]) and assumption discovery
+    /// (capability B) runs WITHIN that config to surface the operational enabling assumption
+    /// `rst == 1 && en == 1`. Capability A says WHICH config is bad; capability B says how to recover
+    /// under it. Canonical verdict stays HOLDS (conditional-only, unchanged).
+    #[test]
+    fn refined_verdict_composes_config_partition_with_assumption_discovery() {
+        let (verdict, refinement) =
+            verify_recoverability_refined(RESET_GATE_TRAP, "st == 0", &[], &[], true);
+        assert_eq!(
+            verdict,
+            PropertyVerdict::Holds,
+            "free reset ⇒ AG EF(st==0) HOLDS (base, unchanged)"
+        );
+        let part = refinement
+            .config_partition
+            .as_ref()
+            .expect("auto reset config_partition localizes the operational trap");
+        assert!(
+            part.violated.contains(&vec![("rst".to_string(), 1)]),
+            "operational (rst=1) traps: {part:?}"
+        );
+        assert!(
+            refinement
+                .holds_under
+                .iter()
+                .any(|a| a.phi == "rst == 1 && en == 1" && a.non_vacuous),
+            "A→B composition surfaces the operational enabling assumption: {:?}",
+            refinement.holds_under
         );
     }
 
