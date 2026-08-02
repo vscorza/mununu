@@ -272,6 +272,15 @@ const CSRNG_MAIN_SM: &str = include_str!("fixtures/wall_classes/csrng_main_sm_fs
 // — an "acknowledge only when expected" discipline. No constant ACK hold reaches Running; free HOLDS.
 const OTBN_START_STOP: &str = include_str!("fixtures/wall_classes/otbn_start_stop_fsm.btor");
 
+// RTL — the OpenTitan ROM controller check FSM, extracted verbatim to
+// examples/recoverability/rom_ctrl_fsm.sv and lifted. The THIRD real POSITIONAL env-strategy case, and a
+// SECOND instance of the otbn "ack-when-expected" flavor (confirming it recurs across OT security FSMs):
+// reaching the terminal Done (state_q==518) needs `kmac_done_i=0` at ReadingLow (a stray ACK trips the
+// SEC_CM consistency check → Invalid) AND `=1` at ReadingHigh/RomAhead (to progress to Checking→Done).
+// The FSM is LINEAR (upstream ASSERT_FPV_LINEAR_FSM) so Done is unique-path; no constant ACK reaches it.
+// The rom_ctrl_counter / rom_ctrl_compare submodules are black-boxed to free inputs (counter_*/checker_*).
+const ROM_CTRL_FSM: &str = include_str!("fixtures/wall_classes/rom_ctrl_fsm.btor");
+
 // ARRAY-CONTENT-GATED νµ recoverability (the SPCR class, PR #410). `AG EF(busy==0)` where recovery
 // routes through ARRAY CONTENT read at a latched index: `busy` clears only when `mem[key]==all-ones`.
 // exact-symbolic SKIPs the in-cone `$mem`; the plain cube's must-edge is an AUFBV ∀-over-array query
@@ -1214,5 +1223,81 @@ fn otbn_witness_play_exhibits_positional_ack_strategy() {
             .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
         Some(119),
         "the play reaches Running (119)"
+    );
+}
+
+/// P2.5-E — the THIRD real POSITIONAL env-strategy case, on the OpenTitan ROM controller check FSM
+/// (`rom_ctrl_fsm`, extracted verbatim). A different security-critical function (secure-boot ROM
+/// integrity) and a SECOND instance of the otbn "ack-when-expected" flavor — confirming that discipline
+/// recurs across OpenTitan security FSMs rather than being a one-off. `kmac_done_i` (the KMAC-digest-ready
+/// ACK) must take opposite values in two states to reach the terminal Done (`state_q==518`): `=0` at
+/// ReadingLow (a stray ACK trips the SEC_CM consistency check → Invalid) and `=1` at ReadingHigh/RomAhead
+/// (to hand off the digest and progress to Checking→Done). The FSM is LINEAR (upstream
+/// `ASSERT_FPV_LINEAR_FSM`) so Done is unique-path; NO constant ACK reaches it (const-1 → Invalid at
+/// ReadingLow; const-0 → stalls at RomAhead), yet a POSITIONAL strategy does. The rom_ctrl_counter /
+/// rom_ctrl_compare submodules are black-boxed to free inputs (the standard chaotic-stub over-approx);
+/// the free reset provides the AG-escape from Invalid. Host-runnable, gates `make ci`.
+#[test]
+fn rom_ctrl_kmac_ack_is_a_third_positional_env_strategy_case() {
+    use mununu_core::adapter::btor2::pin::pin_inputs_to_constants;
+    let good = "state_q == 518"; // Done
+    // Free-input: the env CAN drive the ROM check to completion ⇒ AG EF HOLDS.
+    assert_eq!(
+        verify_recoverability(ROM_CTRL_FSM, good).ok(),
+        Some(PropertyVerdict::Holds),
+        "free-input the ROM check reaches Done (the positional path exists)"
+    );
+    // But NO constant `kmac_done_i` hold reaches Done — the ACK discipline is state-dependent.
+    for v in [0u64, 1] {
+        let (pinned, _) = pin_inputs_to_constants(ROM_CTRL_FSM, &[("kmac_done_i".to_string(), v)]);
+        assert_eq!(
+            verify_recoverability(&pinned, good).ok(),
+            Some(PropertyVerdict::Violated),
+            "constant kmac_done_i={v} cannot reach Done (positional, no constant ACK hold)"
+        );
+    }
+}
+
+/// P2.5-E T2 — the strategy-WITNESS extraction on the THIRD case (ROM controller). The play exhibits the
+/// ack-when-expected discipline: `kmac_done_i = 0` at ReadingLow (state 201 — a stray ACK would trap to
+/// Invalid) and `= 1` at ReadingHigh (state 185) or RomAhead (state 921), reaching Done (518). Shows T2
+/// generalizes to all three positional cases.
+#[test]
+fn rom_ctrl_witness_play_exhibits_positional_ack_strategy() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_witness;
+    let play =
+        exact_env_strategy_witness(ROM_CTRL_FSM, "state_q == 518").expect("a winning play exists");
+    let ack_at = |want_state: u128| -> Option<u128> {
+        play.prefix
+            .iter()
+            .zip(play.inputs.iter())
+            .find_map(|(st, inp)| {
+                let s = st
+                    .iter()
+                    .find(|(k, _)| k.contains("state"))
+                    .map(|(_, v)| *v)?;
+                (s == want_state)
+                    .then(|| inp.get("kmac_done_i").copied())
+                    .flatten()
+            })
+    };
+    assert_eq!(
+        ack_at(201),
+        Some(0),
+        "positional: the strategy keeps kmac_done_i=0 at ReadingLow (a stray ACK would trap to Invalid)"
+    );
+    // Progress to Checking needs kmac_done_i=1 at ReadingHigh (185) or RomAhead (921) — accept either,
+    // since the {kmac_done,counter_done} race picks the path.
+    let progressed = ack_at(185) == Some(1) || ack_at(921) == Some(1);
+    assert!(
+        progressed,
+        "positional: the strategy asserts kmac_done_i=1 at ReadingHigh/RomAhead to progress"
+    );
+    assert_eq!(
+        play.cycle
+            .first()
+            .and_then(|s| s.iter().find(|(k, _)| k.contains("state")).map(|(_, v)| *v)),
+        Some(518),
+        "the play reaches Done (518)"
     );
 }
