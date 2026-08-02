@@ -898,7 +898,11 @@ impl BddBitBlaster {
         predicates: &[PredicateExpr],
         must: Option<MustSemantics>,
     ) -> Result<AbstractRelation, String> {
-        self.abstract_relation_impl(predicates, must, None)
+        let pred_bdds = predicates
+            .iter()
+            .map(|e| self.predicate_bdd(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.abstract_relation_impl(&pred_bdds, must, None)
     }
 
     /// P2.5-F — build the abstract relation as a TWO-PLAYER game: `controllable` names the controller's
@@ -912,18 +916,35 @@ impl BddBitBlaster {
         must: MustSemantics,
         controllable: &std::collections::HashSet<String>,
     ) -> Result<AbstractRelation, String> {
-        self.abstract_relation_impl(predicates, Some(must), Some(controllable))
+        let pred_bdds = predicates
+            .iter()
+            .map(|e| self.predicate_bdd(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.abstract_relation_impl(&pred_bdds, Some(must), Some(controllable))
+    }
+
+    /// P2.5-F (game-CEGAR) — build the two-player game from PRE-BUILT predicate BDDs (over the present
+    /// register vars) rather than [`PredicateExpr`]s. CEGAR's refinement predicates are the pre-image
+    /// regions of existing predicates — arbitrary BDDs, not `REG op VALUE` atoms — so the loop supplies
+    /// them directly here.
+    pub fn abstract_game_bdd(
+        &self,
+        pred_bdds: &[BDDFunction],
+        must: MustSemantics,
+        controllable: &std::collections::HashSet<String>,
+    ) -> Result<AbstractRelation, String> {
+        self.abstract_relation_impl(pred_bdds, Some(must), Some(controllable))
     }
 
     fn abstract_relation_impl(
         &self,
-        predicates: &[PredicateExpr],
+        pred_bdds: &[BDDFunction],
         must: Option<MustSemantics>,
         controllable: Option<&std::collections::HashSet<String>>,
     ) -> Result<AbstractRelation, String> {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
 
-        let k = predicates.len();
+        let k = pred_bdds.len();
 
         // Allocate 2k fresh predicate vars at the bottom of the order: p_i then p'_i.
         let (present, next, present_varnos) = self._manager.with_manager_exclusive(|m| {
@@ -987,8 +1008,8 @@ impl BddBitBlaster {
         // A(x, p) and A'(x, i, p').
         let mut a = self.tt.clone();
         let mut a_prime = self.tt.clone();
-        for (i, expr) in predicates.iter().enumerate() {
-            let pred = self.predicate_bdd(expr)?; // ⟦P_i⟧(x)
+        for (i, pred) in pred_bdds.iter().enumerate() {
+            let pred = pred.clone(); // ⟦P_i⟧(x) — a pre-built predicate BDD
             let pred_next = if sub_vars.is_empty() {
                 pred.clone()
             } else {
@@ -2865,6 +2886,82 @@ pub fn kmts_two_player_verdict(
     let verdict = rel.evaluate(formula, &names)?;
     let init = bb.initial_state_bdd(&file);
     Ok(rel.verdict_at_init(&verdict, &init))
+}
+
+/// P2.5-F (game-CEGAR) — decide the two-player game with automatic predicate REFINEMENT: when the
+/// abstraction is too coarse (the initial cube is `⊥`), add the controllable/environment PRE-IMAGE
+/// (`CPre`) regions of the current predicates and re-evaluate, until the verdict is definite or
+/// `max_refinements` is reached. Returns `(verdict, refinements_used)`.
+///
+/// **Soundness + convergence.** Every refinement predicate is a state region, so adding it only FINES
+/// the abstraction (monotone; a definite verdict never flips — Bruns–Godefroid). The pre-image
+/// refinement is the game attractor's layers, so for a decidable reachability game the abstraction
+/// becomes definite once the layers containing the initial state are represented — the CEGAR converges
+/// to the exact verdict ([`exact_two_player_verdict`] is the oracle). When no new predicate is produced
+/// the abstraction is pre-image-closed (the game is fully represented) and the current verdict stands.
+///
+/// **Scope.** The refinement heuristic is WP-layering (sound + convergent but, on a deep attractor, as
+/// many predicates as the diameter — no asymptotic win over `exact` yet). Interpolation-based predicate
+/// discovery (the RELEVANT predicate, not every layer) is the scaling follow-up.
+pub fn kmts_two_player_verdict_cegar(
+    btor2_content: &str,
+    formula: &Formula,
+    predicates: &[(String, PredicateExpr)],
+    controllable: &[&str],
+    must_semantics: MustSemantics,
+    max_refinements: usize,
+) -> Result<(Trit, usize), String> {
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("adapter/btor2/kmts two-player CEGAR: {}", e.message))?;
+    let exprs: Vec<PredicateExpr> = predicates.iter().map(|(_, e)| e.clone()).collect();
+    let names: Vec<String> = predicates.iter().map(|(n, _)| n.clone()).collect();
+    let mut seed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &exprs {
+        collect_predicate_registers(e, &mut seed);
+    }
+    let seed_atoms: Vec<String> = seed.into_iter().collect();
+    let keep = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep.as_ref())?;
+    let ctrl: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    let exact = bb.exact_model_partitioned(&ctrl); // the concrete pre-image (WP) operator for refinement
+    let init = bb.initial_state_bdd(&file);
+
+    // The predicate set: the named formula atoms first (evaluate binds atom name → index by position),
+    // then the anonymous CEGAR refinement predicates.
+    let mut pred_bdds: Vec<BDDFunction> = exprs
+        .iter()
+        .map(|e| bb.predicate_bdd(e))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for r in 0..=max_refinements {
+        let rel = bb.abstract_game_bdd(&pred_bdds, must_semantics, &ctrl)?;
+        let verdict = rel.evaluate(formula, &names)?;
+        let v = rel.verdict_at_init(&verdict, &init);
+        if v != Trit::Unknown {
+            return Ok((v, r));
+        }
+        // Refine: add the controllable pre-image of each current predicate — the game attractor's next
+        // layer. (The pre-images form a chain, so at most one new predicate per iteration: no cube
+        // blow-up. Refining with the operator matching the formula's control modality — `cpre_environment`
+        // for an `<env>` formula — is the general form; the reachability-controllable formulas here use
+        // `cpre_controllable`.)
+        let mut added = false;
+        let current = pred_bdds.clone();
+        for p in &current {
+            let wp = exact.cpre_controllable(p);
+            if !pred_bdds.contains(&wp) {
+                pred_bdds.push(wp);
+                added = true;
+            }
+        }
+        if !added {
+            // Pre-image-closed: the game is fully represented; the ⊥ is genuine for this game shape.
+            return Ok((Trit::Unknown, r));
+        }
+    }
+    Ok((Trit::Unknown, max_refinements))
 }
 
 /// Shared `catch_unwind` BACKSTOP for the node-budget guard. A single BDD op (`Op::Mul`, a wide
