@@ -135,3 +135,19 @@ fn empty_partition_degenerates_to_box() {
         ExactVerdict::Violated,
     );
 }
+
+/// Stage-2 partition validation: a declared controllable input that is NOT a primary input is an error,
+/// not a silent fall-back to the environment. `"nope"` matches no input ⇒ `Err` (the message lists the
+/// real primary inputs). This closes the silent all-environment gap: a typo or an internally-driven
+/// signal is rejected rather than quietly reinterpreted as environment.
+#[test]
+fn unknown_controllable_input_is_rejected() {
+    let f = parser::parse("mu X. ((st == 1) || <(ctrl = controllable)> X)").unwrap();
+    let err = exact_two_player_verdict(CTRL_INIT0, &f, &["nope"]).unwrap_err();
+    assert!(
+        err.contains("not primary inputs") && err.contains("nope"),
+        "expected a partition-validation error naming the unknown input, got: {err}"
+    );
+    // The real input names still work.
+    assert!(exact_two_player_verdict(CTRL_INIT0, &f, &["c"]).is_ok());
+}

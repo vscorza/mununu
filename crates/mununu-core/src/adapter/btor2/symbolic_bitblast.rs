@@ -2794,6 +2794,31 @@ fn exact_symbolic_verdict_with_witness_inner(
         ));
     }
 
+    // P2.5-F — validate the two-player partition. Every declared controllable input must be a real
+    // primary input of the design. A name matching nothing would otherwise fall back SILENTLY to the
+    // environment (a sound but pessimistic all-environment reading, and not the partition the caller
+    // asked for) — error instead. On a flattened design the BTOR2 inputs ARE the top module's primary
+    // inputs (Yosys `flatten` resolves declared module-to-module wires to internal signals), so a name
+    // that is not here is either a typo or an internal signal driven by another module — not a top input.
+    if !controllable.is_empty() {
+        let mut unknown: Vec<&str> = controllable
+            .iter()
+            .filter(|c| !input_leaf_names.contains(c.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            let mut inputs: Vec<&str> = input_leaf_names.iter().map(String::as_str).collect();
+            inputs.sort_unstable();
+            return Err(format!(
+                "exact two-player MC: declared controllable input(s) {unknown:?} are not primary \
+                 inputs of the design (primary inputs: {inputs:?}). Declare a real top-level input; \
+                 for a multi-module design ensure it is a top input, not one driven by another \
+                 module's output (which flatten resolves to an internal signal, not a free input)."
+            ));
+        }
+    }
+
     let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref())?;
     let exact = if controllable.is_empty() {
         bb.exact_model()
