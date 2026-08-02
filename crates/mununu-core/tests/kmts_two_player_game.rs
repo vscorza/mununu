@@ -217,3 +217,80 @@ fn kmts_two_player_is_sound_on_real_rtl() {
         }
     }
 }
+
+// ---- Game-CEGAR: predicate refinement turns sound ⊥ into definite verdicts --------------------------
+
+use mununu_core::adapter::btor2::symbolic_bitblast::kmts_two_player_verdict_cegar;
+
+/// Game-CEGAR on the coarse two-step CHAIN: the plain KMTS abstains (⊥, see
+/// `kmts_coarse_predicate_yields_bottom`); with refinement it discovers the attractor layers and decides
+/// True — matching the exact oracle (Holds). A zero budget still abstains (no refinement), confirming
+/// the loop's progress comes from the refinements, not the seed.
+#[test]
+fn game_cegar_decides_the_coarse_chain() {
+    let f = parser::parse("mu X. ((st == 2) || <(ctrl = controllable)> X)").unwrap();
+    let p = preds(&[("st == 2", "st == 2")]);
+    let (v, refs) =
+        kmts_two_player_verdict_cegar(CHAIN, &f, &p, &["c"], MustSemantics::ForallExists, 16)
+            .unwrap();
+    assert_eq!(v, Trit::True, "CEGAR decides the chain");
+    assert!(
+        refs >= 1,
+        "it took at least one refinement (the seed alone is ⊥)"
+    );
+    assert_eq!(
+        exact_two_player_verdict(CHAIN, &f, &["c"]).unwrap(),
+        ExactVerdict::Holds,
+        "matches the exact oracle"
+    );
+    // Zero budget ⇒ no refinement ⇒ still ⊥.
+    let (v0, _) =
+        kmts_two_player_verdict_cegar(CHAIN, &f, &p, &["c"], MustSemantics::ForallExists, 0)
+            .unwrap();
+    assert_eq!(v0, Trit::Unknown, "zero budget: no refinement, still ⊥");
+}
+
+/// Industrial game-CEGAR on the real OpenTitan edn boot FSM (a shallow control attractor): refinement
+/// yields DEFINITE verdicts on both partitions, matching the exact two-player oracle — all-controllable
+/// is realizable (True / Holds), mode-controllable is not (False / Violated: the environment withholds
+/// the ack). This is the KMTS backend giving usable industrial verdicts, not just sound ⊥.
+#[test]
+fn game_cegar_decides_edn_both_partitions() {
+    let f = parser::parse("mu X. ((state_q == 44) || <(ctrl = controllable)> X)").unwrap();
+    let p = preds(&[("state_q == 44", "state_q == 44")]);
+    let mode: &[&str] = &["boot_req_mode_i", "edn_enable_i"];
+    for (label, ctrl, want_kmts, want_exact) in [
+        ("all", EDN_ALL, Trit::True, ExactVerdict::Holds),
+        ("mode", mode, Trit::False, ExactVerdict::Violated),
+    ] {
+        let (v, _) =
+            kmts_two_player_verdict_cegar(EDN, &f, &p, ctrl, MustSemantics::ForallExists, 64)
+                .unwrap();
+        assert_eq!(v, want_kmts, "edn/{label}: CEGAR verdict");
+        assert_eq!(
+            exact_two_player_verdict(EDN, &f, ctrl).unwrap(),
+            want_exact,
+            "edn/{label}: exact oracle"
+        );
+    }
+}
+
+/// Honest limitation: on otbn the controllable attractor to Running runs through the secure-wipe address
+/// counter (a deep attractor), so WP-layer refinement does not converge within a modest budget — the
+/// verdict is a SOUND ⊥ (it never contradicts the exact oracle). This is exactly the case interpolation-
+/// based refinement (the RELEVANT predicate, not every layer) is the follow-up for.
+#[test]
+fn game_cegar_wp_does_not_scale_on_a_deep_attractor() {
+    let f = parser::parse("mu X. ((state_q == 119) || <(ctrl = controllable)> X)").unwrap();
+    let p = preds(&[("state_q == 119", "state_q == 119")]);
+    let (v, refs) =
+        kmts_two_player_verdict_cegar(OTBN, &f, &p, OTBN_ALL, MustSemantics::ForallExists, 12)
+            .unwrap();
+    // Sound ⊥ within the budget (the deep counter attractor needs more WP layers than the budget allows).
+    assert_eq!(
+        v,
+        Trit::Unknown,
+        "budget-bounded WP-CEGAR abstains on the deep attractor"
+    );
+    assert_eq!(refs, 12, "the budget was exhausted");
+}
