@@ -1760,8 +1760,17 @@ pub struct ExactModel {
     /// substituted (they remain free to be quantified).
     sub_vars: Vec<VarNo>,
     sub_repl: Vec<BDDFunction>,
-    /// The cube of input-bit vars, quantified in the modal pre-image.
+    /// The cube of input-bit vars, quantified in the single-agent (`Control::All`) modal pre-image.
     input_cube: BDDFunction,
+    /// P2.5-F — the two-player input partition. `ctrl_cube` is the cube of the CONTROLLABLE input
+    /// bits (the controller's), `env_cube` the cube of the remaining (environment/uncontrolled) input
+    /// bits; `ctrl_cube ∧ env_cube = input_cube`. With no partition declared (the default),
+    /// `ctrl_cube = tt` (no controllable bits) and `env_cube = input_cube` — so the controllable
+    /// predecessor degenerates to the box pre-image (the environment owns everything), which is the
+    /// correct semantics for "no controllable inputs". Used by [`ExactModel::cpre_controllable`] /
+    /// [`ExactModel::cpre_environment`] to solve the two-player game.
+    ctrl_cube: BDDFunction,
+    env_cube: BDDFunction,
     /// BTOR2 `constraint` (assume) conjunction over the state + input vars — `tt`
     /// when the design is unconstrained. Injected into `diamond_pre` / `box_pre`
     /// so the modal quantifier ranges only over constraint-respecting transitions.
@@ -1866,6 +1875,18 @@ impl BddBitBlaster {
     /// bit-blasted design, so the `∃`/`∀` over the *remaining* free inputs is exact
     /// for the pinned model.
     pub fn exact_model(&self) -> ExactModel {
+        self.exact_model_partitioned(&std::collections::HashSet::new())
+    }
+
+    /// P2.5-F — build the [`ExactModel`] with a TWO-PLAYER input partition: input cells whose symbol is
+    /// in `controllable` become the controller's (`ctrl_cube`), the rest the environment's (`env_cube`).
+    /// An empty set reproduces [`Self::exact_model`] (all inputs environment / single-agent). The
+    /// partition drives [`ExactModel::cpre_controllable`] / [`ExactModel::cpre_environment`]; the
+    /// single-agent `Control::All` pre-image still quantifies the whole `input_cube` and is unaffected.
+    pub fn exact_model_partitioned(
+        &self,
+        controllable: &std::collections::HashSet<String>,
+    ) -> ExactModel {
         // State bit → next-state function (the same sub the abstract relation uses).
         let mut sub_vars: Vec<VarNo> = Vec::new();
         let mut sub_repl: Vec<BDDFunction> = Vec::new();
@@ -1880,12 +1901,21 @@ impl BddBitBlaster {
                 }
             }
         }
-        // The input-bit cube to quantify in the modal pre-image.
+        // The input-bit cubes to quantify in the modal pre-image. `input_cube` is every input bit
+        // (single-agent); `ctrl_cube` / `env_cube` split it by the two-player partition.
         let mut input_cube = self.tt.clone();
+        let mut ctrl_cube = self.tt.clone();
+        let mut env_cube = self.tt.clone();
         for cell in &self.cells {
             if !cell.is_state {
+                let is_ctrl = controllable.contains(&cell.symbol);
                 for v in &cell.vars {
                     input_cube = input_cube.and(v).unwrap();
+                    if is_ctrl {
+                        ctrl_cube = ctrl_cube.and(v).unwrap();
+                    } else {
+                        env_cube = env_cube.and(v).unwrap();
+                    }
                 }
             }
         }
@@ -1893,6 +1923,8 @@ impl BddBitBlaster {
             sub_vars,
             sub_repl,
             input_cube,
+            ctrl_cube,
+            env_cube,
             constraint: self.constraint_bdd.clone(),
             tt: self.tt.clone(),
             ff: self.ff.clone(),
@@ -2028,6 +2060,50 @@ impl ExactModel {
             .unwrap()
     }
 
+    /// P2.5-F — the CONTROLLABLE PREDECESSOR `CPre_ctrl(φ)`: the states from which the controller can
+    /// force the next state into `φ` against every environment move —
+    /// `{ s : ∀ env, ∃ ctrl, constraint(s, env, ctrl) ∧ next(s, env, ctrl) ∈ φ }`. This is the
+    /// two-player (synchronous, Mealy: environment moves, controller responds) analogue of
+    /// [`Self::diamond_pre`], and the modal step of a controller-side game fixpoint. `Control::All`
+    /// still uses `diamond_pre`; with no controllable inputs (`ctrl_cube = tt`) this degenerates to
+    /// `box_pre` (the environment owns everything), the correct "controller cannot influence" reading.
+    ///
+    /// The controller responds AFTER seeing the environment move (`∃ctrl` inner, `∀env` outer). Under
+    /// `Control::Controllable` the box/diamond kind is subsumed by the controllability structure — the
+    /// same operator as the explicit reference (`evaluator.rs::modal_trit_core`), which the two-player
+    /// exact engine is differentially validated against.
+    pub fn cpre_controllable(&self, phi: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        // ∃ctrl: a constraint-respecting transition into φ (per state + environment move).
+        let reachable = self
+            .to_next(phi)
+            .and(&self.constraint)
+            .unwrap()
+            .exists(&self.ctrl_cube)
+            .unwrap();
+        // ∀env: the controller has such a response to every environment move.
+        reachable.forall(&self.env_cube).unwrap()
+    }
+
+    /// P2.5-F — the ENVIRONMENT PREDECESSOR `CPre_env(φ)`, the De Morgan dual of
+    /// [`Self::cpre_controllable`]: the states from which the ENVIRONMENT can force `φ` against every
+    /// controllable move — `{ s : ∃ env, ∀ ctrl, constraint ⟹ next ∈ φ }`. Used for the environment
+    /// side of the game (e.g. extracting the counterstrategy region when the controller loses).
+    pub fn cpre_environment(&self, phi: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        // ∀ctrl: every controllable response leads (constraint-respecting) into φ.
+        let forced = self
+            .constraint
+            .not()
+            .unwrap()
+            .or(&self.to_next(phi))
+            .unwrap()
+            .forall(&self.ctrl_cube)
+            .unwrap();
+        // ∃env: some environment move imposes that.
+        forced.exists(&self.env_cube).unwrap()
+    }
+
     // ---- Phase 2b: symbolic environment-strategy synthesis ----------------------------------------
     // `AG EF good` under an environment strategy. The environment OWNS the inputs, so `◇` = ∃input
     // (`diamond_pre`) is exactly Eve's controllable move; there is no adversary among the inputs (the
@@ -2159,18 +2235,33 @@ impl ExactModel {
                 guard,
                 target,
             } => {
-                if *guard != Guard::default() {
+                // The exact engine supports bare `[]`/`<>` (single-agent) and the CONTROLLABILITY axis
+                // (`Control::{Controllable, Environment}`, the two-player game — P2.5-F). Other guard
+                // axes (labels / current / next / step-bounded) remain a follow-up.
+                let control_only = *guard
+                    == Guard {
+                        control: guard.control,
+                        ..Guard::default()
+                    };
+                if !control_only {
                     return Err(
-                        "exact μ-calculus MC (D1.2): only bare `[]`/`<>` modalities are supported \
-                         yet — guarded / controllability / step-bounded modalities are a D1.2b \
-                         follow-up"
+                        "exact μ-calculus MC: only bare `[]`/`<>` and controllability (`ctrl`) \
+                         modalities are supported — labels / state-predicate / step-bounded guards \
+                         are a follow-up"
                             .into(),
                     );
                 }
                 let phi = self.eval_node(f, *target, atoms, bindings)?;
-                match kind {
-                    ModalKind::Box => self.box_pre(&phi),
-                    ModalKind::Diamond => self.diamond_pre(&phi),
+                match guard.control {
+                    // Single-agent: box = ∀input, diamond = ∃input.
+                    Control::All => match kind {
+                        ModalKind::Box => self.box_pre(&phi),
+                        ModalKind::Diamond => self.diamond_pre(&phi),
+                    },
+                    // Two-player: the controllability structure subsumes the box/diamond kind (matching
+                    // the explicit reference `evaluator.rs::modal_trit_core`).
+                    Control::Controllable => self.cpre_controllable(&phi),
+                    Control::Environment => self.cpre_environment(&phi),
                 }
             }
             MuNode::Mu { var, body } => self.fixpoint(f, *var, *body, atoms, bindings, false)?,
@@ -2519,16 +2610,41 @@ pub fn exact_symbolic_verdict_with_witness(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
-    // catch_unwind BACKSTOP for the node-budget guard. A single BDD op (`Op::Mul`, a wide
-    // variable shift) can overflow the fixed OxiDD arena *inside* one `eval_op`, before the
-    // per-op node-budget check fires — the `.unwrap()` on OxiDD's `OutOfMemory` then panics.
-    // That is a clean unwrap-panic (the op released the manager lock before returning `Err`),
-    // and the manager is local to the inner call and dropped on unwind, so catching it and
-    // degrading to a Skipped-class error is SOUND (no shared state is poisoned; the verdict is
-    // never fabricated — only turned into a clean Err → Skipped). Gradual growth is caught
-    // earlier + cheaper by the node-budget guard in `eval_op`.
+    verdict_with_witness_catching(btor2_content, formula, &std::collections::HashSet::new())
+}
+
+/// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER exact game, with
+/// `controllable` naming the controller's input signals (the rest are the environment's). The
+/// formula's `<(ctrl=controllable)>` / `[(ctrl=controllable)]` modalities are evaluated by the
+/// controllable predecessor ([`ExactModel::cpre_controllable`]); `Control::All` modalities remain the
+/// single-agent pre-image. `Holds` iff the controller wins from the initial state (the specification is
+/// realizable under the partition). Same engine, cone restriction, and soundness posture as
+/// [`exact_symbolic_verdict`]; the explicit engine (`gr1.rs` / `evaluator.rs`) is the differential
+/// oracle.
+pub fn exact_two_player_verdict(
+    btor2_content: &str,
+    formula: &Formula,
+    controllable: &[&str],
+) -> Result<ExactVerdict, String> {
+    let set: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    verdict_with_witness_catching(btor2_content, formula, &set).map(|(v, _)| v)
+}
+
+/// Shared `catch_unwind` BACKSTOP for the node-budget guard. A single BDD op (`Op::Mul`, a wide
+/// variable shift) can overflow the fixed OxiDD arena *inside* one `eval_op`, before the per-op
+/// node-budget check fires — the `.unwrap()` on OxiDD's `OutOfMemory` then panics. That is a clean
+/// unwrap-panic (the op released the manager lock before returning `Err`), and the manager is local to
+/// the inner call and dropped on unwind, so catching it and degrading to a Skipped-class error is SOUND
+/// (no shared state is poisoned; the verdict is never fabricated — only turned into a clean Err →
+/// Skipped). Gradual growth is caught earlier + cheaper by the node-budget guard in `eval_op`.
+fn verdict_with_witness_catching(
+    btor2_content: &str,
+    formula: &Formula,
+    controllable: &std::collections::HashSet<String>,
+) -> Result<(ExactVerdict, Option<StallLasso>), String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exact_symbolic_verdict_with_witness_inner(btor2_content, formula)
+        exact_symbolic_verdict_with_witness_inner(btor2_content, formula, controllable)
     }))
     .unwrap_or_else(|_| {
         Err(
@@ -2542,6 +2658,7 @@ pub fn exact_symbolic_verdict_with_witness(
 fn exact_symbolic_verdict_with_witness_inner(
     btor2_content: &str,
     formula: &Formula,
+    controllable: &std::collections::HashSet<String>,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
@@ -2678,7 +2795,11 @@ fn exact_symbolic_verdict_with_witness_inner(
     }
 
     let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref())?;
-    let exact = bb.exact_model();
+    let exact = if controllable.is_empty() {
+        bb.exact_model()
+    } else {
+        bb.exact_model_partitioned(controllable)
+    };
 
     // Resolve each atom's full-state BDD against the (cone-restricted) bit-blaster.
     let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
