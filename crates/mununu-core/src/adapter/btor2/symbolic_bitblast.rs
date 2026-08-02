@@ -2901,23 +2901,23 @@ pub fn exact_env_strategy_witness(btor2_content: &str, good: &str) -> Option<Sta
     bb.reach_good_play(&file, &good_bdd)
 }
 
-/// P2.5-E — a full POSITIONAL environment strategy for `AG EF good`: a memoryless policy over the
+/// P2.5-E — a full POSITIONAL environment strategy for `AG EF good`: a memoryless strategy over the
 /// design's reachable states. Where [`exact_env_strategy_witness`] returns ONE play (witnessing `EF good`
 /// from the initial state), this returns the `AG` part — the driving discipline for *every* reachable
 /// state, as a state-indexed map. It is the reusable object: an environment model, a directed-test seed,
 /// or the environment half of an assume-guarantee contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositionalPolicy {
-    /// The state register the policy is indexed by (the register named in the `good` atom).
+pub struct PositionalStrategy {
+    /// The state register the strategy is indexed by (the register named in the `good` atom).
     pub state_register: String,
     /// One row per reachable value of `state_register`, ordered by rank then value.
-    pub entries: Vec<PolicyEntry>,
+    pub entries: Vec<StrategyEntry>,
 }
 
-/// One control-state row of a [`PositionalPolicy`].
+/// One control-state row of a [`PositionalStrategy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyEntry {
-    /// The value of the policy's state register in this row.
+pub struct StrategyEntry {
+    /// The value of the strategy's state register in this row.
     pub state_value: u128,
     /// Attractor distance to `good` (`0` = the state already satisfies `good`).
     pub rank: u32,
@@ -2929,7 +2929,7 @@ pub struct PolicyEntry {
 }
 
 /// P2.5-E — synthesize the full positional environment strategy for `AG EF good` (see
-/// [`PositionalPolicy`]). `None` when `good` is not a resolvable `REG op VALUE` state atom over a state
+/// [`PositionalStrategy`]). `None` when `good` is not a resolvable `REG op VALUE` state atom over a state
 /// register, the model can't be built (over-cap / array / input-atom), or `good` is unreachable from the
 /// initial state (no strategy exists).
 ///
@@ -2937,7 +2937,10 @@ pub struct PolicyEntry {
 /// concrete forward reachability from the initial state enumerates the real reachable states (so the free
 /// reset does not make every encoding "winning"); each row's forced inputs are projected from the
 /// rank-decreasing moves.
-pub fn exact_env_strategy_policy(btor2_content: &str, good: &str) -> Option<PositionalPolicy> {
+pub fn exact_env_positional_strategy(
+    btor2_content: &str,
+    good: &str,
+) -> Option<PositionalStrategy> {
     use crate::adapter::btor2::parser;
     let (bb, file, good_bdd) = build_atom_model(btor2_content, good)?;
     let resolve = |name: &str| -> String {
@@ -2954,7 +2957,7 @@ pub fn exact_env_strategy_policy(btor2_content: &str, good: &str) -> Option<Posi
     let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_predicate_registers(&expr, &mut regs);
     let reg = regs.into_iter().next()?;
-    bb.env_strategy_policy(&file, &good_bdd, &reg)
+    bb.env_positional_strategy(&file, &good_bdd, &reg)
 }
 
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
@@ -3436,15 +3439,15 @@ impl BddBitBlaster {
         None
     }
 
-    /// P2.5-E — the full positional policy (see [`PositionalPolicy`]). The `EF(good)` attractor gives each
+    /// P2.5-E — the full positional strategy (see [`PositionalStrategy`]). The `EF(good)` attractor gives each
     /// state its rank; concrete forward reachability from the initial state enumerates the real reachable
     /// states; the forced inputs per control state are projected from the rank-decreasing moves.
-    fn env_strategy_policy(
+    fn env_positional_strategy(
         &self,
         file: &Btor2File,
         good: &BDDFunction,
         reg_name: &str,
-    ) -> Option<PositionalPolicy> {
+    ) -> Option<PositionalStrategy> {
         let exact = self.exact_model();
         // EF(good) attractor layers: L_0 = good, L_k = L_{k-1} ∨ ◇L_{k-1}. rank(s) = min k: s ∈ L_k.
         let mut layers = vec![good.clone()];
@@ -3461,7 +3464,7 @@ impl BddBitBlaster {
         if init.and(&winning).unwrap() == self.ff {
             return None; // good unreachable from init — no strategy
         }
-        // The policy is indexed by this state register.
+        // The strategy is indexed by this state register.
         if !self
             .cells
             .iter()
@@ -3538,7 +3541,7 @@ impl BddBitBlaster {
                 .and_modify(|acc| *acc = acc.or(&m).unwrap())
                 .or_insert(m);
         }
-        let mut entries: Vec<PolicyEntry> = min_rank
+        let mut entries: Vec<StrategyEntry> = min_rank
             .iter()
             .map(|(&v, &rank)| {
                 let mut forced = BTreeMap::new();
@@ -3551,7 +3554,7 @@ impl BddBitBlaster {
                         }
                     }
                 }
-                PolicyEntry {
+                StrategyEntry {
                     state_value: v,
                     rank,
                     forced_inputs: forced,
@@ -3559,7 +3562,7 @@ impl BddBitBlaster {
             })
             .collect();
         entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
-        Some(PositionalPolicy {
+        Some(PositionalStrategy {
             state_register: reg_name.to_string(),
             entries,
         })

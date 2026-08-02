@@ -118,7 +118,7 @@ pub enum AssumptionKind {
     InputSchedule,
     /// "Reset is eventually asserted."
     ResetEventually,
-    /// A synthesized environment strategy (Mealy contract).
+    /// A synthesized positional environment strategy (1-player: the environment owns all inputs).
     EnvStrategy,
 }
 
