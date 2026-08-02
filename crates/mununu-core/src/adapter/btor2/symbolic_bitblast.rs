@@ -2322,6 +2322,34 @@ impl ExactModel {
         forced.exists(&self.env_cube).unwrap()
     }
 
+    /// P2.5-F (strategy extraction) — the `(state, ctrl-input)` pairs from which, WHATEVER the
+    /// environment does, the controller's move lands the successor in `keep`: `∀env. constraint ∧ next ∈
+    /// keep`. `cpre_controllable(keep) = ctrl_forcing_moves(keep).∃ctrl`. A single state's slice,
+    /// projected onto the controllable inputs, is the controller's forced move there (env-oblivious /
+    /// positional; with no environment inputs it is the whole move).
+    pub fn ctrl_forcing_moves(&self, keep: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        self.to_next(keep)
+            .and(&self.constraint)
+            .unwrap()
+            .forall(&self.env_cube)
+            .unwrap()
+    }
+
+    /// Dual — the `(state, env-input)` pairs from which, WHATEVER the controller does, the successor is
+    /// in `keep`: `∀ctrl. constraint ⟹ next ∈ keep`. The environment's forcing moves, for the
+    /// counterstrategy when the controller loses.
+    pub fn env_forcing_moves(&self, keep: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        self.constraint
+            .not()
+            .unwrap()
+            .or(&self.to_next(keep))
+            .unwrap()
+            .forall(&self.ctrl_cube)
+            .unwrap()
+    }
+
     // ---- Phase 2b: symbolic environment-strategy synthesis ----------------------------------------
     // `AG EF good` under an environment strategy. The environment OWNS the inputs, so `◇` = ∃input
     // (`diamond_pre`) is exactly Eve's controllable move; there is no adversary among the inputs (the
@@ -3439,6 +3467,54 @@ pub fn exact_env_positional_strategy(
     bb.env_positional_strategy(&file, &good_bdd, &reg)
 }
 
+/// P2.5-F — a synthesized TWO-PLAYER strategy: the CONTROLLER's positional strategy when the reachability
+/// game `μX. (good ∨ ⟨ctrl⟩X)` is realizable, or the ENVIRONMENT's COUNTERSTRATEGY when it is not. Both
+/// are state-indexed forced-input maps ([`PositionalStrategy`]): the controller's forces CONTROLLABLE
+/// inputs (robust to every environment move) toward `good`; the environment's forces ENVIRONMENT inputs
+/// (robust to every controllable move) to keep the system out of the controller's winning region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoPlayerStrategy {
+    /// `true` = the controller wins from the initial state (spec realizable) and `strategy` is its
+    /// strategy; `false` = the environment wins (unrealizable) and `strategy` is its counterstrategy.
+    pub realizable: bool,
+    /// The winner's positional strategy.
+    pub strategy: PositionalStrategy,
+}
+
+/// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good` with
+/// `controllable` naming the controller's inputs. `realizable` iff the controller wins from the initial
+/// state (== [`exact_two_player_verdict`] on `μX. good ∨ ⟨ctrl⟩X`). `None` when `good` is not a resolvable
+/// state atom or the model can't be built.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD — the controllable attractor (`cpre_controllable`) supplies
+/// ranks; concrete forward reachability enumerates the real states; each row's forced inputs come from
+/// the winner's forcing moves ([`ExactModel::ctrl_forcing_moves`] / [`ExactModel::env_forcing_moves`]).
+pub fn exact_two_player_strategy(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Option<TwoPlayerStrategy> {
+    use crate::adapter::btor2::parser;
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good)?;
+    let resolve = |name: &str| -> String {
+        parser::resolve_to_canonical_name(
+            &file,
+            name,
+            parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
+    };
+    let expr = resolve_predicate_expr_registers(&parse_predicate_atom_bool(good).ok()?, &resolve);
+    let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_predicate_registers(&expr, &mut regs);
+    let reg = regs.into_iter().next()?;
+    let ctrl: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    bb.two_player_strategy(&file, &good_bdd, &reg, &ctrl)
+}
+
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
 /// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
 /// - bare `AF p` = `μX. (p ∨ [] X)`,
@@ -4044,6 +4120,172 @@ impl BddBitBlaster {
         Some(PositionalStrategy {
             state_register: reg_name.to_string(),
             entries,
+        })
+    }
+
+    /// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good`, with
+    /// `controllable` the controller's input names. Solves the attractor `μX. good ∨ CPre_ctrl(X)`; the
+    /// controller wins iff `init ⊆ attractor`. Returns the WINNER's positional strategy:
+    /// - **realizable** (controller wins): each reachable winning state's row forces the CONTROLLABLE
+    ///   inputs to a rank-decreasing move ([`ExactModel::ctrl_forcing_moves`] into the next-lower attractor
+    ///   layer) — robust to every environment move. With all inputs controllable this reduces to the
+    ///   1-player [`Self::env_positional_strategy`].
+    /// - **unrealizable** (environment wins): each reachable state OUTSIDE the attractor forces the
+    ///   ENVIRONMENT inputs to a move that keeps the play out of it ([`ExactModel::env_forcing_moves`]) —
+    ///   the counterstrategy witnessing why no controller can reach `good`. A safety/maintain strategy, so
+    ///   every row has rank 0 (no distance-to-target metric).
+    ///
+    /// `None` when `reg_name` is not a state register.
+    fn two_player_strategy(
+        &self,
+        file: &Btor2File,
+        good: &BDDFunction,
+        reg_name: &str,
+        controllable: &std::collections::HashSet<String>,
+    ) -> Option<TwoPlayerStrategy> {
+        let exact = self.exact_model_partitioned(controllable);
+        // Controllable-reachability attractor: L_0 = good, L_k = L_{k-1} ∨ CPre_ctrl(L_{k-1}).
+        // rank(s) = min k : s ∈ L_k. The controller wins from init iff init ⊆ the fixpoint.
+        let mut layers = vec![good.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.cpre_controllable(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let winning = layers.last().unwrap().clone();
+        if !self
+            .cells
+            .iter()
+            .any(|c| c.is_state && c.symbol == reg_name)
+        {
+            return None;
+        }
+        let init = self.initial_state_bdd(file);
+        let realizable = init.and(&winning).unwrap() != self.ff;
+        // The winner's region: the controller lives inside the attractor; the environment lives outside it
+        // (by determinacy of the reachability game, ¬attractor is the environment's winning region).
+        let region = if realizable {
+            winning.clone()
+        } else {
+            winning.not().unwrap()
+        };
+        // rank(s): the attractor layer for the controller; 0 everywhere for the environment (safety game).
+        let rank_of = |s: &BTreeMap<String, u128>| -> u32 {
+            if !realizable {
+                return 0;
+            }
+            let mt = self.state_minterm(s);
+            (0..layers.len())
+                .find(|&k| mt.and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(0) as u32
+        };
+        // Concrete forward reachability from init (under all inputs), kept to the winner's region — so the
+        // free reset does not make every encoding "winning", exactly as the 1-player extractor does.
+        let mut frontier: Vec<BTreeMap<String, u128>> = Vec::new();
+        {
+            let mut r = init.clone();
+            for _ in 0..1024 {
+                if r == self.ff {
+                    break;
+                }
+                let s = self.pick_state_assignment(&r);
+                r = r.and(&self.state_minterm(&s).not().unwrap()).unwrap();
+                frontier.push(s);
+            }
+        }
+        let mut visited: std::collections::HashSet<BTreeMap<String, u128>> =
+            std::collections::HashSet::new();
+        let mut reached: Vec<(BTreeMap<String, u128>, u32)> = Vec::new();
+        let mut guard = 0usize;
+        while let Some(s) = frontier.pop() {
+            guard += 1;
+            if guard > 200_000 {
+                break;
+            }
+            if !visited.insert(s.clone()) {
+                continue;
+            }
+            for ns in self.concrete_successors(&exact, &s) {
+                if !visited.contains(&ns) {
+                    frontier.push(ns);
+                }
+            }
+            // Only states in the winner's region carry a strategy row.
+            if self.state_minterm(&s).and(&region).unwrap() != self.ff {
+                let k = rank_of(&s);
+                reached.push((s, k));
+            }
+        }
+        // Min rank per state-register value (its fastest progress, as in the 1-player extractor).
+        let mut min_rank: BTreeMap<u128, u32> = BTreeMap::new();
+        for (s, k) in &reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            min_rank
+                .entry(v)
+                .and_modify(|r| *r = (*r).min(*k))
+                .or_insert(*k);
+        }
+        // Forced moves of the MIN-RANK states of each control value. Controller: the rank-decreasing
+        // controllable move (`ctrl_forcing_moves` into the next-lower layer, robust to every env move).
+        // Environment: the region-maintaining environment move (`env_forcing_moves` staying in ¬attractor).
+        let mut moves_by_val: BTreeMap<u128, BDDFunction> = BTreeMap::new();
+        for (s, k) in &reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            if *k != min_rank[&v] {
+                continue;
+            }
+            let m = if realizable {
+                if *k == 0 {
+                    continue; // already at `good` — no forcing move needed
+                }
+                self.state_minterm(s)
+                    .and(&exact.ctrl_forcing_moves(&layers[(*k - 1) as usize]))
+                    .unwrap()
+            } else {
+                self.state_minterm(s)
+                    .and(&exact.env_forcing_moves(&region))
+                    .unwrap()
+            };
+            moves_by_val
+                .entry(v)
+                .and_modify(|acc| *acc = acc.or(&m).unwrap())
+                .or_insert(m);
+        }
+        // Project onto the WINNER's own inputs: controllable inputs for the controller, environment inputs
+        // for the counterstrategy. (The other player's inputs are ∀-quantified out by the forcing move.)
+        let owns = |cell: &Cell| -> bool {
+            !cell.is_state && (realizable == controllable.contains(&cell.symbol))
+        };
+        let mut entries: Vec<StrategyEntry> = min_rank
+            .iter()
+            .map(|(&v, &rank)| {
+                let mut forced = BTreeMap::new();
+                if let Some(mv) = moves_by_val.get(&v)
+                    && *mv != self.ff
+                {
+                    for cell in self.cells.iter().filter(|c| owns(c)) {
+                        if let Some(val) = self.forced_cell_value(mv, cell) {
+                            forced.insert(cell.symbol.clone(), val);
+                        }
+                    }
+                }
+                StrategyEntry {
+                    state_value: v,
+                    rank,
+                    forced_inputs: forced,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
+        Some(TwoPlayerStrategy {
+            realizable,
+            strategy: PositionalStrategy {
+                state_register: reg_name.to_string(),
+                entries,
+            },
         })
     }
 
