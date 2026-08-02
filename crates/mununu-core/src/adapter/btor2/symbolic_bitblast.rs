@@ -898,6 +898,29 @@ impl BddBitBlaster {
         predicates: &[PredicateExpr],
         must: Option<MustSemantics>,
     ) -> Result<AbstractRelation, String> {
+        self.abstract_relation_impl(predicates, must, None)
+    }
+
+    /// P2.5-F — build the abstract relation as a TWO-PLAYER game: `controllable` names the controller's
+    /// input signals (the rest are the environment's). The result additionally carries the concrete
+    /// game pieces ([`GamePieces`]) so [`AbstractRelation::cpre_controllable`] can solve the 3-valued
+    /// game. `Control::All` modalities still use `r_may`/`r_must`; `Control::{Controllable, Environment}`
+    /// use the controllable predecessor. Requires a [`MustSemantics`] (the 3-valued steps need `r_must`).
+    pub fn abstract_game(
+        &self,
+        predicates: &[PredicateExpr],
+        must: MustSemantics,
+        controllable: &std::collections::HashSet<String>,
+    ) -> Result<AbstractRelation, String> {
+        self.abstract_relation_impl(predicates, Some(must), Some(controllable))
+    }
+
+    fn abstract_relation_impl(
+        &self,
+        predicates: &[PredicateExpr],
+        must: Option<MustSemantics>,
+        controllable: Option<&std::collections::HashSet<String>>,
+    ) -> Result<AbstractRelation, String> {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
 
         let k = predicates.len();
@@ -938,15 +961,24 @@ impl BddBitBlaster {
             }
         }
 
-        // Cubes: register vars, input vars, and their union.
+        // Cubes: register vars, input vars (split controllable / environment for the two-player game),
+        // and their union.
         let mut reg_cube = self.tt.clone();
         let mut input_cube = self.tt.clone();
+        let mut ctrl_cube = self.tt.clone();
+        let mut env_cube = self.tt.clone();
         for cell in &self.cells {
+            let is_ctrl = !cell.is_state && controllable.is_some_and(|c| c.contains(&cell.symbol));
             for v in &cell.vars {
                 if cell.is_state {
                     reg_cube = reg_cube.and(v).unwrap();
                 } else {
                     input_cube = input_cube.and(v).unwrap();
+                    if is_ctrl {
+                        ctrl_cube = ctrl_cube.and(v).unwrap();
+                    } else {
+                        env_cube = env_cube.and(v).unwrap();
+                    }
                 }
             }
         }
@@ -1014,6 +1046,15 @@ impl BddBitBlaster {
             raw.and(&feasible_present).unwrap()
         });
 
+        // P2.5-F — retain the concrete game pieces when a controllable partition was requested.
+        let game = controllable.map(|_| GamePieces {
+            a: a.clone(),
+            a_prime: a_prime.clone(),
+            reg_cube: reg_cube.clone(),
+            ctrl_cube,
+            env_cube,
+        });
+
         Ok(AbstractRelation {
             num_predicates: k,
             feasible_present,
@@ -1023,6 +1064,7 @@ impl BddBitBlaster {
             next_cube,
             r_may,
             r_must,
+            game,
             tt: self.tt.clone(),
             ff: self.ff.clone(),
         })
@@ -1064,8 +1106,30 @@ pub struct AbstractRelation {
     r_may: BDDFunction,
     /// The must relation over `(p, p')`, when a [`MustSemantics`] was requested.
     r_must: Option<BDDFunction>,
+    /// P2.5-F — the TWO-PLAYER game pieces, present only when the relation was built for a game
+    /// ([`BddBitBlaster::abstract_game`]). They carry the CONCRETE `A(x,p)` / `A'(x,i,p')` predicates
+    /// and the controllable/environment input split, which the single-agent `r_may`/`r_must` (having
+    /// quantified all inputs away) cannot express. The 3-valued controllable predecessor
+    /// ([`Self::cpre_controllable`]) reads them.
+    game: Option<GamePieces>,
     tt: BDDFunction,
     ff: BDDFunction,
+}
+
+/// P2.5-F — the concrete predicates + input partition a two-player [`AbstractRelation`] retains so the
+/// controllable predecessor can quantify `∀env ∃ctrl` (which the input-quantified `r_may`/`r_must`
+/// cannot). All BDDs are over the bit-blaster's concrete register + input vars and the cube vars.
+struct GamePieces {
+    /// `A(x, p)` — concrete state `x` is in cube `p`.
+    a: BDDFunction,
+    /// `A'(x, i, p')` — the successor of `x` under input `i` is in cube `p'`.
+    a_prime: BDDFunction,
+    /// Cube of the concrete register-bit vars (quantified for the ∀x/∃x cube abstraction).
+    reg_cube: BDDFunction,
+    /// Cube of the CONTROLLABLE input bits.
+    ctrl_cube: BDDFunction,
+    /// Cube of the ENVIRONMENT (uncontrolled) input bits.
+    env_cube: BDDFunction,
 }
 
 impl AbstractRelation {
@@ -1204,6 +1268,94 @@ impl AbstractRelation {
         TritBdd::from_parts(dia_must, dia_may)
     }
 
+    /// P2.5-F — the 3-valued CONTROLLABLE PREDECESSOR over the abstract game: the cubes from which the
+    /// controller can force `phi`. It plays the EXACT concrete one-step game (`∀env ∃ctrl`) within each
+    /// concrete state, then lifts to the cube by the may/must abstraction — the `must` (definite) region
+    /// requires EVERY concrete state in the cube to be controller-winning (`∀x∈p`), the `may` (possible)
+    /// region requires SOME (`∃x∈p`). When the predicates pin each concrete state (one cube per state)
+    /// this reduces to the exact [`ExactModel::cpre_controllable`], so the exact engine is the
+    /// differential oracle; with coarser predicates a cube where some states win and others do not is
+    /// `⊥`. Sound: definite (`must`/`¬may`) verdicts transfer (Bruns–Godefroid). Requires the relation
+    /// to carry [`GamePieces`] (built via [`BddBitBlaster::abstract_game`]).
+    fn cpre_controllable(&self, phi: &TritBdd) -> TritBdd {
+        let g = self
+            .game
+            .as_ref()
+            .expect("cpre_controllable requires a game relation (abstract_game)");
+        // The concrete controller-win region toward next-set `r_next` (over concrete x):
+        // `∀env. ∃ctrl. ∃p'. A'(x, ctrl, env, p') ∧ r_next(p')` = "the controller can step into r".
+        let win = |r_next: &BDDFunction| -> BDDFunction {
+            use oxidd::{BooleanFunctionQuant, BooleanOperator};
+            let reach = g
+                .a_prime
+                .apply_exists(BooleanOperator::And, r_next, &self.next_cube)
+                .unwrap()
+                .exists(&g.ctrl_cube)
+                .unwrap();
+            reach.forall(&g.env_cube).unwrap()
+        };
+        self.lift_game_win(
+            g,
+            &win(&self.to_next(phi.must())),
+            &win(&self.to_next(phi.may())),
+        )
+    }
+
+    /// P2.5-F — the 3-valued ENVIRONMENT PREDECESSOR (dual of [`Self::cpre_controllable`]): the cubes
+    /// from which the ENVIRONMENT can force `phi` — concrete `∃env ∀ctrl` per state, lifted by the
+    /// same `∀x`/`∃x` cube abstraction.
+    fn cpre_environment(&self, phi: &TritBdd) -> TritBdd {
+        let g = self
+            .game
+            .as_ref()
+            .expect("cpre_environment requires a game relation (abstract_game)");
+        // `∃env. ∀ctrl. ∃p'. A'(x, ctrl, env, p') ∧ r_next(p')`.
+        let win = |r_next: &BDDFunction| -> BDDFunction {
+            use oxidd::{BooleanFunctionQuant, BooleanOperator};
+            let step = g
+                .a_prime
+                .apply_exists(BooleanOperator::And, r_next, &self.next_cube)
+                .unwrap();
+            step.forall(&g.ctrl_cube)
+                .unwrap()
+                .exists(&g.env_cube)
+                .unwrap()
+        };
+        self.lift_game_win(
+            g,
+            &win(&self.to_next(phi.must())),
+            &win(&self.to_next(phi.may())),
+        )
+    }
+
+    /// Lift a concrete per-state win region to the cube: `must = ∀x∈p. win_must`, `may = ∃x∈p. win_may`,
+    /// both restricted to feasible cubes. Shared by both predecessors.
+    fn lift_game_win(
+        &self,
+        g: &GamePieces,
+        win_must: &BDDFunction,
+        win_may: &BDDFunction,
+    ) -> TritBdd {
+        use oxidd::BooleanFunctionQuant;
+        let cpre_must =
+            g.a.not()
+                .unwrap()
+                .or(win_must)
+                .unwrap()
+                .forall(&g.reg_cube)
+                .unwrap()
+                .and(&self.feasible_present)
+                .unwrap();
+        let cpre_may =
+            g.a.and(win_may)
+                .unwrap()
+                .exists(&g.reg_cube)
+                .unwrap()
+                .and(&self.feasible_present)
+                .unwrap();
+        TritBdd::from_parts(cpre_must, cpre_may)
+    }
+
     /// R-F5.5c — the may/must relations RESTRICTED to a guard's matching
     /// transitions: `R ∧ cur_ok(x) ∧ next_ok(x')`, where `cur_ok` / `next_ok`
     /// are the `req_*` / `forb_*` state-predicate filters over the present /
@@ -1318,16 +1470,38 @@ impl AbstractRelation {
                 guard,
                 target,
             } => {
-                // Out-of-fragment over a predicate cube (see
-                // `cube_modality_soundness_warnings`): controllability needs a
-                // player partition the plain verification cube lacks; a bounded
-                // step is not may/must-filtered; a label guard is vacuous because
-                // the cube collapses every concrete action onto its own label.
+                // P2.5-F — TWO-PLAYER: a controllability guard is dispatched to the 3-valued
+                // controllable predecessor when the relation carries a game partition
+                // (`abstract_game`). It must be a CONTROL-ONLY guard (no label / state-predicate /
+                // step axis, which the game CPre does not yet combine with). Without a game partition
+                // it stays an honest error (the plain verification cube has no player partition).
                 if guard.control != Control::All {
-                    return Err(
-                        "symbolic cube evaluator: controllability guards (`ctrl`) unsupported"
-                            .into(),
-                    );
+                    let control_only = *guard
+                        == Guard {
+                            control: guard.control,
+                            ..Guard::default()
+                        };
+                    if self.game.is_none() {
+                        return Err(
+                            "symbolic cube evaluator: controllability guards (`ctrl`) require a \
+                             two-player game relation — build with `abstract_game`"
+                                .into(),
+                        );
+                    }
+                    if !control_only {
+                        return Err(
+                            "symbolic cube evaluator: a controllability (`ctrl`) modality must be \
+                             control-only — labels / state-predicate / step guards are not yet \
+                             combined with the game predecessor"
+                                .into(),
+                        );
+                    }
+                    let phi = self.eval_node(f, *target, names, r_must, bindings)?;
+                    return Ok(match guard.control {
+                        Control::Controllable => self.cpre_controllable(&phi),
+                        Control::Environment => self.cpre_environment(&phi),
+                        Control::All => unreachable!("handled by the outer branch"),
+                    });
                 }
                 if guard.max_steps.is_some() {
                     return Err(
@@ -1400,6 +1574,29 @@ impl AbstractRelation {
             Trit::Unknown
         } else {
             Trit::False
+        }
+    }
+
+    /// P2.5-F — the trit verdict at the INITIAL cube(s): the abstract cubes containing a concrete
+    /// initial state (`∃x. init(x) ∧ A(x,p)`). `True` iff every such cube is definite-true
+    /// (`init ⊆ must`), `False` iff none is even possibly-true (`init ∩ may = ∅`), else `⊥`. Requires a
+    /// game relation (which carries `A(x,p)`).
+    pub fn verdict_at_init(&self, verdict: &TritBdd, init_state: &BDDFunction) -> Trit {
+        use oxidd::BooleanFunctionQuant;
+        let g = self
+            .game
+            .as_ref()
+            .expect("verdict_at_init requires a game relation (abstract_game)");
+        let init_cubes = init_state.and(&g.a).unwrap().exists(&g.reg_cube).unwrap();
+        if init_cubes == self.ff {
+            return Trit::Unknown; // no feasible initial cube (should not happen for a real reset)
+        }
+        if init_cubes.and(&verdict.must().not().unwrap()).unwrap() == self.ff {
+            Trit::True
+        } else if init_cubes.and(verdict.may()).unwrap() == self.ff {
+            Trit::False
+        } else {
+            Trit::Unknown
         }
     }
 }
@@ -2629,6 +2826,45 @@ pub fn exact_two_player_verdict(
     let set: std::collections::HashSet<String> =
         controllable.iter().map(|s| s.to_string()).collect();
     verdict_with_witness_catching(btor2_content, formula, &set).map(|(v, _)| v)
+}
+
+/// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER KMTS (3-valued predicate
+/// cube) game: the scale backend of the unified verifier (past the exact BDD cap). `predicates` is the
+/// abstraction (name → atom); `controllable` names the controller's inputs. Returns the 3-valued verdict
+/// at the initial cube — `True` (controller wins / spec realizable), `False` (environment wins), or
+/// `Unknown` (the abstraction is too coarse; a CEGAR refinement of the predicates is the follow-up).
+///
+/// **Soundness (Bruns–Godefroid).** Definite (`True`/`False`) verdicts transfer to the concrete game at
+/// every alternation depth. The controllable predecessor plays the exact concrete `∀env ∃ctrl` game
+/// within each concrete state and lifts by the `∀x`/`∃x` cube abstraction
+/// ([`AbstractRelation::cpre_controllable`]); with predicates that pin each state it equals the exact
+/// [`exact_two_player_verdict`], which is the differential oracle.
+pub fn kmts_two_player_verdict(
+    btor2_content: &str,
+    formula: &Formula,
+    predicates: &[(String, PredicateExpr)],
+    controllable: &[&str],
+    must_semantics: MustSemantics,
+) -> Result<Trit, String> {
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("adapter/btor2/kmts two-player: {}", e.message))?;
+    let exprs: Vec<PredicateExpr> = predicates.iter().map(|(_, e)| e.clone()).collect();
+    let names: Vec<String> = predicates.iter().map(|(n, _)| n.clone()).collect();
+    // R-F5.6 cone restriction from the predicate registers (mirrors the single-agent cube path).
+    let mut seed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &exprs {
+        collect_predicate_registers(e, &mut seed);
+    }
+    let seed_atoms: Vec<String> = seed.into_iter().collect();
+    let keep = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep.as_ref())?;
+    let ctrl: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    let rel = bb.abstract_game(&exprs, must_semantics, &ctrl)?;
+    let verdict = rel.evaluate(formula, &names)?;
+    let init = bb.initial_state_bdd(&file);
+    Ok(rel.verdict_at_init(&verdict, &init))
 }
 
 /// Shared `catch_unwind` BACKSTOP for the node-budget guard. A single BDD op (`Op::Mul`, a wide
