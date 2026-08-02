@@ -2901,6 +2901,62 @@ pub fn exact_env_strategy_witness(btor2_content: &str, good: &str) -> Option<Sta
     bb.reach_good_play(&file, &good_bdd)
 }
 
+/// P2.5-E — a full POSITIONAL environment strategy for `AG EF good`: a memoryless policy over the
+/// design's reachable states. Where [`exact_env_strategy_witness`] returns ONE play (witnessing `EF good`
+/// from the initial state), this returns the `AG` part — the driving discipline for *every* reachable
+/// state, as a state-indexed map. It is the reusable object: an environment model, a directed-test seed,
+/// or the environment half of an assume-guarantee contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionalPolicy {
+    /// The state register the policy is indexed by (the register named in the `good` atom).
+    pub state_register: String,
+    /// One row per reachable value of `state_register`, ordered by rank then value.
+    pub entries: Vec<PolicyEntry>,
+}
+
+/// One control-state row of a [`PositionalPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEntry {
+    /// The value of the policy's state register in this row.
+    pub state_value: u128,
+    /// Attractor distance to `good` (`0` = the state already satisfies `good`).
+    pub rank: u32,
+    /// The inputs the strategy FORCES in this state (name → value). An input that some rank-decreasing
+    /// move leaves free is omitted, so a nonempty map is the minimal driving discipline. The SAME input
+    /// appearing with DIFFERENT forced values across rows is the positional obligation, made explicit as
+    /// a map rather than read off a single trace.
+    pub forced_inputs: BTreeMap<String, u128>,
+}
+
+/// P2.5-E — synthesize the full positional environment strategy for `AG EF good` (see
+/// [`PositionalPolicy`]). `None` when `good` is not a resolvable `REG op VALUE` state atom over a state
+/// register, the model can't be built (over-cap / array / input-atom), or `good` is unreachable from the
+/// initial state (no strategy exists).
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD — the `EF(good)` attractor supplies each state's rank;
+/// concrete forward reachability from the initial state enumerates the real reachable states (so the free
+/// reset does not make every encoding "winning"); each row's forced inputs are projected from the
+/// rank-decreasing moves.
+pub fn exact_env_strategy_policy(btor2_content: &str, good: &str) -> Option<PositionalPolicy> {
+    use crate::adapter::btor2::parser;
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good)?;
+    let resolve = |name: &str| -> String {
+        parser::resolve_to_canonical_name(
+            &file,
+            name,
+            parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
+    };
+    let expr = resolve_predicate_expr_registers(&parse_predicate_atom_bool(good).ok()?, &resolve);
+    let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_predicate_registers(&expr, &mut regs);
+    let reg = regs.into_iter().next()?;
+    bb.env_strategy_policy(&file, &good_bdd, &reg)
+}
+
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
 /// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
 /// - bare `AF p` = `μX. (p ∨ [] X)`,
@@ -3378,6 +3434,179 @@ impl BddBitBlaster {
             s = ns;
         }
         None
+    }
+
+    /// P2.5-E — the full positional policy (see [`PositionalPolicy`]). The `EF(good)` attractor gives each
+    /// state its rank; concrete forward reachability from the initial state enumerates the real reachable
+    /// states; the forced inputs per control state are projected from the rank-decreasing moves.
+    fn env_strategy_policy(
+        &self,
+        file: &Btor2File,
+        good: &BDDFunction,
+        reg_name: &str,
+    ) -> Option<PositionalPolicy> {
+        let exact = self.exact_model();
+        // EF(good) attractor layers: L_0 = good, L_k = L_{k-1} ∨ ◇L_{k-1}. rank(s) = min k: s ∈ L_k.
+        let mut layers = vec![good.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.diamond_pre(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let winning = layers.last().unwrap().clone();
+        let init = self.initial_state_bdd(file);
+        if init.and(&winning).unwrap() == self.ff {
+            return None; // good unreachable from init — no strategy
+        }
+        // The policy is indexed by this state register.
+        if !self
+            .cells
+            .iter()
+            .any(|c| c.is_state && c.symbol == reg_name)
+        {
+            return None;
+        }
+        // rank(s): the least attractor layer containing the concrete state s.
+        let rank_of = |s: &BTreeMap<String, u128>| -> u32 {
+            let mt = self.state_minterm(s);
+            (0..layers.len())
+                .find(|&k| mt.and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(0) as u32
+        };
+        // Concrete forward reachability from init (under all inputs) — stays on the design's real states,
+        // so the free reset does not make every encoding "winning" (a symbolic winning-region walk would).
+        let mut frontier: Vec<BTreeMap<String, u128>> = Vec::new();
+        {
+            let mut r = init.clone();
+            for _ in 0..1024 {
+                if r == self.ff {
+                    break;
+                }
+                let s = self.pick_state_assignment(&r);
+                r = r.and(&self.state_minterm(&s).not().unwrap()).unwrap();
+                frontier.push(s);
+            }
+        }
+        let mut visited: std::collections::HashSet<BTreeMap<String, u128>> =
+            std::collections::HashSet::new();
+        let mut reached: Vec<(BTreeMap<String, u128>, u32)> = Vec::new();
+        let mut guard = 0usize;
+        while let Some(s) = frontier.pop() {
+            guard += 1;
+            if guard > 200_000 {
+                break; // reachable-set guard (should never fire for a control FSM)
+            }
+            if !visited.insert(s.clone()) {
+                continue;
+            }
+            let k = rank_of(&s);
+            for ns in self.concrete_successors(&exact, &s) {
+                if !visited.contains(&ns) {
+                    frontier.push(ns);
+                }
+            }
+            reached.push((s, k));
+        }
+        // The min rank per state-register value (its shortest distance to `good`).
+        let mut min_rank: BTreeMap<u128, u32> = BTreeMap::new();
+        for (s, k) in &reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            min_rank
+                .entry(v)
+                .and_modify(|r| *r = (*r).min(*k))
+                .or_insert(*k);
+        }
+        // The forced-input discipline is projected from the rank-decreasing moves of the MIN-RANK
+        // states of each control value (its fastest-progress behaviour). Aggregating over higher-rank
+        // states of the same control value — which may branch differently on OTHER registers (e.g. a
+        // wipe-round flag) — would cancel the forcing; the min-rank moves are the clean discipline.
+        let mut moves_by_val: BTreeMap<u128, BDDFunction> = BTreeMap::new();
+        for (s, k) in &reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            if *k == 0 || *k != min_rank[&v] {
+                continue;
+            }
+            let m = self
+                .state_minterm(s)
+                .and(&exact.move_into(&layers[(*k - 1) as usize]))
+                .unwrap();
+            moves_by_val
+                .entry(v)
+                .and_modify(|acc| *acc = acc.or(&m).unwrap())
+                .or_insert(m);
+        }
+        let mut entries: Vec<PolicyEntry> = min_rank
+            .iter()
+            .map(|(&v, &rank)| {
+                let mut forced = BTreeMap::new();
+                if let Some(mv) = moves_by_val.get(&v)
+                    && *mv != self.ff
+                {
+                    for cell in self.cells.iter().filter(|c| !c.is_state) {
+                        if let Some(val) = self.forced_cell_value(mv, cell) {
+                            forced.insert(cell.symbol.clone(), val);
+                        }
+                    }
+                }
+                PolicyEntry {
+                    state_value: v,
+                    rank,
+                    forced_inputs: forced,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
+        Some(PositionalPolicy {
+            state_register: reg_name.to_string(),
+            entries,
+        })
+    }
+
+    /// The distinct concrete next-states reachable from `s` under some constraint-respecting input.
+    /// Enumerates by picking a full `(state = s, input)` assignment, stepping it, then subtracting every
+    /// input that leads to that successor — so the loop count is the number of DISTINCT successors (few).
+    fn concrete_successors(
+        &self,
+        exact: &ExactModel,
+        s: &BTreeMap<String, u128>,
+    ) -> Vec<BTreeMap<String, u128>> {
+        let mut rem = self.state_minterm(s).and(&self.constraint_bdd).unwrap();
+        let mut outs = Vec::new();
+        for _ in 0..4096 {
+            if rem == self.ff {
+                break;
+            }
+            let full = self.pick_full_assignment(&rem);
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            rem = rem
+                .and(&exact.to_next(&self.state_minterm(&ns)).not().unwrap())
+                .unwrap();
+            outs.push(ns);
+        }
+        outs
+    }
+
+    /// The value `cell` is forced to across the (state,input) set `set` (assumed non-empty), or `None`
+    /// if any of `cell`'s bits can take either value there — i.e. the cell is not (fully) constrained.
+    fn forced_cell_value(&self, set: &BDDFunction, cell: &Cell) -> Option<u128> {
+        let mut val = 0u128;
+        for (b, var) in cell.vars.iter().enumerate() {
+            let with1 = set.and(var).unwrap();
+            let with0 = set.and(&var.not().unwrap()).unwrap();
+            if with1 != self.ff && with0 != self.ff {
+                return None;
+            }
+            if with1 != self.ff {
+                val |= 1u128 << b;
+            }
+        }
+        Some(val)
     }
 
     /// `¬EF p = ¬(μX. (p ∨ ◇X))` over the exact model — the "trap" region: states from which

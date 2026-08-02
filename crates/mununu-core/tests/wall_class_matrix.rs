@@ -1301,3 +1301,112 @@ fn rom_ctrl_witness_play_exhibits_positional_ack_strategy() {
         "the play reaches Done (518)"
     );
 }
+
+/// P2.5-E — the FULL positional strategy (Mealy policy over reachable states), the generalization of the
+/// single witness play. `exact_env_strategy_policy` returns a state-indexed map; for edn the map prescribes
+/// `boot_req_mode_i` at OPPOSITE values in two control states — the positional obligation as a policy
+/// rather than one trace: `=1` at Idle (193, request the boot) and `=0` at BootDone (240, release to
+/// progress). The map also covers the whole reachable region (every control state gets a discipline).
+#[test]
+fn edn_full_positional_policy_maps_boot_req_per_state() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_policy;
+    let policy = exact_env_strategy_policy(EDN_BOOT, "state_q == 44").expect("a strategy exists");
+    let forced = |v: u128, sig: &str| -> Option<u128> {
+        policy
+            .entries
+            .iter()
+            .find(|e| e.state_value == v)
+            .and_then(|e| e.forced_inputs.get(sig).copied())
+    };
+    // The SAME input forced to OPPOSITE values in two states — the positional obligation, as a map.
+    assert_eq!(
+        forced(193, "boot_req_mode_i"),
+        Some(1),
+        "Idle: request the boot"
+    );
+    assert_eq!(
+        forced(240, "boot_req_mode_i"),
+        Some(0),
+        "BootDone: release boot_req to progress"
+    );
+    // The target is already good (rank 0), and the policy covers the reachable control states.
+    assert!(
+        policy
+            .entries
+            .iter()
+            .any(|e| e.state_value == 44 && e.rank == 0)
+    );
+    assert!(
+        policy.entries.len() >= 5,
+        "policy covers the reachable region, not one path: {} entries",
+        policy.entries.len()
+    );
+}
+
+/// P2.5-E — the full positional policy on OTBN. The map captures the "acknowledge only when expected"
+/// discipline across ALL states: `urnd_reseed_ack_i = 0` at Halt (1) — a stray ACK would trap — and `= 1`
+/// at UrndRefresh (242) to progress to Running (119). The per-control-state forced inputs come from the
+/// MIN-RANK (fastest-progress) moves, so the UrndRefresh row is not muddied by the wipe-round register.
+#[test]
+fn otbn_full_positional_policy_maps_ack_per_state() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_policy;
+    let policy =
+        exact_env_strategy_policy(OTBN_START_STOP, "state_q == 119").expect("a strategy exists");
+    let forced = |v: u128, sig: &str| -> Option<u128> {
+        policy
+            .entries
+            .iter()
+            .find(|e| e.state_value == v)
+            .and_then(|e| e.forced_inputs.get(sig).copied())
+    };
+    assert_eq!(
+        forced(1, "urnd_reseed_ack_i"),
+        Some(0),
+        "Halt: keep ACK silent (a stray ACK traps to Locked)"
+    );
+    assert_eq!(
+        forced(242, "urnd_reseed_ack_i"),
+        Some(1),
+        "UrndRefresh: assert ACK to progress to Running"
+    );
+    assert!(
+        policy
+            .entries
+            .iter()
+            .any(|e| e.state_value == 119 && e.rank == 0)
+    );
+}
+
+/// P2.5-E — the full positional policy on the ROM controller. The map prescribes `kmac_done_i = 0` at
+/// ReadingLow (201) — a stray ACK trips the consistency check → Invalid — and `= 1` at ReadingHigh (185)
+/// to hand off the digest toward Checking → Done (518). The same ack-when-expected discipline as OTBN,
+/// on a second security FSM.
+#[test]
+fn rom_ctrl_full_positional_policy_maps_ack_per_state() {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_env_strategy_policy;
+    let policy =
+        exact_env_strategy_policy(ROM_CTRL_FSM, "state_q == 518").expect("a strategy exists");
+    let forced = |v: u128, sig: &str| -> Option<u128> {
+        policy
+            .entries
+            .iter()
+            .find(|e| e.state_value == v)
+            .and_then(|e| e.forced_inputs.get(sig).copied())
+    };
+    assert_eq!(
+        forced(201, "kmac_done_i"),
+        Some(0),
+        "ReadingLow: keep the KMAC ACK silent (a stray ACK trips the consistency check)"
+    );
+    assert_eq!(
+        forced(185, "kmac_done_i"),
+        Some(1),
+        "ReadingHigh: assert the KMAC ACK to progress toward Done"
+    );
+    assert!(
+        policy
+            .entries
+            .iter()
+            .any(|e| e.state_value == 518 && e.rank == 0)
+    );
+}
