@@ -20,7 +20,14 @@
 
 use mununu_core::adapter::btor2::symbolic_bitblast::{
     TwoPlayerStrategy, exact_env_positional_strategy, exact_two_player_strategy,
+    game_sound_posture_model,
 };
+
+// A reset-artifact game: `st' = rst ? 0 : c` (active-high async reset). controllable = {c}. With `rst`
+// ADVERSARIAL the environment holds `rst=1` forever → `st` stuck at 0 → `st==1` unreachable ⇒ spuriously
+// UNREALIZABLE (a modeling artifact — reset is not a real adversarial input). `game_sound_posture_model`
+// pins the reset inactive (+ reset-init), so the sound game `st'=c` is realizable.
+const RESET_GAME: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 rst\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 ite 1 3 5 2\n8 next 1 4 7\n";
 
 // st' = c : the controller sets the next state directly (environment powerless).
 const CTRL_INIT0: &str = "\
@@ -200,4 +207,24 @@ fn edn_mode_controllable_counterstrategy_is_environment_only() {
             );
         }
     }
+}
+
+/// The sound-posture transform removes the reset-hold ARTIFACT: the raw reset-adversarial game is
+/// (spuriously) unrealizable — the environment holds `rst=1` forever — but on `game_sound_posture_model`
+/// (reset pinned inactive + reset-init) the genuine functional game `st'=c` is realizable.
+#[test]
+fn sound_posture_removes_the_reset_hold_artifact() {
+    // Raw model: reset is adversarial → the environment blocks by holding reset → unrealizable.
+    let raw = exact_two_player_strategy(RESET_GAME, "st == 1", &["c"]).unwrap();
+    assert!(
+        matches!(raw, TwoPlayerStrategy::EnvironmentCounterstrategy(_)),
+        "raw (reset-adversarial): the env holds reset ⇒ spuriously unrealizable"
+    );
+    // Sound posture: reset is a released posture (not adversarial) → the controller wins `st'=c`.
+    let sound_model = game_sound_posture_model(RESET_GAME);
+    let sound = exact_two_player_strategy(&sound_model, "st == 1", &["c"]).unwrap();
+    assert!(
+        matches!(sound, TwoPlayerStrategy::ControllerStrategy(_)),
+        "sound posture (reset released): the controller forces st=1 ⇒ realizable"
+    );
 }

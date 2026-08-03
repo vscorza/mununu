@@ -810,6 +810,13 @@ struct Btor2GameArgs {
     /// environment counterstrategy's forced inputs are the blockers, searched first.
     #[arg(long = "discover-assumptions")]
     discover_assumptions: bool,
+    /// Model the CLOCK and RESET as a sound posture instead of adversarial inputs (the raw lifted BTOR2
+    /// carries `clk`/`rst` as free inputs, so a two-player game otherwise lets the environment FREEZE THE
+    /// CLOCK or HOLD RESET — spuriously unrealizable for a modeling, not functional, reason). Pins the
+    /// detected reset inactive (+ post-reset init) and the clock to a constant, so the game is the genuine
+    /// functional one. Recommended for real RTL.
+    #[arg(long = "assume-clock-reset")]
+    assume_clock_reset: bool,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2754,10 +2761,18 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// peer of the API `POST /api/v1/btor2/game`. Exits non-zero (via `--fail-on`) on `unrealizable` (mapped
 /// to the `violated` verdict class); `realizable` maps to `holds`.
 fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
-    use mununu_core::adapter::btor2::symbolic_bitblast::exact_two_player_strategy;
+    use mununu_core::adapter::btor2::symbolic_bitblast::{
+        exact_two_player_strategy, game_sound_posture_model,
+    };
 
-    let content = std::fs::read_to_string(&args.file)
+    let raw = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    // --assume-clock-reset: model clk/rst as a sound posture (not adversarial) before solving the game.
+    let content = if args.assume_clock_reset {
+        game_sound_posture_model(&raw)
+    } else {
+        raw
+    };
     let controllable: Vec<&str> = args.controllable.iter().map(String::as_str).collect();
     let strategy = exact_two_player_strategy(&content, &args.good, &controllable)?;
 
@@ -2765,6 +2780,7 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
         "file": args.file.display().to_string(),
         "good": args.good,
         "controllable": args.controllable,
+        "assume_clock_reset": args.assume_clock_reset,
         "realizable": strategy.realizable(),
     });
     summary["strategy"] =

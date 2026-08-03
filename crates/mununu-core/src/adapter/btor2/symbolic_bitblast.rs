@@ -2859,6 +2859,55 @@ pub fn exact_symbolic_verdict_with_witness(
     verdict_with_witness_catching(btor2_content, formula, &std::collections::HashSet::new())
 }
 
+/// P2.5-F — the SOUND-POSTURE two-player game model: exclude the CLOCK and RESET from the adversary.
+/// The raw lifted BTOR2 carries `clk`/`rst` as free primary inputs, so a two-player game treats them as
+/// ADVERSARIAL — the environment can FREEZE THE CLOCK (hold `clk` constant → the design never advances)
+/// or HOLD RESET (→ the FSM sticks in reset), making the reachability game spuriously unrealizable for a
+/// MODELING reason, not a functional one. In real synchronous verification the clock ticks and reset is a
+/// controlled posture. This transform models that: inject the post-reset `init`
+/// ([`crate::adapter::btor2::reset_init::inject_reset_init`]), then PIN the detected reset(s) to their
+/// inactive level and the clock(s) to a constant — so the game is over the FUNCTIONAL inputs only. Returns
+/// the content unchanged when there is no detected reset/clock (a pure-functional design is already sound).
+///
+/// **Soundness:** reset-released + reset-init IS the design's normal operational start (the same
+/// operational model the recoverability path uses); the clock is near-dangling in an `async2sync`-lifted
+/// design, so pinning it is a no-op on the transition. The resulting verdict/strategy is the genuine
+/// FUNCTIONAL game, free of the clock-freeze / reset-hold artifacts. Opt-in (the raw model is preserved
+/// for callers that want the literal all-inputs-adversarial reading).
+pub fn game_sound_posture_model(btor2_content: &str) -> String {
+    use crate::adapter::btor2::ast::Node;
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return btor2_content.to_string();
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    // Detected reset(s): (input name, inactive level). Post-reset `init` first, so pinning the reset
+    // inactive does not leave a HAVOC initial state (the reset would otherwise set the start state).
+    let resets = crate::adapter::fsm_scan::detect_resets(&file, &symbols);
+    let m = crate::adapter::btor2::reset_init::inject_reset_init(btor2_content, &resets)
+        .unwrap_or_else(|_| btor2_content.to_string());
+    let mut pins: Vec<(String, u64)> = resets;
+    // Clock(s): pin to 0 — near-dangling in async2sync, so this excludes any residual clock-gating from
+    // the adversary without changing functional behaviour.
+    let is_clock = |s: &str| -> bool {
+        matches!(
+            s.to_ascii_lowercase().as_str(),
+            "clk" | "clock" | "ck" | "i_clk" | "clk_i" | "iclk" | "clki"
+        )
+    };
+    for line in &file.lines {
+        if let Node::Input { .. } = &line.node
+            && let Some(name) = symbols.get(&line.nid)
+            && is_clock(name)
+        {
+            pins.push((name.clone(), 0));
+        }
+    }
+    if pins.is_empty() {
+        return m;
+    }
+    crate::adapter::btor2::pin::pin_inputs_to_constants(&m, &pins).0
+}
+
 /// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER exact game, with
 /// `controllable` naming the controller's input signals (the rest are the environment's). The
 /// formula's `<(ctrl=controllable)>` / `[(ctrl=controllable)]` modalities are evaluated by the
