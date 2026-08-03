@@ -3413,7 +3413,7 @@ pub fn exact_env_strategy_witness(btor2_content: &str, good: &str) -> Option<Sta
 /// from the initial state), this returns the `AG` part — the driving discipline for *every* reachable
 /// state, as a state-indexed map. It is the reusable object: an environment model, a directed-test seed,
 /// or the environment half of an assume-guarantee contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PositionalStrategy {
     /// The state register the strategy is indexed by (the register named in the `good` atom).
     pub state_register: String,
@@ -3422,7 +3422,7 @@ pub struct PositionalStrategy {
 }
 
 /// One control-state row of a [`PositionalStrategy`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StrategyEntry {
     /// The value of the strategy's state register in this row.
     pub state_value: u128,
@@ -3471,7 +3471,7 @@ pub fn exact_env_positional_strategy(
 /// ([`MealyStrategy`]). The game is Mealy — the environment moves and the controller RESPONDS
 /// ([`ExactModel::cpre_controllable`], `∀env ∃ctrl`) — so the controller's move may depend on the
 /// current environment input. `env_inputs` is empty for an env-independent (Moore) move.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MealyMove {
     /// The environment-input valuation this move responds to; empty = env-independent (holds for every
     /// environment move).
@@ -3481,7 +3481,7 @@ pub struct MealyMove {
 }
 
 /// One control-state row of a [`MealyStrategy`]: the controller's response(s) at that control value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MealyEntry {
     /// The value of the strategy's state register.
     pub state_value: u128,
@@ -3499,7 +3499,7 @@ pub struct MealyEntry {
 /// controller forces the controllable inputs (possibly reacting to the environment input — the game is
 /// `∀env ∃ctrl`) to a rank-decreasing move. Contrast [`PositionalStrategy`], which the ENVIRONMENT
 /// counterstrategy uses (the environment is the first-mover, so its winning strategy is positional).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MealyStrategy {
     /// The state register the strategy is indexed by.
     pub state_register: String,
@@ -3539,20 +3539,36 @@ impl MealyStrategy {
 /// COUNTERSTRATEGY when it is not (by determinacy, exactly one holds). The asymmetry is intrinsic to the
 /// Mealy game (`∀env ∃ctrl`): the environment is the first-mover, so its winning strategy is positional
 /// (state-indexed); the controller responds, so its strategy may depend on the environment input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TwoPlayerStrategy {
-    /// The controller wins from the initial state (spec realizable) — its Mealy strategy.
+    /// The controller wins from the initial state (spec realizable) — its Mealy strategy. Serializes as
+    /// `{"kind": "controller_strategy", "state_register": …, "entries": […]}`.
     ControllerStrategy(MealyStrategy),
     /// The environment wins (unrealizable) — its positional counterstrategy, forcing environment inputs
     /// (robust to every controllable move) to keep the play out of the controller's winning region.
+    /// Serializes as `{"kind": "environment_counterstrategy", "state_register": …, "entries": […]}`.
     EnvironmentCounterstrategy(PositionalStrategy),
+}
+
+impl TwoPlayerStrategy {
+    /// `true` when the controller wins from the initial state (the spec is realizable) and this carries
+    /// its strategy; `false` when the environment wins (unrealizable) and this carries the counterstrategy.
+    pub fn realizable(&self) -> bool {
+        matches!(self, TwoPlayerStrategy::ControllerStrategy(_))
+    }
 }
 
 /// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good` with
 /// `controllable` naming the controller's inputs. Returns the CONTROLLER's Mealy strategy when the
 /// controller wins from the initial state (== [`exact_two_player_verdict`] holds on `μX. good ∨ ⟨ctrl⟩X`),
-/// or the ENVIRONMENT's positional counterstrategy when it does not. `None` when `good` is not a
-/// resolvable state atom or the model can't be built.
+/// or the ENVIRONMENT's positional counterstrategy when it does not (`TwoPlayerStrategy::realizable`
+/// distinguishes them). The surface entry point behind `mununu btor2 game` / `POST /api/v1/btor2/game`.
+///
+/// `Err` when `good` is not a resolvable `REG op VALUE` state atom, the model can't be built (over the
+/// exact cap / array / input-atom), the atom references no state register, or a declared `controllable`
+/// name is not a real primary input — the same partition validation as [`exact_two_player_verdict`], so a
+/// typo or an internally-driven signal is rejected rather than silently reinterpreted as environment.
 ///
 /// **Engine (§16):** `exact-symbolic` ROBDD — the controllable attractor (`cpre_controllable`) supplies
 /// ranks; concrete forward reachability enumerates the real states. The controller's moves come from
@@ -3563,9 +3579,39 @@ pub fn exact_two_player_strategy(
     btor2_content: &str,
     good: &str,
     controllable: &[&str],
-) -> Option<TwoPlayerStrategy> {
+) -> Result<TwoPlayerStrategy, String> {
     use crate::adapter::btor2::parser;
-    let (bb, file, good_bdd) = build_atom_model(btor2_content, good)?;
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good).ok_or_else(|| {
+        format!(
+            "exact two-player strategy: `{good}` is not a resolvable `REG op VALUE` state atom, or the \
+             model can't be built (over the exact cap / array / input-atom)"
+        )
+    })?;
+    // Validate the partition: every declared controllable input must be a real primary input, else it
+    // would fall back SILENTLY to the environment (the same rule + rationale as `exact_two_player_verdict`).
+    if !controllable.is_empty() {
+        let inputs: std::collections::HashSet<String> = crate::adapter::sts_ir::BtorSts::new(&file)
+            .leaf_cells()
+            .map_err(|e| format!("exact two-player strategy: {e}"))?
+            .into_iter()
+            .filter(|c| !c.is_state)
+            .map(|c| c.name)
+            .collect();
+        let mut unknown: Vec<&str> = controllable
+            .iter()
+            .copied()
+            .filter(|c| !inputs.contains(*c))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            let mut names: Vec<&str> = inputs.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(format!(
+                "exact two-player strategy: declared controllable input(s) {unknown:?} are not primary \
+                 inputs of the design (primary inputs: {names:?})"
+            ));
+        }
+    }
     let resolve = |name: &str| -> String {
         parser::resolve_to_canonical_name(
             &file,
@@ -3576,13 +3622,21 @@ pub fn exact_two_player_strategy(
         )
         .unwrap_or_else(|| name.to_string())
     };
-    let expr = resolve_predicate_expr_registers(&parse_predicate_atom_bool(good).ok()?, &resolve);
+    let expr = resolve_predicate_expr_registers(
+        &parse_predicate_atom_bool(good).map_err(|e| format!("exact two-player strategy: {e}"))?,
+        &resolve,
+    );
     let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_predicate_registers(&expr, &mut regs);
-    let reg = regs.into_iter().next()?;
+    let reg = regs.into_iter().next().ok_or_else(|| {
+        format!("exact two-player strategy: `{good}` references no state register")
+    })?;
     let ctrl: std::collections::HashSet<String> =
         controllable.iter().map(|s| s.to_string()).collect();
     bb.two_player_strategy(&file, &good_bdd, &reg, &ctrl)
+        .ok_or_else(|| {
+            format!("exact two-player strategy: `{reg}` is not a state register in the design")
+        })
 }
 
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.

@@ -1086,6 +1086,38 @@ pub struct Btor2CheckFsmResponse {
     pub registers: Vec<FsmRegisterFinding>,
 }
 
+/// Request for the two-player controllable-reachability game (`POST /api/v1/btor2/game`). Mirrors the CLI
+/// `mununu btor2 game`: decide whether the CONTROLLER can force the design to `good` against every
+/// environment move, and synthesize the winner's strategy.
+#[derive(Debug, Deserialize)]
+pub struct Btor2GameRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// The reachability target `good` state atom (`"REG op VALUE"`, e.g. `"state_q == 44"`).
+    pub good: String,
+    /// The controller-owned primary inputs; every other primary input is the (adversarial) environment's.
+    /// A name that is not a real primary input is a `BadRequest`.
+    #[serde(default)]
+    pub controllable: Vec<String>,
+}
+
+/// Response for `POST /api/v1/btor2/game`.
+#[derive(Debug, Serialize)]
+pub struct Btor2GameResponse {
+    /// `true` = the controller can force `good` against every environment move (the spec is realizable);
+    /// `false` = the environment can prevent it (unrealizable).
+    pub realizable: bool,
+    /// The `good` atom, echoed for provenance.
+    pub good: String,
+    /// The controller-owned inputs, echoed for provenance.
+    pub controllable: Vec<String>,
+    /// The winner's strategy: a `controller_strategy` (Mealy, when realizable) or an
+    /// `environment_counterstrategy` (positional, when not) — the [`crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy`]
+    /// serialized with a `"kind"` tag. The counterstrategy is the witness for the assume-guarantee reading
+    /// (why no controller works).
+    pub strategy: crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy,
+}
+
 /// The SV → BTOR2 lift inputs shared by the SV-direct verb endpoints
 /// (`/api/v1/sv/verify`, `/sv/verify-liveness`, `/sv/verify-recoverability`). These
 /// lift the module (sv2v + Yosys) and then decide the corresponding BTOR2 property,

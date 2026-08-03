@@ -139,6 +139,10 @@ fn create_router() -> Router {
             "/api/v1/btor2/check-fsm",
             post(handlers::btor2_check_fsm_handler),
         )
+        // P2.5-F two-player game — decide controllable-reachability of `good` under an input partition
+        // (controller vs environment) and synthesize the winner's strategy (controller Mealy strategy or
+        // environment counterstrategy). Surface peer of the CLI `mununu btor2 game`.
+        .route("/api/v1/btor2/game", post(handlers::btor2_game_handler))
         // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
         // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
