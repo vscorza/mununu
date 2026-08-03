@@ -1099,6 +1099,11 @@ pub struct Btor2GameRequest {
     /// A name that is not a real primary input is a `BadRequest`.
     #[serde(default)]
     pub controllable: Vec<String>,
+    /// When the game is UNREALIZABLE, also search for an ENVIRONMENT ASSUMPTION under which the controller
+    /// wins (the assume-guarantee wedge) → `holds_under`. CONDITIONAL — never flips `realizable`. No-op
+    /// when the game is already realizable. Mirrors the CLI `--discover-assumptions`.
+    #[serde(default)]
+    pub discover_assumptions: bool,
 }
 
 /// Response for `POST /api/v1/btor2/game`.
@@ -1111,6 +1116,11 @@ pub struct Btor2GameResponse {
     pub good: String,
     /// The controller-owned inputs, echoed for provenance.
     pub controllable: Vec<String>,
+    /// Discovered environment assumption(s) under which the (unrealizable) game becomes realizable —
+    /// each a CONDITIONAL `HoldsUnder(φ)` (never flips `realizable`). Only when `discover_assumptions`
+    /// was requested and the game is unrealizable; empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub holds_under: Vec<crate::verdict::DiscoveredAssumption>,
     /// The winner's strategy: a `controller_strategy` (Mealy, when realizable) or an
     /// `environment_counterstrategy` (positional, when not) — the [`crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy`]
     /// serialized with a `"kind"` tag. The counterstrategy is the witness for the assume-guarantee reading

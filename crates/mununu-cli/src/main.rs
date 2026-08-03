@@ -804,6 +804,12 @@ struct Btor2GameArgs {
     /// (adversarial) environment. A name that is not a real primary input is rejected.
     #[arg(long = "controllable", value_name = "INPUT")]
     controllable: Vec<String>,
+    /// When the game is UNREALIZABLE, search for an ENVIRONMENT ASSUMPTION under which the controller
+    /// wins (the assume-guarantee wedge) — a narrow environment-input hold `e == v` making `A ⇒ G`
+    /// realizable, reported in `holds_under` (CONDITIONAL — never flips the canonical `realizable`). The
+    /// environment counterstrategy's forced inputs are the blockers, searched first.
+    #[arg(long = "discover-assumptions")]
+    discover_assumptions: bool,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2763,6 +2769,19 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     });
     summary["strategy"] =
         serde_json::to_value(&strategy).map_err(|e| format!("serialize strategy: {e}"))?;
+    // --discover-assumptions: when the game is unrealizable, search for an environment assumption under
+    // which the controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
+    if args.discover_assumptions {
+        let holds_under = mununu_core::adapter::recoverability::discover_game_env_assumption(
+            &content,
+            &args.good,
+            &controllable,
+        );
+        if !holds_under.is_empty() {
+            summary["holds_under"] = serde_json::to_value(&holds_under)
+                .map_err(|e| format!("serialize holds_under: {e}"))?;
+        }
+    }
     print_json_summary(&summary)?;
 
     // realizable == the controller wins (`holds`); unrealizable == no controller works (`violated`).

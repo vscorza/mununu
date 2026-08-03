@@ -892,11 +892,23 @@ pub async fn btor2_game_handler(
             message,
             details: None,
         })?;
+    // discover_assumptions: when unrealizable, search for an environment assumption under which the
+    // controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
+    let holds_under = if request.discover_assumptions {
+        crate::adapter::recoverability::discover_game_env_assumption(
+            &request.content,
+            &request.good,
+            &controllable,
+        )
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(Btor2GameResponse {
         realizable: strategy.realizable(),
         good: request.good,
         controllable: request.controllable,
+        holds_under,
         strategy,
     }))
 }
@@ -4677,6 +4689,7 @@ members = ["x"]
             content: GAME_CTRL.to_string(),
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
+            discover_assumptions: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(out.realizable, "st'=c: the controller wins");
@@ -4693,6 +4706,7 @@ members = ["x"]
             content: GAME_ENVBLK.to_string(),
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
+            discover_assumptions: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(!out.realizable, "st'=c&¬e: the environment wins");
@@ -4702,12 +4716,37 @@ members = ["x"]
         ));
     }
 
+    /// `--discover-assumptions` over HTTP: the unrealizable ENVBLK game returns a `holds_under` carrying
+    /// the enabling environment assumption `e == 0` (CONDITIONAL — `realizable` stays false).
+    #[tokio::test]
+    async fn btor2_game_handler_discovers_env_assumption() {
+        let request = Btor2GameRequest {
+            content: GAME_ENVBLK.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: true,
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(
+            !out.realizable,
+            "canonical realizable stays false (conditional-only)"
+        );
+        assert!(
+            out.holds_under
+                .iter()
+                .any(|a| a.phi == "e == 0" && a.non_vacuous),
+            "holds_under carries the enabling assumption e==0: {:?}",
+            out.holds_under
+        );
+    }
+
     #[tokio::test]
     async fn btor2_game_handler_rejects_unknown_controllable_input() {
         let request = Btor2GameRequest {
             content: GAME_CTRL.to_string(),
             good: "st == 1".to_string(),
             controllable: vec!["nope".to_string()], // not a primary input
+            discover_assumptions: false,
         };
         let err = btor2_game_handler(Json(request))
             .await
