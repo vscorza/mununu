@@ -1104,6 +1104,12 @@ pub struct Btor2GameRequest {
     /// when the game is already realizable. Mirrors the CLI `--discover-assumptions`.
     #[serde(default)]
     pub discover_assumptions: bool,
+    /// Model the clock and reset as a sound POSTURE instead of adversarial inputs — pin the detected reset
+    /// inactive (+ post-reset init) and the clock to a constant, so the environment cannot spuriously
+    /// FREEZE THE CLOCK or HOLD RESET (a modeling artifact of the raw lift). Recommended for real RTL.
+    /// Mirrors the CLI `--assume-clock-reset`.
+    #[serde(default)]
+    pub assume_clock_reset: bool,
 }
 
 /// Response for `POST /api/v1/btor2/game`.

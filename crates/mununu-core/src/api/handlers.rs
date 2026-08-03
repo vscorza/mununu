@@ -884,19 +884,29 @@ pub async fn btor2_check_fsm_handler(
 pub async fn btor2_game_handler(
     Json(request): Json<Btor2GameRequest>,
 ) -> ApiResult<Json<Btor2GameResponse>> {
-    use crate::adapter::btor2::symbolic_bitblast::exact_two_player_strategy;
+    use crate::adapter::btor2::symbolic_bitblast::{
+        exact_two_player_strategy, game_sound_posture_model,
+    };
 
+    // assume_clock_reset: model clk/rst as a sound posture (not adversarial) before solving.
+    let content = if request.assume_clock_reset {
+        game_sound_posture_model(&request.content)
+    } else {
+        request.content.clone()
+    };
     let controllable: Vec<&str> = request.controllable.iter().map(String::as_str).collect();
-    let strategy = exact_two_player_strategy(&request.content, &request.good, &controllable)
-        .map_err(|message| ApiError::BadRequest {
-            message,
-            details: None,
+    let strategy =
+        exact_two_player_strategy(&content, &request.good, &controllable).map_err(|message| {
+            ApiError::BadRequest {
+                message,
+                details: None,
+            }
         })?;
     // discover_assumptions: when unrealizable, search for an environment assumption under which the
     // controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
     let holds_under = if request.discover_assumptions {
         crate::adapter::recoverability::discover_game_env_assumption(
-            &request.content,
+            &content,
             &request.good,
             &controllable,
         )
@@ -4681,6 +4691,39 @@ members = ["x"]
     // same known-answer 1-bit games as tests/exact_two_player_strategy.rs, over the HTTP handler.
     const GAME_CTRL: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 next 1 4 2\n";
     const GAME_ENVBLK: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 not 1 3\n8 and 1 2 7\n9 next 1 4 8\n";
+    // Reset-artifact game `st' = rst ? 0 : c`: with `rst` adversarial the env holds reset → unrealizable;
+    // `assume_clock_reset` pins the reset inactive → the functional game `st'=c` is realizable.
+    const GAME_RESET: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 rst\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 ite 1 3 5 2\n8 next 1 4 7\n";
+
+    /// `assume_clock_reset` over HTTP: the reset-adversarial game is unrealizable raw, but realizable when
+    /// the reset is modeled as a posture (the modeling-artifact fix).
+    #[tokio::test]
+    async fn btor2_game_handler_assume_clock_reset_removes_reset_artifact() {
+        let raw = Btor2GameRequest {
+            content: GAME_RESET.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: false,
+            assume_clock_reset: false,
+        };
+        let Json(out) = btor2_game_handler(Json(raw)).await.expect("game runs");
+        assert!(
+            !out.realizable,
+            "reset-adversarial ⇒ spuriously unrealizable"
+        );
+        let posture = Btor2GameRequest {
+            content: GAME_RESET.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: false,
+            assume_clock_reset: true,
+        };
+        let Json(out) = btor2_game_handler(Json(posture)).await.expect("game runs");
+        assert!(
+            out.realizable,
+            "reset as posture ⇒ the controller wins st'=c"
+        );
+    }
 
     #[tokio::test]
     async fn btor2_game_handler_realizable_returns_controller_strategy() {
@@ -4690,6 +4733,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(out.realizable, "st'=c: the controller wins");
@@ -4707,6 +4751,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(!out.realizable, "st'=c&¬e: the environment wins");
@@ -4725,6 +4770,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: true,
+            assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(
@@ -4747,6 +4793,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["nope".to_string()], // not a primary input
             discover_assumptions: false,
+            assume_clock_reset: false,
         };
         let err = btor2_game_handler(Json(request))
             .await
