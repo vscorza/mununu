@@ -885,7 +885,7 @@ pub async fn btor2_game_handler(
     Json(request): Json<Btor2GameRequest>,
 ) -> ApiResult<Json<Btor2GameResponse>> {
     use crate::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_reach_realizable, exact_two_player_strategy, game_sound_posture_model,
     };
 
     // assume_clock_reset: model clk/rst as a sound posture (not adversarial) before solving.
@@ -895,13 +895,15 @@ pub async fn btor2_game_handler(
         request.content.clone()
     };
     let controllable: Vec<&str> = request.controllable.iter().map(String::as_str).collect();
-    let strategy =
-        exact_two_player_strategy(&content, &request.good, &controllable).map_err(|message| {
-            ApiError::BadRequest {
-                message,
-                details: None,
-            }
+    // The VERDICT works on any resolvable target (state cell, combinational output, relation) and
+    // validates the partition; the STRATEGY needs a STATE-register target, so it is best-effort —
+    // omitted (`null`) for a combinational-output / relational `good` (a FIFO's `full_o`).
+    let realizable = exact_two_player_reach_realizable(&content, &request.good, &controllable)
+        .map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
         })?;
+    let strategy = exact_two_player_strategy(&content, &request.good, &controllable).ok();
     // discover_assumptions: when unrealizable, search for an environment assumption under which the
     // controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
     let holds_under = if request.discover_assumptions {
@@ -915,7 +917,7 @@ pub async fn btor2_game_handler(
     };
 
     Ok(Json(Btor2GameResponse {
-        realizable: strategy.realizable(),
+        realizable,
         good: request.good,
         controllable: request.controllable,
         holds_under,
@@ -4739,7 +4741,7 @@ members = ["x"]
         assert!(out.realizable, "st'=c: the controller wins");
         assert!(matches!(
             out.strategy,
-            TwoPlayerStrategy::ControllerStrategy(_)
+            Some(TwoPlayerStrategy::ControllerStrategy(_))
         ));
     }
 
@@ -4757,7 +4759,7 @@ members = ["x"]
         assert!(!out.realizable, "st'=c&¬e: the environment wins");
         assert!(matches!(
             out.strategy,
-            TwoPlayerStrategy::EnvironmentCounterstrategy(_)
+            Some(TwoPlayerStrategy::EnvironmentCounterstrategy(_))
         ));
     }
 

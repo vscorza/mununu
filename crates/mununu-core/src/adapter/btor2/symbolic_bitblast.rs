@@ -2926,6 +2926,24 @@ pub fn exact_two_player_verdict(
     verdict_with_witness_catching(btor2_content, formula, &set).map(|(v, _)| v)
 }
 
+/// P2.5-F — is the controllable-reachability game to `good` REALIZABLE? Builds the reachability formula
+/// `μX. (good ∨ ⟨ctrl⟩X)` and decides it via [`exact_two_player_verdict`]. Unlike
+/// [`exact_two_player_strategy`] (which extracts a state-INDEXED strategy and so requires `good` to name a
+/// STATE register), this needs only the VERDICT — so `good` may be a combinational OUTPUT or a RELATIONAL
+/// atom (`full_o == 1`, `wptr == rptr`), exactly the datapath targets a FIFO-class design uses. `good` is
+/// any atom the exact engine's `predicate_bdd` resolves (state cell, named combinational output, or a
+/// `REG op REG`/`REG op VALUE` comparison). `Ok(true)` = the controller wins from the initial state.
+pub fn exact_two_player_reach_realizable(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Result<bool, String> {
+    let formula_str = format!("mu X. (({good}) || <(ctrl = controllable)> X)");
+    let formula = crate::mu_calculus::parser::parse(&formula_str)
+        .map_err(|e| format!("exact two-player reach: parsing `{formula_str}`: {e:?}"))?;
+    Ok(exact_two_player_verdict(btor2_content, &formula, controllable)? == ExactVerdict::Holds)
+}
+
 /// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER KMTS (3-valued predicate
 /// cube) game: the scale backend of the unified verifier (past the exact BDD cap). `predicates` is the
 /// abstraction (name → atom); `controllable` names the controller's inputs. Returns the 3-valued verdict

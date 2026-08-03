@@ -1129,9 +1129,11 @@ pub struct Btor2GameResponse {
     pub holds_under: Vec<crate::verdict::DiscoveredAssumption>,
     /// The winner's strategy: a `controller_strategy` (Mealy, when realizable) or an
     /// `environment_counterstrategy` (positional, when not) — the [`crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy`]
-    /// serialized with a `"kind"` tag. The counterstrategy is the witness for the assume-guarantee reading
-    /// (why no controller works).
-    pub strategy: crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy,
+    /// serialized with a `"kind"` tag. **Present only for a STATE-register `good`**: the strategy is
+    /// state-indexed, so it is omitted (`null`) for a combinational-output / relational target (a FIFO's
+    /// `full_o`), where `realizable` + `holds_under` still apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy>,
 }
 
 /// The SV → BTOR2 lift inputs shared by the SV-direct verb endpoints
