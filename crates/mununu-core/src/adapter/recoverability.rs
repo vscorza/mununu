@@ -1405,6 +1405,117 @@ fn synthesize_env_strategy_assumption(
     })
 }
 
+/// Capability B, Phase 2c (TWO-PLAYER) — discover an ENVIRONMENT ASSUMPTION under which the
+/// controllable-reachability GAME to `good` becomes REALIZABLE. When the controller cannot force `good`
+/// against a free adversary (`exact_two_player_strategy` returns an `EnvironmentCounterstrategy`), search
+/// for a constraint on the ENVIRONMENT (non-controllable) inputs under which the controller WINS — the
+/// assume-guarantee wedge: `G` is unrealizable, but `A ⇒ G` is realizable ("the boot handshake completes
+/// IF the acknowledging module eventually acks"). Each returned [`DiscoveredAssumption`] is CONDITIONAL
+/// (the caller's canonical verdict is unchanged). Empty when the game is ALREADY realizable (no
+/// assumption needed — the soundness/false-positive control), when `good` is not `REG == VALUE`, or when
+/// no single narrow env-input hold wins.
+///
+/// The environment COUNTERSTRATEGY is the witness: the env inputs it FORCES are the blockers, so those
+/// axes are searched FIRST — a hold that constrains the environment away from its blocking discipline is
+/// the natural assumption. Unlike the 1-player [`synthesize_env_strategy_assumption`] (which asks whether
+/// the environment, owning ALL inputs, can MAINTAIN recovery), this splits inputs into controller vs
+/// environment and asks whether CONSTRAINING the adversary lets the CONTROLLER win — the generalization
+/// the refined-verdicts plan flagged, unblocked by the two-player CPre (`exact_model_partitioned`).
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD two-player game ([`exact_two_player_strategy`], `∀env ∃ctrl`
+/// CPre) on each [`pin_inputs_to_constants`] env-pinned concrete model (2-valued sound per pin) + the
+/// reach portfolio for the non-vacuity gate. A candidate cap + a wall-clock budget bound the search.
+pub fn discover_game_env_assumption(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Vec<DiscoveredAssumption> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::pin::pin_inputs_to_constants;
+    use crate::adapter::btor2::symbolic_bitblast::{TwoPlayerStrategy, exact_two_player_strategy};
+    const MAX_INPUT_BITS: u32 = 3; // ≤ 8 values — a narrow control/ack/enable, not a datapath
+    const MAX_CANDIDATE_PINS: usize = 48;
+    let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let start = std::time::Instant::now();
+
+    // `good` must be `REG == VALUE` — the non-vacuity gate needs the register + value.
+    let (register, value) = match parse_predicate_expr(good).ok() {
+        Some(PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        }) => (register, value),
+        _ => return Vec::new(),
+    };
+
+    // Only search when the game is genuinely UNREALIZABLE — a realizable game needs no assumption (the
+    // false-positive control: discovery must not fabricate an enabling φ for a controller that already
+    // wins). The returned counterstrategy names the blocking env inputs.
+    let counter = match exact_two_player_strategy(btor2_content, good, controllable) {
+        Ok(TwoPlayerStrategy::EnvironmentCounterstrategy(p)) => p,
+        _ => return Vec::new(), // realizable, or `good` not a resolvable atom / over-cap
+    };
+    let priority: std::collections::HashSet<String> = counter
+        .entries
+        .iter()
+        .flat_map(|e| e.forced_inputs.keys().cloned())
+        .collect();
+
+    let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return Vec::new();
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    // Candidate assumption axes = the design's NARROW ENVIRONMENT primary inputs (narrow, non-controllable).
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for line in &file.lines {
+        if let Node::Input { sort, .. } = &line.node
+            && let Some(name) = symbols.get(&line.nid)
+            && !ctrl_set.contains(name.as_str())
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+            && w <= MAX_INPUT_BITS
+        {
+            candidates.push((name.clone(), w));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    // Search the counterstrategy-forced (blocking) env inputs FIRST — the witness guides the search.
+    candidates.sort_by_key(|(n, _)| (!priority.contains(n), n.clone()));
+
+    let mut found: Vec<DiscoveredAssumption> = Vec::new();
+    let mut pins_tried = 0usize;
+    'outer: for (name, w) in candidates {
+        for c in 0..(1u64 << w) {
+            if pins_tried >= MAX_CANDIDATE_PINS || start.elapsed().as_millis() > budget_ms {
+                break 'outer;
+            }
+            pins_tried += 1;
+            let (pinned, _) = pin_inputs_to_constants(btor2_content, &[(name.clone(), c)]);
+            // SOUNDNESS: the env input is pinned to a CONSTANT ⇒ the two-player game on the pinned model
+            // is exact/2-valued sound; the non-vacuity gate rejects a realizable-but-vacuous hold (good
+            // unreachable or stuck-true under the assumption). The report stays CONDITIONAL — the caller
+            // never lifts it to an unconditional realizable.
+            let realizable = matches!(
+                exact_two_player_strategy(&pinned, good, controllable),
+                Ok(s) if s.realizable()
+            );
+            if realizable && good_nonvacuous_under(&pinned, &register, value) {
+                found.push(DiscoveredAssumption {
+                    phi: format!("{name} == {c}"),
+                    kind: AssumptionKind::InputHold,
+                    non_vacuous: true,
+                    engine: "two-player game realizable under env-input hold".to_string(),
+                });
+            }
+        }
+    }
+    found
+}
+
 /// Capability A (refined-verdicts Phase 1) — partition the `AG EF good` verdict over the CONFIG the
 /// recovery rides on. For each config valuation (the cross-product of each `(input, candidate values)`
 /// spec) PIN those inputs to constants and decide the CONCRETE pinned model with the exact engine —
@@ -4112,6 +4223,50 @@ mod tests {
                 .iter()
                 .any(|a| a.phi == "en == 1" && a.non_vacuous),
             "the enabling assumption rides in holds_under: {refinement:?}"
+        );
+    }
+
+    // --- Capability B, Phase 2c (TWO-PLAYER assumption discovery) -----------------------------------
+    // The same 1-bit games as tests/exact_two_player_strategy.rs: `st' = c` (controller wins),
+    // `st' = c & ¬e` (environment blocks with e=1), `st' = 0` (target unreachable).
+    const GAME_CTRL: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 next 1 4 2\n";
+    const GAME_ENVBLK: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 not 1 3\n8 and 1 2 7\n9 next 1 4 8\n";
+    const GAME_STUCK: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 next 1 4 5\n";
+
+    /// The wedge: `ENVBLK` (`st'=c&¬e`) is UNREALIZABLE (the environment blocks `st==1` with `e=1`), but
+    /// under the environment assumption `e == 0` the controller wins (`st'=c`, set `c=1`). Discovery
+    /// finds the non-vacuous `HoldsUnder(e == 0)` — the assume-guarantee assumption on the adversary.
+    #[test]
+    fn discover_game_env_assumption_finds_the_enabling_assumption() {
+        let found = discover_game_env_assumption(GAME_ENVBLK, "st == 1", &["c"]);
+        assert!(
+            found
+                .iter()
+                .any(|a| a.phi == "e == 0" && a.kind == AssumptionKind::InputHold && a.non_vacuous),
+            "expected a non-vacuous HoldsUnder(e == 0) making the game realizable: {found:?}"
+        );
+    }
+
+    /// False-positive control: a game the controller ALREADY wins (`st'=c`, realizable) needs no
+    /// assumption — discovery must return ∅, never fabricate an enabling φ.
+    #[test]
+    fn discover_game_env_assumption_empty_when_already_realizable() {
+        let found = discover_game_env_assumption(GAME_CTRL, "st == 1", &["c"]);
+        assert!(
+            found.is_empty(),
+            "a realizable game needs no environment assumption: {found:?}"
+        );
+    }
+
+    /// Soundness control: an unrealizable game whose target is structurally UNREACHABLE (`st'=0`, so
+    /// `st==1` is never reached under any env constraint) must NOT yield a spurious assumption — the
+    /// realizability + non-vacuity gates both reject every env hold.
+    #[test]
+    fn discover_game_env_assumption_no_spurious_phi_on_dead_target() {
+        let found = discover_game_env_assumption(GAME_STUCK, "st == 1", &["c"]);
+        assert!(
+            found.is_empty(),
+            "a structurally-unreachable target must not fabricate an enabling φ: {found:?}"
         );
     }
 
