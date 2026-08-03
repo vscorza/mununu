@@ -114,6 +114,10 @@ pub struct ConfigPartition {
 pub enum AssumptionKind {
     /// An input held at a constant value (`en = 1`).
     InputHold,
+    /// A CONJUNCTION of environment-input holds (`ack == 1 && escalate == 0`) — the minimal set of
+    /// environment inputs that must be constrained for a two-player game to become realizable, when no
+    /// single hold suffices (the design has multiple independent adversarial blockers).
+    InputConjunction,
     /// A finite input schedule (a command sequence).
     InputSchedule,
     /// "Reset is eventually asserted."

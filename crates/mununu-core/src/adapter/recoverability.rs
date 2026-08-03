@@ -1513,7 +1513,153 @@ pub fn discover_game_env_assumption(
             }
         }
     }
+    // When NO single hold wins (multiple independent adversarial blockers — the edn/otbn case), fall back
+    // to the CONJUNCTIVE slice: a minimal SET of env-input holds under which the controller wins.
+    if found.is_empty()
+        && let Some(conj) = discover_game_env_conjunction(btor2_content, good, controllable)
+    {
+        found.push(conj);
+    }
     found
+}
+
+/// Capability B, Phase 2c (CONJUNCTIVE) — when NO single environment-input hold makes the game realizable
+/// (the design has MULTIPLE independent adversarial blockers, e.g. the OpenTitan edn/otbn boot handshakes:
+/// the environment can block by withholding the ack OR escalating OR requesting a wipe), find a MINIMAL
+/// CONJUNCTION of env-input holds under which the controller WINS — `A = (e_i == v_i ∧ …) ⇒ G` realizable.
+/// Returns ONE minimal conjunction (≥2 inputs), or `None` (already realizable, `good` not `REG == VALUE`,
+/// no winning combination within the width/budget caps, or it minimizes to a single hold — that is the
+/// [`discover_game_env_assumption`] single-hold slice's job).
+///
+/// Pinning a set of env inputs to constants makes them non-adversarial; pinning ALL cone-relevant env
+/// inputs to a WINNING combination reduces the game to 1-player controllable reachability; the minimal
+/// such set (greedily drop any pin the controller wins without) is the assume-guarantee assumption.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD two-player game ([`exact_two_player_strategy`]) on each
+/// [`pin_inputs_to_constants`] model + the reach-portfolio non-vacuity gate. Bounded: candidate env inputs
+/// are restricted to `good`'s cone-of-influence (`cone_leaf_nids` — excludes dangling clocks); the
+/// winning-combination search caps at `MAX_CONJ_BITS` total env bits (abstain if wider) and a wall-clock
+/// budget.
+fn discover_game_env_conjunction(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Option<DiscoveredAssumption> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::dep_graph::cone_leaf_nids;
+    use crate::adapter::btor2::pin::pin_inputs_to_constants;
+    use crate::adapter::btor2::symbolic_bitblast::{TwoPlayerStrategy, exact_two_player_strategy};
+    const MAX_INPUT_BITS: u32 = 3;
+    const MAX_CONJ_BITS: u32 = 12; // ≤ 4096 combinations searched
+    let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let start = std::time::Instant::now();
+
+    let (register, value) = match parse_predicate_expr(good).ok() {
+        Some(PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        }) => (register, value),
+        _ => return None,
+    };
+    // Only when the game is unrealizable (a realizable game needs no assumption).
+    match exact_two_player_strategy(btor2_content, good, controllable) {
+        Ok(TwoPlayerStrategy::EnvironmentCounterstrategy(_)) => {}
+        _ => return None,
+    }
+    let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return None;
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    // Candidate axes = the narrow NON-controllable primary inputs IN `good`'s cone (dangling clocks are
+    // out of the cone, so they never enter the combinatorial product).
+    let cone = cone_leaf_nids(&file, std::slice::from_ref(&register));
+    let mut axes: Vec<(String, u32)> = Vec::new();
+    for line in &file.lines {
+        if let Node::Input { sort, .. } = &line.node
+            && cone.contains(&line.nid)
+            && let Some(name) = symbols.get(&line.nid)
+            && !ctrl_set.contains(name.as_str())
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+            && w <= MAX_INPUT_BITS
+        {
+            axes.push((name.clone(), w));
+        }
+    }
+    axes.sort();
+    axes.dedup();
+    let total_bits: u32 = axes.iter().map(|(_, w)| *w).sum();
+    if axes.len() < 2 || total_bits > MAX_CONJ_BITS {
+        return None; // < 2 axes = not a conjunction; too wide = abstain (needs the symbolic ∃-env)
+    }
+
+    // The reused realizable + non-vacuous check on a pin set.
+    let wins = |pins: &[(String, u64)]| -> bool {
+        let (pinned, _) = pin_inputs_to_constants(btor2_content, pins);
+        matches!(exact_two_player_strategy(&pinned, good, controllable), Ok(s) if s.realizable())
+            && good_nonvacuous_under(&pinned, &register, value)
+    };
+
+    // Search the product of the axes' value ranges for a WINNING full pin.
+    let ranges: Vec<u64> = axes.iter().map(|(_, w)| 1u64 << w).collect();
+    let total_combos: u64 = ranges.iter().product();
+    let mut vals: Option<Vec<u64>> = None;
+    for idx in 0..total_combos {
+        if start.elapsed().as_millis() > budget_ms {
+            break;
+        }
+        let mut rem = idx;
+        let candidate: Vec<u64> = ranges
+            .iter()
+            .map(|r| {
+                let v = rem % r;
+                rem /= r;
+                v
+            })
+            .collect();
+        let pins: Vec<(String, u64)> = axes
+            .iter()
+            .zip(&candidate)
+            .map(|((n, _), v)| (n.clone(), *v))
+            .collect();
+        if wins(&pins) {
+            vals = Some(candidate);
+            break;
+        }
+    }
+    let vals = vals?;
+
+    // MINIMIZE: greedily drop any pin the controller wins WITHOUT (that env input can stay free/adversarial).
+    let mut needed: Vec<usize> = (0..axes.len()).collect();
+    for i in 0..axes.len() {
+        let trial: Vec<usize> = needed.iter().copied().filter(|&j| j != i).collect();
+        let pins: Vec<(String, u64)> = trial
+            .iter()
+            .map(|&j| (axes[j].0.clone(), vals[j]))
+            .collect();
+        if wins(&pins) {
+            needed = trial; // input i's pin is redundant
+        }
+    }
+    if needed.len() < 2 {
+        return None; // reduced to a single hold — the single-hold slice's job, not a conjunction
+    }
+    let phi = needed
+        .iter()
+        .map(|&j| format!("{} == {}", axes[j].0, vals[j]))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    Some(DiscoveredAssumption {
+        phi,
+        kind: AssumptionKind::InputConjunction,
+        non_vacuous: true,
+        engine: "two-player game realizable under env-input conjunction (pin-all + minimize)"
+            .to_string(),
+    })
 }
 
 /// Capability A (refined-verdicts Phase 1) — partition the `AG EF good` verdict over the CONFIG the
@@ -4267,6 +4413,35 @@ mod tests {
         assert!(
             found.is_empty(),
             "a structurally-unreachable target must not fabricate an enabling φ: {found:?}"
+        );
+    }
+
+    // TWO independent blockers: `st' = c & ¬e1 & ¬e2` (the environment blocks `st==1` by asserting e1 OR
+    // e2). NO single hold wins (`e1==0` still blockable by e2, and vice-versa), so the CONJUNCTIVE slice
+    // must discover the minimal `e1 == 0 && e2 == 0` — the edn/otbn "multiple blockers" shape in miniature.
+    const GAME_TWOBLOCK: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e1\n4 input 1 e2\n5 state 1 st\n6 zero 1\n7 init 1 5 6\n8 not 1 3\n9 not 1 4\n10 and 1 2 8\n11 and 1 10 9\n12 next 1 5 11\n";
+
+    /// The conjunctive slice: `st'=c&¬e1&¬e2` is UNREALIZABLE and NO single env-input hold makes it
+    /// realizable, so `discover_game_env_assumption` falls back to the conjunction and finds the minimal
+    /// `HoldsUnder(e1 == 0 && e2 == 0)` (`kind = InputConjunction`, non-vacuous).
+    #[test]
+    fn discover_game_env_conjunction_finds_the_minimal_conjunction() {
+        let found = discover_game_env_assumption(GAME_TWOBLOCK, "st == 1", &["c"]);
+        let conj = found
+            .iter()
+            .find(|a| a.kind == AssumptionKind::InputConjunction)
+            .unwrap_or_else(|| panic!("expected a conjunctive assumption: {found:?}"));
+        // Both blockers must be constrained (order-independent), and nothing else.
+        assert!(conj.non_vacuous);
+        assert!(
+            conj.phi.contains("e1 == 0") && conj.phi.contains("e2 == 0") && conj.phi.contains("&&"),
+            "expected the minimal 2-input conjunction e1==0 && e2==0: {}",
+            conj.phi
+        );
+        assert!(
+            !conj.phi.contains("c =="),
+            "the controllable input c must not appear in the env assumption: {}",
+            conj.phi
         );
     }
 
