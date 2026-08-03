@@ -5284,11 +5284,23 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
         let files = source_manifest::discover_sv_files(dir)?;
         let design_name = dir.file_name().and_then(|s| s.to_str());
         let a = source_manifest::assemble_sv_design(&files, design_name);
-        for note in &a.notes {
-            eprintln!("design-dir: {note}");
-        }
         // explicit --top overrides the detected top; --include-dir adds to detected dirs.
         let top = args.top.clone().or(a.top);
+        for note in &a.notes {
+            // When an explicit `--top` is given it WINS (`args.top.or(a.top)` above), so the
+            // auto-detection's "N top candidates → ambiguous"/"no un-instantiated module" notes are
+            // moot and actively misleading (they read as "your --top was ignored" when it was not).
+            // Suppress just those; keep every other assembly note.
+            if args.top.is_some()
+                && (note.contains("top candidate") || note.contains("un-instantiated module"))
+            {
+                continue;
+            }
+            eprintln!("design-dir: {note}");
+        }
+        if let Some(t) = &args.top {
+            eprintln!("design-dir: explicit --top '{t}' used (overrides any auto-detection)");
+        }
         let include_dirs = args
             .include_dirs
             .iter()
