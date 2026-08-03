@@ -873,6 +873,34 @@ pub async fn btor2_check_fsm_handler(
     }))
 }
 
+/// Solve the two-player controllable-reachability game (`POST /api/v1/btor2/game`) and synthesize the
+/// winner's strategy. Surface peer of the CLI `mununu btor2 game`: partitions the primary inputs into
+/// controller-owned (`controllable`) vs environment-owned (the adversary), decides whether the controller
+/// can force the design to `good` against every environment move, and returns `realizable` plus the
+/// controller's Mealy strategy — or, when unrealizable, the environment's positional counterstrategy (the
+/// witness for why no controller works, motivating an assume-guarantee assumption). A malformed BTOR2
+/// source, an unresolvable `good` atom, or a `controllable` name that is not a primary input is a
+/// `BadRequest`.
+pub async fn btor2_game_handler(
+    Json(request): Json<Btor2GameRequest>,
+) -> ApiResult<Json<Btor2GameResponse>> {
+    use crate::adapter::btor2::symbolic_bitblast::exact_two_player_strategy;
+
+    let controllable: Vec<&str> = request.controllable.iter().map(String::as_str).collect();
+    let strategy = exact_two_player_strategy(&request.content, &request.good, &controllable)
+        .map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
+
+    Ok(Json(Btor2GameResponse {
+        realizable: strategy.realizable(),
+        good: request.good,
+        controllable: request.controllable,
+        strategy,
+    }))
+}
+
 // --- SV-direct verbs: lift SV (sv2v + Yosys) then decide, in one call. Surface peers
 // of the CLI `sv verify` / `verify-liveness` / `verify-recoverability`; they return
 // the same `Btor2Verify*Response` shapes as the BTOR2-direct verbs. The lift needs
@@ -4634,6 +4662,56 @@ members = ["x"]
         let err = btor2_check_fsm_handler(Json(request))
             .await
             .expect_err("malformed BTOR2 must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    // Two-player game verb: `st' = c` (controller wins) and `st' = c & ¬e` (environment blocks) — the
+    // same known-answer 1-bit games as tests/exact_two_player_strategy.rs, over the HTTP handler.
+    const GAME_CTRL: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 next 1 4 2\n";
+    const GAME_ENVBLK: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 not 1 3\n8 and 1 2 7\n9 next 1 4 8\n";
+
+    #[tokio::test]
+    async fn btor2_game_handler_realizable_returns_controller_strategy() {
+        use crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy;
+        let request = Btor2GameRequest {
+            content: GAME_CTRL.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(out.realizable, "st'=c: the controller wins");
+        assert!(matches!(
+            out.strategy,
+            TwoPlayerStrategy::ControllerStrategy(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn btor2_game_handler_unrealizable_returns_counterstrategy() {
+        use crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy;
+        let request = Btor2GameRequest {
+            content: GAME_ENVBLK.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(!out.realizable, "st'=c&¬e: the environment wins");
+        assert!(matches!(
+            out.strategy,
+            TwoPlayerStrategy::EnvironmentCounterstrategy(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn btor2_game_handler_rejects_unknown_controllable_input() {
+        let request = Btor2GameRequest {
+            content: GAME_CTRL.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["nope".to_string()], // not a primary input
+        };
+        let err = btor2_game_handler(Json(request))
+            .await
+            .expect_err("an unknown controllable input must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 

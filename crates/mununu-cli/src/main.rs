@@ -297,6 +297,17 @@ enum Btor2Command {
     /// the word-level reachability portfolio (scales past the exact engine). Prints one
     /// line per register; exits non-zero on any reachable illegal encoding.
     CheckFsm(Btor2CheckFsmArgs),
+    /// Solve a two-player controllable-reachability GAME and synthesize the winner's strategy.
+    ///
+    /// Partitions the primary inputs into controller-owned (`--controllable`, repeatable) vs
+    /// environment-owned (the rest, adversarial), then decides whether the CONTROLLER can force the
+    /// design to the `--good` state atom against every environment move (the Mealy game
+    /// `μX. good ∨ ⟨ctrl⟩X`). Prints `realizable` + the controller's Mealy strategy when it wins, or
+    /// `unrealizable` + the environment's positional COUNTERSTRATEGY (the witness for why no controller
+    /// works — e.g. an ack the environment withholds, motivating an assume-guarantee assumption) when it
+    /// does not. Decided by the exact-symbolic ROBDD engine (definite within its cap). Surface peer of
+    /// `POST /api/v1/btor2/game`. Exits non-zero (`--fail-on`) on `unrealizable`.
+    Game(Btor2GameArgs),
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
@@ -776,6 +787,23 @@ struct Btor2CheckFsmArgs {
     /// Max state-register width to treat as an FSM (wider = datapath/counter, skipped).
     #[arg(long, value_name = "BITS", default_value_t = mununu_core::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH)]
     max_width: u32,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+#[derive(Args, Debug)]
+struct Btor2GameArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// The reachability target `good` state atom the controller tries to force — a single
+    /// register-comparison atom (`"state_q == 44"`).
+    #[arg(long, value_name = "REG op VALUE")]
+    good: String,
+    /// A controller-owned primary input (repeatable). Every other primary input belongs to the
+    /// (adversarial) environment. A name that is not a real primary input is rejected.
+    #[arg(long = "controllable", value_name = "INPUT")]
+    controllable: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2675,6 +2703,7 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
         Btor2Command::VerifySafety(args) => btor2_verify_safety(args),
         Btor2Command::CheckFsm(args) => btor2_check_fsm(args),
+        Btor2Command::Game(args) => btor2_game(args),
     }
 }
 
@@ -2711,6 +2740,38 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
     // Exit code: the worst verdict across the checked registers.
     let worst = worst_verdict(findings.iter().map(|f| PropertyVerdict::as_str(f.verdict)));
     ci_gate_exit(worst, args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu btor2 game` — solve the two-player controllable-reachability game and synthesize the winner's
+/// strategy (the controller's Mealy strategy, or the environment's positional counterstrategy). Surface
+/// peer of the API `POST /api/v1/btor2/game`. Exits non-zero (via `--fail-on`) on `unrealizable` (mapped
+/// to the `violated` verdict class); `realizable` maps to `holds`.
+fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
+    use mununu_core::adapter::btor2::symbolic_bitblast::exact_two_player_strategy;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let controllable: Vec<&str> = args.controllable.iter().map(String::as_str).collect();
+    let strategy = exact_two_player_strategy(&content, &args.good, &controllable)?;
+
+    let mut summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "good": args.good,
+        "controllable": args.controllable,
+        "realizable": strategy.realizable(),
+    });
+    summary["strategy"] =
+        serde_json::to_value(&strategy).map_err(|e| format!("serialize strategy: {e}"))?;
+    print_json_summary(&summary)?;
+
+    // realizable == the controller wins (`holds`); unrealizable == no controller works (`violated`).
+    let verdict = if strategy.realizable() {
+        "holds"
+    } else {
+        "violated"
+    };
+    ci_gate_exit(verdict, args.ci.fail_on);
     Ok(())
 }
 
