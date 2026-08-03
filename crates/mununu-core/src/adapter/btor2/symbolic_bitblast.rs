@@ -3467,28 +3467,98 @@ pub fn exact_env_positional_strategy(
     bb.env_positional_strategy(&file, &good_bdd, &reg)
 }
 
-/// P2.5-F — a synthesized TWO-PLAYER strategy: the CONTROLLER's positional strategy when the reachability
-/// game `μX. (good ∨ ⟨ctrl⟩X)` is realizable, or the ENVIRONMENT's COUNTERSTRATEGY when it is not. Both
-/// are state-indexed forced-input maps ([`PositionalStrategy`]): the controller's forces CONTROLLABLE
-/// inputs (robust to every environment move) toward `good`; the environment's forces ENVIRONMENT inputs
-/// (robust to every controllable move) to keep the system out of the controller's winning region.
+/// One `(environment-input guard → forced controllable inputs)` move of a Mealy controller
+/// ([`MealyStrategy`]). The game is Mealy — the environment moves and the controller RESPONDS
+/// ([`ExactModel::cpre_controllable`], `∀env ∃ctrl`) — so the controller's move may depend on the
+/// current environment input. `env_inputs` is empty for an env-independent (Moore) move.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TwoPlayerStrategy {
-    /// `true` = the controller wins from the initial state (spec realizable) and `strategy` is its
-    /// strategy; `false` = the environment wins (unrealizable) and `strategy` is its counterstrategy.
-    pub realizable: bool,
-    /// The winner's positional strategy.
-    pub strategy: PositionalStrategy,
+pub struct MealyMove {
+    /// The environment-input valuation this move responds to; empty = env-independent (holds for every
+    /// environment move).
+    pub env_inputs: BTreeMap<String, u128>,
+    /// The controllable inputs the controller forces in response.
+    pub forced_ctrl: BTreeMap<String, u128>,
+}
+
+/// One control-state row of a [`MealyStrategy`]: the controller's response(s) at that control value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MealyEntry {
+    /// The value of the strategy's state register.
+    pub state_value: u128,
+    /// The attractor rank (distance to `good`); 0 = already `good` (no move needed).
+    pub rank: u32,
+    /// The controller's move(s). A single `env_inputs`-empty move = a Moore (env-independent) response;
+    /// several moves = a genuinely reactive response, one per environment input valuation.
+    pub moves: Vec<MealyMove>,
+    /// `false` = the reactive-move enumeration hit its bound and `moves` is a partial cover (only for
+    /// wide-environment reactive states; never for the Moore fast-path). No silent truncation.
+    pub complete: bool,
+}
+
+/// P2.5-F — a Mealy CONTROLLER strategy for a realizable reachability game: at each control state the
+/// controller forces the controllable inputs (possibly reacting to the environment input — the game is
+/// `∀env ∃ctrl`) to a rank-decreasing move. Contrast [`PositionalStrategy`], which the ENVIRONMENT
+/// counterstrategy uses (the environment is the first-mover, so its winning strategy is positional).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MealyStrategy {
+    /// The state register the strategy is indexed by.
+    pub state_register: String,
+    /// One row per reachable control-state value, sorted by rank then value.
+    pub entries: Vec<MealyEntry>,
+}
+
+impl MealyStrategy {
+    /// The positional (Moore) projection, when every entry's response is env-independent (a single
+    /// `env_inputs`-empty move) — i.e. the controller needs no reaction to the environment. `None` when
+    /// any state requires a genuinely reactive (env-dependent) move, since no state-only strategy exists
+    /// there. With all inputs controllable (no environment) this always succeeds and equals the 1-player
+    /// [`exact_env_positional_strategy`].
+    pub fn as_positional(&self) -> Option<PositionalStrategy> {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for e in &self.entries {
+            let forced = match e.moves.as_slice() {
+                [] => BTreeMap::new(),
+                [m] if m.env_inputs.is_empty() => m.forced_ctrl.clone(),
+                _ => return None, // reactive: no env-independent positional move
+            };
+            entries.push(StrategyEntry {
+                state_value: e.state_value,
+                rank: e.rank,
+                forced_inputs: forced,
+            });
+        }
+        Some(PositionalStrategy {
+            state_register: self.state_register.clone(),
+            entries,
+        })
+    }
+}
+
+/// P2.5-F — a synthesized TWO-PLAYER strategy for the controllable-reachability game `μX. (good ∨
+/// ⟨ctrl⟩X)`: the CONTROLLER's Mealy strategy when it is realizable, or the ENVIRONMENT's positional
+/// COUNTERSTRATEGY when it is not (by determinacy, exactly one holds). The asymmetry is intrinsic to the
+/// Mealy game (`∀env ∃ctrl`): the environment is the first-mover, so its winning strategy is positional
+/// (state-indexed); the controller responds, so its strategy may depend on the environment input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TwoPlayerStrategy {
+    /// The controller wins from the initial state (spec realizable) — its Mealy strategy.
+    ControllerStrategy(MealyStrategy),
+    /// The environment wins (unrealizable) — its positional counterstrategy, forcing environment inputs
+    /// (robust to every controllable move) to keep the play out of the controller's winning region.
+    EnvironmentCounterstrategy(PositionalStrategy),
 }
 
 /// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good` with
-/// `controllable` naming the controller's inputs. `realizable` iff the controller wins from the initial
-/// state (== [`exact_two_player_verdict`] on `μX. good ∨ ⟨ctrl⟩X`). `None` when `good` is not a resolvable
-/// state atom or the model can't be built.
+/// `controllable` naming the controller's inputs. Returns the CONTROLLER's Mealy strategy when the
+/// controller wins from the initial state (== [`exact_two_player_verdict`] holds on `μX. good ∨ ⟨ctrl⟩X`),
+/// or the ENVIRONMENT's positional counterstrategy when it does not. `None` when `good` is not a
+/// resolvable state atom or the model can't be built.
 ///
 /// **Engine (§16):** `exact-symbolic` ROBDD — the controllable attractor (`cpre_controllable`) supplies
-/// ranks; concrete forward reachability enumerates the real states; each row's forced inputs come from
-/// the winner's forcing moves ([`ExactModel::ctrl_forcing_moves`] / [`ExactModel::env_forcing_moves`]).
+/// ranks; concrete forward reachability enumerates the real states. The controller's moves come from
+/// [`ExactModel::ctrl_forcing_moves`] (env-independent, Moore fast-path) or, where the controller must
+/// react, the per-environment move relation ([`ExactModel::move_into`]); the environment counterstrategy
+/// from [`ExactModel::env_forcing_moves`].
 pub fn exact_two_player_strategy(
     btor2_content: &str,
     good: &str,
@@ -4125,15 +4195,19 @@ impl BddBitBlaster {
 
     /// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good`, with
     /// `controllable` the controller's input names. Solves the attractor `μX. good ∨ CPre_ctrl(X)`; the
-    /// controller wins iff `init ⊆ attractor`. Returns the WINNER's positional strategy:
-    /// - **realizable** (controller wins): each reachable winning state's row forces the CONTROLLABLE
-    ///   inputs to a rank-decreasing move ([`ExactModel::ctrl_forcing_moves`] into the next-lower attractor
-    ///   layer) — robust to every environment move. With all inputs controllable this reduces to the
-    ///   1-player [`Self::env_positional_strategy`].
-    /// - **unrealizable** (environment wins): each reachable state OUTSIDE the attractor forces the
-    ///   ENVIRONMENT inputs to a move that keeps the play out of it ([`ExactModel::env_forcing_moves`]) —
-    ///   the counterstrategy witnessing why no controller can reach `good`. A safety/maintain strategy, so
-    ///   every row has rank 0 (no distance-to-target metric).
+    /// controller wins iff `init ⊆ attractor`. Returns the WINNER's strategy, and the Mealy/positional
+    /// asymmetry is intrinsic to the game (`CPre_ctrl = ∀env ∃ctrl` — the environment moves, the
+    /// controller responds):
+    /// - **realizable** (controller wins): a [`MealyStrategy`]. At each reachable winning state force a
+    ///   rank-decreasing controllable move: env-independent when one exists ([`ExactModel::ctrl_forcing_moves`]
+    ///   — the Moore fast-path), else ONE response per environment input ([`ExactModel::move_into`] — a
+    ///   genuinely reactive controller, since the controller is the responder). With all inputs
+    ///   controllable this is Moore everywhere and `MealyStrategy::as_positional` equals the 1-player
+    ///   [`Self::env_positional_strategy`].
+    /// - **unrealizable** (environment wins): a positional [`PositionalStrategy`] — the environment is the
+    ///   first-mover, so its winning strategy is state-indexed. Each reachable state OUTSIDE the attractor
+    ///   forces ENVIRONMENT inputs that keep the play out of it ([`ExactModel::env_forcing_moves`],
+    ///   ∀ctrl-robust). A safety/maintain strategy, so every row has rank 0.
     ///
     /// `None` when `reg_name` is not a state register.
     fn two_player_strategy(
@@ -4228,65 +4302,154 @@ impl BddBitBlaster {
                 .and_modify(|r| *r = (*r).min(*k))
                 .or_insert(*k);
         }
-        // Forced moves of the MIN-RANK states of each control value. Controller: the rank-decreasing
-        // controllable move (`ctrl_forcing_moves` into the next-lower layer, robust to every env move).
-        // Environment: the region-maintaining environment move (`env_forcing_moves` staying in ¬attractor).
-        let mut moves_by_val: BTreeMap<u128, BDDFunction> = BTreeMap::new();
-        for (s, k) in &reached {
-            let v = *s.get(reg_name).unwrap_or(&0);
-            if *k != min_rank[&v] {
-                continue;
-            }
-            let m = if realizable {
-                if *k == 0 {
-                    continue; // already at `good` — no forcing move needed
+        let is_ctrl = |c: &&Cell| -> bool { !c.is_state && controllable.contains(&c.symbol) };
+        let is_env = |c: &&Cell| -> bool { !c.is_state && !controllable.contains(&c.symbol) };
+        if realizable {
+            // CONTROLLER (Mealy: the environment moves, the controller responds — `cpre_controllable` is
+            // `∀env ∃ctrl`). At each min-rank control value force a rank-decreasing move into the next-lower
+            // layer: env-independent when one exists (the Moore fast-path), else one response per
+            // environment input (a genuinely reactive controller — the responder cannot be positional).
+            const MAX_REACTIVE_MOVES: usize = 256;
+            // Per value: the union of its min-rank state minterms + that value's (uniform) rank.
+            let mut states_by_val: BTreeMap<u128, (BDDFunction, u32)> = BTreeMap::new();
+            for (s, k) in &reached {
+                let v = *s.get(reg_name).unwrap_or(&0);
+                if *k != min_rank[&v] {
+                    continue;
                 }
-                self.state_minterm(s)
-                    .and(&exact.ctrl_forcing_moves(&layers[(*k - 1) as usize]))
-                    .unwrap()
-            } else {
-                self.state_minterm(s)
-                    .and(&exact.env_forcing_moves(&region))
-                    .unwrap()
-            };
-            moves_by_val
-                .entry(v)
-                .and_modify(|acc| *acc = acc.or(&m).unwrap())
-                .or_insert(m);
-        }
-        // Project onto the WINNER's own inputs: controllable inputs for the controller, environment inputs
-        // for the counterstrategy. (The other player's inputs are ∀-quantified out by the forcing move.)
-        let owns = |cell: &Cell| -> bool {
-            !cell.is_state && (realizable == controllable.contains(&cell.symbol))
-        };
-        let mut entries: Vec<StrategyEntry> = min_rank
-            .iter()
-            .map(|(&v, &rank)| {
-                let mut forced = BTreeMap::new();
-                if let Some(mv) = moves_by_val.get(&v)
-                    && *mv != self.ff
-                {
-                    for cell in self.cells.iter().filter(|c| owns(c)) {
-                        if let Some(val) = self.forced_cell_value(mv, cell) {
-                            forced.insert(cell.symbol.clone(), val);
+                let mt = self.state_minterm(s);
+                states_by_val
+                    .entry(v)
+                    .and_modify(|(acc, _)| *acc = acc.or(&mt).unwrap())
+                    .or_insert((mt, *k));
+            }
+            let mut entries: Vec<MealyEntry> = Vec::new();
+            for (&v, (mt, rank)) in &states_by_val {
+                if *rank == 0 {
+                    // already at `good` — no move needed.
+                    entries.push(MealyEntry {
+                        state_value: v,
+                        rank: 0,
+                        moves: Vec::new(),
+                        complete: true,
+                    });
+                    continue;
+                }
+                let lower = &layers[(*rank - 1) as usize];
+                // Moore fast-path: a single controllable move robust to every environment input.
+                let moore = mt.and(&exact.ctrl_forcing_moves(lower)).unwrap();
+                if moore != self.ff {
+                    let mut forced_ctrl = BTreeMap::new();
+                    for cell in self.cells.iter().filter(is_ctrl) {
+                        if let Some(val) = self.forced_cell_value(&moore, cell) {
+                            forced_ctrl.insert(cell.symbol.clone(), val);
                         }
                     }
+                    entries.push(MealyEntry {
+                        state_value: v,
+                        rank: *rank,
+                        moves: vec![MealyMove {
+                            env_inputs: BTreeMap::new(),
+                            forced_ctrl,
+                        }],
+                        complete: true,
+                    });
+                    continue;
                 }
-                StrategyEntry {
+                // Reactive: enumerate one controllable response per environment-input valuation. The state
+                // is in the attractor, so `∀env ∃ctrl` — every environment column has a response.
+                let mut rem = mt.and(&exact.move_into(lower)).unwrap();
+                let mut moves: Vec<MealyMove> = Vec::new();
+                for _ in 0..MAX_REACTIVE_MOVES {
+                    if rem == self.ff {
+                        break;
+                    }
+                    let full = self.pick_full_assignment(&rem);
+                    let mut env_inputs = BTreeMap::new();
+                    let mut env_mt = self.tt.clone();
+                    for cell in self.cells.iter().filter(is_env) {
+                        let val = *full.get(&cell.symbol).unwrap_or(&0);
+                        env_inputs.insert(cell.symbol.clone(), val);
+                        for (b, var) in cell.vars.iter().enumerate() {
+                            let lit = if (val >> b) & 1 == 1 {
+                                var.clone()
+                            } else {
+                                var.not().unwrap()
+                            };
+                            env_mt = env_mt.and(&lit).unwrap();
+                        }
+                    }
+                    let mut forced_ctrl = BTreeMap::new();
+                    for cell in self.cells.iter().filter(is_ctrl) {
+                        forced_ctrl
+                            .insert(cell.symbol.clone(), *full.get(&cell.symbol).unwrap_or(&0));
+                    }
+                    moves.push(MealyMove {
+                        env_inputs,
+                        forced_ctrl,
+                    });
+                    rem = rem.and(&env_mt.not().unwrap()).unwrap();
+                }
+                entries.push(MealyEntry {
                     state_value: v,
-                    rank,
-                    forced_inputs: forced,
-                }
-            })
-            .collect();
-        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
-        Some(TwoPlayerStrategy {
-            realizable,
-            strategy: PositionalStrategy {
+                    rank: *rank,
+                    moves,
+                    complete: rem == self.ff, // false = the reactive fan-out hit the bound (no silent cap)
+                });
+            }
+            entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
+            Some(TwoPlayerStrategy::ControllerStrategy(MealyStrategy {
                 state_register: reg_name.to_string(),
                 entries,
-            },
-        })
+            }))
+        } else {
+            // ENVIRONMENT counterstrategy — positional (the environment is the first-mover). At each
+            // reachable state outside the attractor force env inputs keeping the play out of it
+            // (`env_forcing_moves`, robust to every controllable move). The `∀ctrl` is the correct dual of
+            // `cpre_controllable`'s `∀env ∃ctrl`, so this exists iff the controller has no strategy.
+            let mut moves_by_val: BTreeMap<u128, BDDFunction> = BTreeMap::new();
+            for (s, k) in &reached {
+                let v = *s.get(reg_name).unwrap_or(&0);
+                if *k != min_rank[&v] {
+                    continue;
+                }
+                let m = self
+                    .state_minterm(s)
+                    .and(&exact.env_forcing_moves(&region))
+                    .unwrap();
+                moves_by_val
+                    .entry(v)
+                    .and_modify(|acc| *acc = acc.or(&m).unwrap())
+                    .or_insert(m);
+            }
+            let mut entries: Vec<StrategyEntry> = min_rank
+                .iter()
+                .map(|(&v, &rank)| {
+                    let mut forced = BTreeMap::new();
+                    if let Some(mv) = moves_by_val.get(&v)
+                        && *mv != self.ff
+                    {
+                        for cell in self.cells.iter().filter(is_env) {
+                            if let Some(val) = self.forced_cell_value(mv, cell) {
+                                forced.insert(cell.symbol.clone(), val);
+                            }
+                        }
+                    }
+                    StrategyEntry {
+                        state_value: v,
+                        rank,
+                        forced_inputs: forced,
+                    }
+                })
+                .collect();
+            entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
+            Some(TwoPlayerStrategy::EnvironmentCounterstrategy(
+                PositionalStrategy {
+                    state_register: reg_name.to_string(),
+                    entries,
+                },
+            ))
+        }
     }
 
     /// The distinct concrete next-states reachable from `s` under some constraint-respecting input.
