@@ -2762,7 +2762,7 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// to the `violated` verdict class); `realizable` maps to `holds`.
 fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_reach_realizable, exact_two_player_strategy, game_sound_posture_model,
     };
 
     let raw = std::fs::read_to_string(&args.file)
@@ -2774,17 +2774,23 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
         raw
     };
     let controllable: Vec<&str> = args.controllable.iter().map(String::as_str).collect();
-    let strategy = exact_two_player_strategy(&content, &args.good, &controllable)?;
+    // The VERDICT works on any resolvable target (state cell, combinational output, relation); it also
+    // validates the controllable partition. The STRATEGY is best-effort — it needs a STATE-register
+    // target, so it is omitted for a combinational-output / relational `good` (a FIFO's `full_o`).
+    let realizable = exact_two_player_reach_realizable(&content, &args.good, &controllable)?;
+    let strategy = exact_two_player_strategy(&content, &args.good, &controllable).ok();
 
     let mut summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "good": args.good,
         "controllable": args.controllable,
         "assume_clock_reset": args.assume_clock_reset,
-        "realizable": strategy.realizable(),
+        "realizable": realizable,
     });
-    summary["strategy"] =
-        serde_json::to_value(&strategy).map_err(|e| format!("serialize strategy: {e}"))?;
+    if let Some(s) = &strategy {
+        summary["strategy"] =
+            serde_json::to_value(s).map_err(|e| format!("serialize strategy: {e}"))?;
+    }
     // --discover-assumptions: when the game is unrealizable, search for an environment assumption under
     // which the controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
     if args.discover_assumptions {
@@ -2801,11 +2807,7 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     print_json_summary(&summary)?;
 
     // realizable == the controller wins (`holds`); unrealizable == no controller works (`violated`).
-    let verdict = if strategy.realizable() {
-        "holds"
-    } else {
-        "violated"
-    };
+    let verdict = if realizable { "holds" } else { "violated" };
     ci_gate_exit(verdict, args.ci.fail_on);
     Ok(())
 }

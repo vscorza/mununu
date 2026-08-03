@@ -1432,7 +1432,9 @@ pub fn discover_game_env_assumption(
 ) -> Vec<DiscoveredAssumption> {
     use crate::adapter::btor2::ast::Node;
     use crate::adapter::btor2::pin::pin_inputs_to_constants;
-    use crate::adapter::btor2::symbolic_bitblast::{TwoPlayerStrategy, exact_two_player_strategy};
+    use crate::adapter::btor2::symbolic_bitblast::{
+        TwoPlayerStrategy, exact_two_player_reach_realizable, exact_two_player_strategy,
+    };
     const MAX_INPUT_BITS: u32 = 3; // ≤ 8 values — a narrow control/ack/enable, not a datapath
     const MAX_CANDIDATE_PINS: usize = 48;
     let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
@@ -1441,7 +1443,8 @@ pub fn discover_game_env_assumption(
         .unwrap_or(90_000);
     let start = std::time::Instant::now();
 
-    // `good` must be `REG == VALUE` — the non-vacuity gate needs the register + value.
+    // `good` must be `REG == VALUE` (a state register OR a named combinational output like `full_o == 1`)
+    // — the non-vacuity gate needs the register/output + value.
     let (register, value) = match parse_predicate_expr(good).ok() {
         Some(PredicateExpr::Cmp {
             register,
@@ -1453,16 +1456,24 @@ pub fn discover_game_env_assumption(
 
     // Only search when the game is genuinely UNREALIZABLE — a realizable game needs no assumption (the
     // false-positive control: discovery must not fabricate an enabling φ for a controller that already
-    // wins). The returned counterstrategy names the blocking env inputs.
-    let counter = match exact_two_player_strategy(btor2_content, good, controllable) {
-        Ok(TwoPlayerStrategy::EnvironmentCounterstrategy(p)) => p,
-        _ => return Vec::new(), // realizable, or `good` not a resolvable atom / over-cap
-    };
-    let priority: std::collections::HashSet<String> = counter
-        .entries
-        .iter()
-        .flat_map(|e| e.forced_inputs.keys().cloned())
-        .collect();
+    // wins). Uses the FORMULA verdict (`exact_two_player_reach_realizable`), so `good` may be a
+    // combinational OUTPUT / relational target (a FIFO's `full_o`), not only a state register.
+    match exact_two_player_reach_realizable(btor2_content, good, controllable) {
+        Ok(false) => {}         // unrealizable → search for an enabling assumption
+        _ => return Vec::new(), // realizable, or `good` not resolvable / over-cap
+    }
+    // The env COUNTERSTRATEGY (when extractable — a state-register target) names the blocking env inputs,
+    // searched FIRST. Best-effort: a combinational-output/relational target has no state-indexed strategy,
+    // so `priority` is empty there and every candidate is searched.
+    let priority: std::collections::HashSet<String> =
+        match exact_two_player_strategy(btor2_content, good, controllable) {
+            Ok(TwoPlayerStrategy::EnvironmentCounterstrategy(p)) => p
+                .entries
+                .iter()
+                .flat_map(|e| e.forced_inputs.keys().cloned())
+                .collect(),
+            _ => std::collections::HashSet::new(),
+        };
 
     let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
     let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
@@ -1499,10 +1510,8 @@ pub fn discover_game_env_assumption(
             // is exact/2-valued sound; the non-vacuity gate rejects a realizable-but-vacuous hold (good
             // unreachable or stuck-true under the assumption). The report stays CONDITIONAL — the caller
             // never lifts it to an unconditional realizable.
-            let realizable = matches!(
-                exact_two_player_strategy(&pinned, good, controllable),
-                Ok(s) if s.realizable()
-            );
+            let realizable =
+                exact_two_player_reach_realizable(&pinned, good, controllable) == Ok(true);
             if realizable && good_nonvacuous_under(&pinned, &register, value) {
                 found.push(DiscoveredAssumption {
                     phi: format!("{name} == {c}"),
@@ -1548,7 +1557,7 @@ fn discover_game_env_conjunction(
     use crate::adapter::btor2::ast::Node;
     use crate::adapter::btor2::dep_graph::cone_leaf_nids;
     use crate::adapter::btor2::pin::pin_inputs_to_constants;
-    use crate::adapter::btor2::symbolic_bitblast::{TwoPlayerStrategy, exact_two_player_strategy};
+    use crate::adapter::btor2::symbolic_bitblast::exact_two_player_reach_realizable;
     const MAX_INPUT_BITS: u32 = 3;
     const MAX_CONJ_BITS: u32 = 12; // ≤ 4096 combinations searched
     let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
@@ -1565,10 +1574,10 @@ fn discover_game_env_conjunction(
         }) => (register, value),
         _ => return None,
     };
-    // Only when the game is unrealizable (a realizable game needs no assumption).
-    match exact_two_player_strategy(btor2_content, good, controllable) {
-        Ok(TwoPlayerStrategy::EnvironmentCounterstrategy(_)) => {}
-        _ => return None,
+    // Only when the game is unrealizable (a realizable game needs no assumption). Formula verdict, so
+    // `good` may be a combinational-output / relational target (a FIFO's `full_o`).
+    if exact_two_player_reach_realizable(btor2_content, good, controllable) != Ok(false) {
+        return None;
     }
     let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
     let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
@@ -1600,7 +1609,7 @@ fn discover_game_env_conjunction(
     // The reused realizable + non-vacuous check on a pin set.
     let wins = |pins: &[(String, u64)]| -> bool {
         let (pinned, _) = pin_inputs_to_constants(btor2_content, pins);
-        matches!(exact_two_player_strategy(&pinned, good, controllable), Ok(s) if s.realizable())
+        exact_two_player_reach_realizable(&pinned, good, controllable) == Ok(true)
             && good_nonvacuous_under(&pinned, &register, value)
     };
 

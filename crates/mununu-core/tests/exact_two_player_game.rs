@@ -15,8 +15,40 @@
 //! `parity_game.rs` solver on a shared CLTS is a follow-up; here the hand-computed winning regions are
 //! the oracle.)
 
-use mununu_core::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_two_player_verdict};
+use mununu_core::adapter::btor2::symbolic_bitblast::{
+    ExactVerdict, exact_two_player_reach_realizable, exact_two_player_strategy,
+    exact_two_player_verdict,
+};
 use mununu_core::mu_calculus::parser;
+
+// st' = c, with a NAMED COMBINATIONAL OUTPUT `busy_o = ¬st` (not a state register). The realizability
+// VERDICT resolves the output atom; the state-INDEXED STRATEGY cannot (no register in `good`). This is
+// the FIFO-class datapath shape: the target is a combinational output (`full_o`, `empty_o`), not a cell.
+const CTRL_OUT: &str = "\
+1 sort bitvec 1
+2 input 1 c
+3 input 1 e
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 next 1 4 2
+8 not 1 4 busy_o
+9 output 8
+";
+// st' = c & ¬e with the same `busy_o = ¬st` output: the environment can block st=1, so busy_o stays 1.
+const ENVBLK_OUT: &str = "\
+1 sort bitvec 1
+2 input 1 c
+3 input 1 e
+4 state 1 st
+5 zero 1
+6 init 1 4 5
+7 not 1 3
+8 and 1 2 7
+9 next 1 4 8
+10 not 1 4 busy_o
+11 output 10
+";
 
 // st' = c : the controller sets the next state.
 const CTRL_INIT0: &str = "\
@@ -150,4 +182,44 @@ fn unknown_controllable_input_is_rejected() {
     );
     // The real input names still work.
     assert!(exact_two_player_verdict(CTRL_INIT0, &f, &["c"]).is_ok());
+}
+
+/// Relational / combinational-OUTPUT target: `exact_two_player_reach_realizable` decides a game whose
+/// `good` is a named combinational output (`busy_o = ¬st`), not a state register — the FIFO-class datapath
+/// shape (`full_o`, `empty_o`). The controller forcing `busy_o == 0` ⇔ forcing `st == 1`, so the answer
+/// matches the state-atom game: realizable on `CTRL_OUT`, unrealizable on `ENVBLK_OUT`.
+#[test]
+fn reach_realizable_decides_a_combinational_output_target() {
+    assert_eq!(
+        exact_two_player_reach_realizable(CTRL_OUT, "busy_o == 0", &["c"]),
+        Ok(true),
+        "st'=c: the controller forces busy_o=0 (st=1) in one step"
+    );
+    assert_eq!(
+        exact_two_player_reach_realizable(ENVBLK_OUT, "busy_o == 0", &["c"]),
+        Ok(false),
+        "st'=c&¬e: the environment blocks with e=1, so busy_o stays 1"
+    );
+    // Sanity: the output atom tracks its state equivalent (`st == 1`) exactly.
+    assert_eq!(
+        exact_two_player_reach_realizable(CTRL_OUT, "st == 1", &["c"]),
+        exact_two_player_reach_realizable(CTRL_OUT, "busy_o == 0", &["c"]),
+    );
+}
+
+/// The state-INDEXED strategy cannot be extracted for a combinational-output `good` (it references no
+/// state register) — the verb makes it best-effort and falls back to `realizable` + `holds_under`. This
+/// pins WHY the strategy is `Option`: the verdict decides the same target the strategy cannot index.
+#[test]
+fn strategy_extraction_declines_a_combinational_output_target() {
+    let err = exact_two_player_strategy(CTRL_OUT, "busy_o == 0", &["c"]).unwrap_err();
+    assert!(
+        err.contains("state register") || err.contains("resolvable"),
+        "expected a no-state-register error for a combinational output, got: {err}"
+    );
+    // ...but the VERDICT on the very same target decides.
+    assert_eq!(
+        exact_two_player_reach_realizable(CTRL_OUT, "busy_o == 0", &["c"]),
+        Ok(true),
+    );
 }
