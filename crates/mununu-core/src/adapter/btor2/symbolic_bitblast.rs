@@ -3015,6 +3015,58 @@ pub fn exact_two_player_gr1_realizable(
     Ok(exact_two_player_verdict(&latched, &formula, controllable)? == ExactVerdict::Holds)
 }
 
+/// P2.5-F — is `GF good` REALIZABLE under a CONJUNCTION of fairness assumptions
+/// `GF a_1 ∧ … ∧ GF a_m` (the multi-pair GR(1) objective `(⋀_i GF a_i) → GF good`)? Used when NO single
+/// justice assumption rescues an unrealizable recurrence game but a SET of them does (the fairness analog
+/// of [`crate::adapter::recoverability`]'s reach conjunctive slice).
+///
+/// **Soundness.** Each input assumption `a_i` is LATCHED into its own monitor state
+/// `mununu_assume_prev_i` (same pure-monitor argument as [`exact_two_player_gr1_realizable`], one latch
+/// per assumption), so `GF(mununu_assume_prev_i == 1) ⟺ GF a_i`. The controller then wins the
+/// STATE-fairness MULTI-pair GR(1) game (Piterman–Pnueli–Sa'ar), decided EXACTLY by
+/// [`exact_two_player_verdict`]:
+///
+/// ```text
+/// νZ. μY. ⋁_i νX_i. ( (good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y ∨ (mununu_assume_prev_i == 0 ∧ ⟨ctrl⟩X_i) )
+/// ```
+///
+/// The `⋁_i` over per-assumption `νX_i` "stall" branches encodes "the system wins if `good` recurs OR
+/// SOME assumption `a_i` is satisfied only finitely often" (`(⋀ GF a_i) → GF good` ≡ `GF good ∨ ⋁_i
+/// FG ¬a_i`). For `m = 1` it reduces exactly to [`exact_two_player_gr1_realizable`]; for `m = 0` (no
+/// assumption) to [`exact_two_player_buchi_realizable`]. `Ok(true)` = the controller wins under the
+/// conjunction. engine: `exact-symbolic` ROBDD (OxiDD) over the `m`-latch model.
+pub fn exact_two_player_gr1_conjunction_realizable(
+    btor2_content: &str,
+    good: &str,
+    assumes: &[crate::adapter::btor2::concrete_oracle::OracleAtom],
+    controllable: &[&str],
+) -> Result<bool, String> {
+    use crate::adapter::btor2::bad_monitor::{
+        ASSUME_PREV_SYMBOL, emit_latched_predicate_state_named,
+    };
+    if assumes.is_empty() {
+        return exact_two_player_buchi_realizable(btor2_content, good, controllable);
+    }
+    let ctrl = "<(ctrl = controllable)>";
+    let mut content = btor2_content.to_string();
+    let mut disjuncts: Vec<String> = Vec::with_capacity(assumes.len());
+    for (i, a) in assumes.iter().enumerate() {
+        let sym = format!("{ASSUME_PREV_SYMBOL}_{i}");
+        content = emit_latched_predicate_state_named(&content, a, &sym, false).map_err(|e| {
+            format!("exact two-player GR(1) conjunction: latching assumption {i}: {e}")
+        })?;
+        // One νX_i stall branch per assumption; X_i is a fresh fixpoint variable.
+        disjuncts.push(format!(
+            "(nu X{i}. ((({good}) && {ctrl} Z) || {ctrl} Y || (({sym} == 0) && {ctrl} X{i})))"
+        ));
+    }
+    let formula_str = format!("nu Z. (mu Y. ({}))", disjuncts.join(" || "));
+    let formula = crate::mu_calculus::parser::parse(&formula_str).map_err(|e| {
+        format!("exact two-player GR(1) conjunction: parsing `{formula_str}`: {e:?}")
+    })?;
+    Ok(exact_two_player_verdict(&content, &formula, controllable)? == ExactVerdict::Holds)
+}
+
 /// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER KMTS (3-valued predicate
 /// cube) game: the scale backend of the unified verifier (past the exact BDD cap). `predicates` is the
 /// abstraction (name → atom); `controllable` names the controller's inputs. Returns the 3-valued verdict

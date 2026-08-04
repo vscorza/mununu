@@ -17,7 +17,8 @@
 use mununu_core::adapter::btor2::concrete_oracle::OracleAtom;
 use mununu_core::adapter::btor2::predicate_expr::CmpOp;
 use mununu_core::adapter::btor2::symbolic_bitblast::{
-    exact_two_player_buchi_realizable, exact_two_player_gr1_realizable,
+    exact_two_player_buchi_realizable, exact_two_player_gr1_conjunction_realizable,
+    exact_two_player_gr1_realizable,
 };
 use mununu_core::adapter::recoverability::discover_game_fairness_assumption;
 
@@ -48,6 +49,34 @@ const CTRL_INIT1: &str = "\
 5 one 1
 6 init 1 4 5
 7 next 1 4 2
+";
+
+// TWO independent env gates on the path to `good = (st == 2)`, each needing its own fairness pause:
+//   st 0 --(c ∧ ¬e1)--> st 1 --(c ∧ ¬e2)--> st 2 --> st 0 (auto, non-idleable)
+// Controller drives `c`; the environment owns e1, e2. Reaching st==2 recurrently needs BOTH `e1` and
+// `e2` to pause infinitely often — neither single `GF(e_i==0)` suffices (the other gate stays shut).
+const TWOGATE: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 c
+4 input 1 e1
+5 input 1 e2
+6 state 2 st
+7 zero 2
+8 init 2 6 7
+9 one 2
+10 constd 2 2
+11 not 1 4
+12 and 1 3 11
+13 not 1 5
+14 and 1 3 13
+15 eq 1 6 7
+16 eq 1 6 9
+17 ite 2 12 9 7
+18 ite 2 14 10 9
+19 ite 2 16 18 7
+20 ite 2 15 17 19
+21 next 2 6 20
 ";
 
 /// The RECURRENCE game `GF(count==1)` (controller = push) is UNREALIZABLE: the environment pops forever
@@ -127,5 +156,83 @@ fn discovery_is_empty_when_recurrence_already_holds() {
     assert!(
         discover_game_fairness_assumption(CTRL_INIT1, "st == 1", &["c"]).is_empty(),
         "a realizable recurrence game needs no fairness assumption"
+    );
+}
+
+/// SOUNDNESS GATE for the CONJUNCTIVE lever — the multi-pair GR(1) `νZ.μY. ⋁_i νX_i(…)`. On TWOGATE,
+/// two independent env gates each need their own pause, so:
+///   - the bare recurrence is unrealizable,
+///   - NEITHER single `GF(e_i==0)` rescues (the other gate stays shut — the crucial non-over-firing
+///     control: a lever that "rescued" with one assumption would be unsound), and
+///   - the CONJUNCTION `GF(e1==0) ∧ GF(e2==0)` DOES rescue.
+#[test]
+fn conjunctive_fairness_rescues_when_no_single_assumption_does() {
+    let e1_low = OracleAtom::new("e1", CmpOp::Eq, 0);
+    let e2_low = OracleAtom::new("e2", CmpOp::Eq, 0);
+
+    assert_eq!(
+        exact_two_player_buchi_realizable(TWOGATE, "st == 2", &["c"]),
+        Ok(false),
+        "bare recurrence: the environment shuts either gate forever"
+    );
+    // Neither single justice assumption suffices.
+    assert_eq!(
+        exact_two_player_gr1_realizable(TWOGATE, "st == 2", &e1_low, &["c"]),
+        Ok(false),
+        "GF(e1==0) alone: gate 1 (e2) still shut ⇒ st==2 unreachable"
+    );
+    assert_eq!(
+        exact_two_player_gr1_realizable(TWOGATE, "st == 2", &e2_low, &["c"]),
+        Ok(false),
+        "GF(e2==0) alone: gate 0 (e1) still shut ⇒ st==1 unreachable"
+    );
+    // The conjunction rescues.
+    assert_eq!(
+        exact_two_player_gr1_conjunction_realizable(
+            TWOGATE,
+            "st == 2",
+            &[e1_low.clone(), e2_low.clone()],
+            &["c"]
+        ),
+        Ok(true),
+        "GF(e1==0) ∧ GF(e2==0): both gates pause i.o. ⇒ st==2 recurs"
+    );
+}
+
+/// DISCOVERY end-to-end for the CONJUNCTIVE fallback: on TWOGATE (no single fairness rescues),
+/// `discover_game_fairness_assumption` falls through to the conjunction and reports
+/// `GF(e1 == 0) && GF(e2 == 0)` with kind `InputFairnessConjunction`.
+#[test]
+fn discovery_finds_the_fairness_conjunction_when_no_single_works() {
+    let found = discover_game_fairness_assumption(TWOGATE, "st == 2", &["c"]);
+    assert!(
+        found.iter().any(|a| a.phi.contains("GF(e1 == 0)")
+            && a.phi.contains("GF(e2 == 0)")
+            && a.kind == mununu_core::verdict::AssumptionKind::InputFairnessConjunction
+            && a.non_vacuous),
+        "expected the conjunction GF(e1==0) && GF(e2==0): {found:?}"
+    );
+}
+
+/// REDUCTION sanity for the conjunctive helper: a 1-element conjunction equals the single-pair GR(1),
+/// and a 0-element conjunction equals the bare Büchi game. Confirms the multi-pair νZ.μY.⋁νX formula
+/// does not drift from the shipped single-pair / recurrence primitives.
+#[test]
+fn conjunction_reduces_to_single_and_buchi() {
+    let e_low = OracleAtom::new("e", CmpOp::Eq, 0);
+    // m = 1 ≡ single-pair GR(1) (on the BUFFER game where GF(e==0) rescues).
+    assert_eq!(
+        exact_two_player_gr1_conjunction_realizable(
+            BUFFER,
+            "count == 1",
+            std::slice::from_ref(&e_low),
+            &["c"]
+        ),
+        exact_two_player_gr1_realizable(BUFFER, "count == 1", &e_low, &["c"]),
+    );
+    // m = 0 ≡ bare Büchi recurrence.
+    assert_eq!(
+        exact_two_player_gr1_conjunction_realizable(BUFFER, "count == 1", &[], &["c"]),
+        exact_two_player_buchi_realizable(BUFFER, "count == 1", &["c"]),
     );
 }

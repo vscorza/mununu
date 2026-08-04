@@ -129,6 +129,11 @@ pub enum AssumptionKind {
     /// (`GF a → GF good`, the GR(1) 1-pair objective). Distinct from `InputHold` (a SAFETY hold `G(a)`):
     /// fairness is strictly weaker (the environment may violate `a` finitely often).
     InputFairness,
+    /// A CONJUNCTION of fairness assumptions `GF(e_1 == v_1) ∧ … ∧ GF(e_k == v_k)` — the minimal set of
+    /// environment liveness assumptions under which an unrealizable RECURRENCE game becomes realizable
+    /// (`(⋀_i GF a_i) → GF good`, the MULTI-pair GR(1) objective), when no SINGLE fairness assumption
+    /// suffices (multiple independent liveness blockers). The fairness analog of `InputConjunction`.
+    InputFairnessConjunction,
 }
 
 /// See [`VerdictRefinement::holds_under`]. A CONDITIONAL result: the property holds under `phi`.

@@ -1631,7 +1631,154 @@ pub fn discover_game_fairness_assumption(
             }
         }
     }
+    // When NO single fairness assumption wins (multiple independent liveness blockers), fall back to the
+    // CONJUNCTIVE slice: a minimal SET of `GF(e_i == v_i)` under which the controller wins.
+    if found.is_empty()
+        && let Some(conj) = discover_game_fairness_conjunction(btor2_content, good, controllable)
+    {
+        found.push(conj);
+    }
     found
+}
+
+/// Capability B, Phase 2c (FAIRNESS, CONJUNCTIVE) — when NO single `GF(e_i == v_i)` rescues the
+/// unrealizable recurrence game (multiple INDEPENDENT liveness blockers), find a MINIMAL CONJUNCTION of
+/// fairness assumptions `GF(e_1 == v_1) ∧ … ∧ GF(e_k == v_k)` under which the controller wins
+/// `(⋀_i GF a_i) → GF good` (the multi-pair GR(1) objective). The fairness analog of
+/// [`discover_game_env_conjunction`] (which pins env inputs to CONSTANTS for a reach/safety `A ⇒ G`);
+/// here each `e_i` stays free EXCEPT that it must be `v_i` INFINITELY OFTEN.
+///
+/// Returns ONE minimal conjunction (≥2 assumptions), or `None` (already realizable, `good` not
+/// `REG == VALUE`, no winning value-combination within the caps, or it minimizes to a single assumption
+/// — that is the [`discover_game_fairness_assumption`] single-`GF` slice's job).
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD multi-pair GR(1)
+/// ([`crate::adapter::btor2::symbolic_bitblast::exact_two_player_gr1_conjunction_realizable`]) over the
+/// `k`-latch model + the reach-portfolio non-vacuity gate. Bounded: candidate env inputs are restricted
+/// to `good`'s cone (`cone_leaf_nids`); the winning-combination search caps at `MAX_CONJ_BITS` total env
+/// bits (the νμ over `k` latches is pricier than a reach pin, so the cap is tighter than the reach
+/// slice's) and a wall-clock budget.
+fn discover_game_fairness_conjunction(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Option<DiscoveredAssumption> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::concrete_oracle::OracleAtom;
+    use crate::adapter::btor2::dep_graph::cone_leaf_nids;
+    use crate::adapter::btor2::symbolic_bitblast::{
+        exact_two_player_buchi_realizable, exact_two_player_gr1_conjunction_realizable,
+    };
+    const MAX_INPUT_BITS: u32 = 3;
+    const MAX_CONJ_BITS: u32 = 6; // ≤ 64 value-combinations; the νμ over k latches is pricier than a pin
+    let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let start = std::time::Instant::now();
+
+    let (register, value) = match parse_predicate_expr(good).ok() {
+        Some(PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        }) => (register, value),
+        _ => return None,
+    };
+    // Only when the RECURRENCE game is genuinely unrealizable.
+    if exact_two_player_buchi_realizable(btor2_content, good, controllable) != Ok(false) {
+        return None;
+    }
+    // Non-vacuity is a property of the DESIGN (good reachable AND avoidable), independent of the
+    // assumption — check it once. A dead/stuck target yields no meaningful conjunction.
+    if !good_nonvacuous_under(btor2_content, &register, value) {
+        return None;
+    }
+    let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return None;
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    let cone = cone_leaf_nids(&file, std::slice::from_ref(&register));
+    let mut axes: Vec<(String, u32)> = Vec::new();
+    for line in &file.lines {
+        if let Node::Input { sort, .. } = &line.node
+            && cone.contains(&line.nid)
+            && let Some(name) = symbols.get(&line.nid)
+            && !ctrl_set.contains(name.as_str())
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+            && w <= MAX_INPUT_BITS
+        {
+            axes.push((name.clone(), w));
+        }
+    }
+    axes.sort();
+    axes.dedup();
+    let total_bits: u32 = axes.iter().map(|(_, w)| *w).sum();
+    if axes.len() < 2 || total_bits > MAX_CONJ_BITS {
+        return None; // < 2 axes = not a conjunction; too wide = abstain
+    }
+
+    // `wins`: the SUBSET `kept` of axes, each assumed `GF(e_j == vals[j])`, makes the multi-pair GR(1)
+    // game realizable. (Non-vacuity already checked above — it does not depend on the assumption.)
+    let wins = |kept: &[usize], vals: &[u64]| -> bool {
+        let assumes: Vec<OracleAtom> = kept
+            .iter()
+            .map(|&j| OracleAtom::new(axes[j].0.clone(), CmpOp::Eq, vals[j] as u128))
+            .collect();
+        exact_two_player_gr1_conjunction_realizable(btor2_content, good, &assumes, controllable)
+            == Ok(true)
+    };
+
+    // Search the product of the axes' value ranges for a WINNING full assumption set (all axes assumed).
+    let ranges: Vec<u64> = axes.iter().map(|(_, w)| 1u64 << w).collect();
+    let total_combos: u64 = ranges.iter().product();
+    let all: Vec<usize> = (0..axes.len()).collect();
+    let mut vals: Option<Vec<u64>> = None;
+    for idx in 0..total_combos {
+        if start.elapsed().as_millis() > budget_ms {
+            break;
+        }
+        let mut rem = idx;
+        let candidate: Vec<u64> = ranges
+            .iter()
+            .map(|r| {
+                let v = rem % r;
+                rem /= r;
+                v
+            })
+            .collect();
+        if wins(&all, &candidate) {
+            vals = Some(candidate);
+            break;
+        }
+    }
+    let vals = vals?;
+
+    // MINIMIZE: greedily drop any assumption the controller wins WITHOUT (that env input can stay fully
+    // adversarial).
+    let mut needed: Vec<usize> = (0..axes.len()).collect();
+    for i in 0..axes.len() {
+        let trial: Vec<usize> = needed.iter().copied().filter(|&j| j != i).collect();
+        if wins(&trial, &vals) {
+            needed = trial;
+        }
+    }
+    if needed.len() < 2 {
+        return None; // reduced to a single fairness assumption — the single-`GF` slice's job
+    }
+    let phi = needed
+        .iter()
+        .map(|&j| format!("GF({} == {})", axes[j].0, vals[j]))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    Some(DiscoveredAssumption {
+        phi,
+        kind: AssumptionKind::InputFairnessConjunction,
+        non_vacuous: true,
+        engine: "two-player multi-pair GR(1) game realizable under env-input fairness conjunction"
+            .to_string(),
+    })
 }
 
 /// Capability B, Phase 2c (CONJUNCTIVE) — when NO single environment-input hold makes the game realizable

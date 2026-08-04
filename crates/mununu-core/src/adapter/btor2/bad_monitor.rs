@@ -421,6 +421,18 @@ pub fn emit_latched_predicate_state(
     atom: &OracleAtom,
     reset_pinned: bool,
 ) -> Result<String, AdapterError> {
+    emit_latched_predicate_state_named(content, atom, ASSUME_PREV_SYMBOL, reset_pinned)
+}
+
+/// As [`emit_latched_predicate_state`] but with an explicit latch `symbol` — for a CONJUNCTION of
+/// fairness assumptions `GF a_1 ∧ … ∧ GF a_m`, where each `a_i` needs its OWN latch state
+/// (`mununu_assume_prev_0`, `_1`, …) so the multi-pair GR(1) fixpoint can reference them independently.
+pub fn emit_latched_predicate_state_named(
+    content: &str,
+    atom: &OracleAtom,
+    symbol: &str,
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
     let file = parser::parse(content).map_err(|mut e| {
         e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
         e
@@ -452,14 +464,14 @@ pub fn emit_latched_predicate_state(
         btor2_cmp_keyword(atom.op)
     ));
 
-    // mununu_assume_prev latch: init 0, next = a_cmp. (`init` needs the state NID > the value NID, so
+    // `symbol` latch: init 0, next = a_cmp. (`init` needs the state NID > the value NID, so
     // `zero` is emitted before the state — the same ordering emit_ag_implies_next_monitor relies on.)
     let zero_bool = next_nid;
     next_nid += 1;
     appended.push(format!("{zero_bool} zero {bool_sort}"));
     let latch = next_nid;
     next_nid += 1;
-    appended.push(format!("{latch} state {bool_sort} {ASSUME_PREV_SYMBOL}"));
+    appended.push(format!("{latch} state {bool_sort} {symbol}"));
     let latch_init = next_nid;
     next_nid += 1;
     appended.push(format!("{latch_init} init {bool_sort} {latch} {zero_bool}"));
