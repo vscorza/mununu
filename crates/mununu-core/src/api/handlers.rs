@@ -885,8 +885,10 @@ pub async fn btor2_game_handler(
     Json(request): Json<Btor2GameRequest>,
 ) -> ApiResult<Json<Btor2GameResponse>> {
     use crate::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_reach_realizable, exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
+        exact_two_player_strategy, game_sound_posture_model,
     };
+    use crate::api::models::GameObjective;
 
     // assume_clock_reset: model clk/rst as a sound posture (not adversarial) before solving.
     let content = if request.assume_clock_reset {
@@ -895,18 +897,29 @@ pub async fn btor2_game_handler(
         request.content.clone()
     };
     let controllable: Vec<&str> = request.controllable.iter().map(String::as_str).collect();
-    // The VERDICT works on any resolvable target (state cell, combinational output, relation) and
-    // validates the partition; the STRATEGY needs a STATE-register target, so it is best-effort —
-    // omitted (`null`) for a combinational-output / relational `good` (a FIFO's `full_o`).
-    let realizable = exact_two_player_reach_realizable(&content, &request.good, &controllable)
-        .map_err(|message| ApiError::BadRequest {
-            message,
-            details: None,
-        })?;
-    let strategy = exact_two_player_strategy(&content, &request.good, &controllable).ok();
-    // discover_assumptions: when unrealizable, search for an environment assumption under which the
-    // controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
-    let holds_under = if request.discover_assumptions {
+    let recurrence = request.objective == GameObjective::Recurrence;
+    // The VERDICT works on any resolvable target (state cell, combinational output, relation) for both
+    // objectives and validates the partition. `reach` = force `good` once; `recurrence` = force `good`
+    // infinitely often (Büchi).
+    let realizable = if recurrence {
+        exact_two_player_buchi_realizable(&content, &request.good, &controllable)
+    } else {
+        exact_two_player_reach_realizable(&content, &request.good, &controllable)
+    }
+    .map_err(|message| ApiError::BadRequest {
+        message,
+        details: None,
+    })?;
+    // STRATEGY + assumption discovery are REACH-only today (the strategy is a reachability attractor, the
+    // assumption search a reach `A ⇒ G`; a fairness GF a → GF good assumption for recurrence is the
+    // follow-up). Strategy is also best-effort: it needs a STATE-register target, so it is `null` for a
+    // combinational-output / relational `good` (a FIFO's `full_o`).
+    let strategy = if recurrence {
+        None
+    } else {
+        exact_two_player_strategy(&content, &request.good, &controllable).ok()
+    };
+    let holds_under = if request.discover_assumptions && !recurrence {
         crate::adapter::recoverability::discover_game_env_assumption(
             &content,
             &request.good,
@@ -919,6 +932,7 @@ pub async fn btor2_game_handler(
     Ok(Json(Btor2GameResponse {
         realizable,
         good: request.good,
+        objective: request.objective,
         controllable: request.controllable,
         holds_under,
         strategy,
@@ -4706,6 +4720,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(raw)).await.expect("game runs");
@@ -4718,6 +4733,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: true,
         };
         let Json(out) = btor2_game_handler(Json(posture)).await.expect("game runs");
@@ -4735,6 +4751,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
@@ -4753,6 +4770,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
@@ -4772,6 +4790,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["c".to_string()],
             discover_assumptions: true,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: false,
         };
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
@@ -4788,6 +4807,28 @@ members = ["x"]
         );
     }
 
+    /// `objective: "recurrence"` over HTTP: the Büchi game on `st'=c` is realizable (the controller keeps
+    /// `st==1` forever), the objective is echoed, and the strategy is omitted (recurrence is verdict-only
+    /// today — the reachability strategy would be the wrong shape).
+    #[tokio::test]
+    async fn btor2_game_handler_recurrence_objective_is_verdict_only() {
+        let request = Btor2GameRequest {
+            content: GAME_CTRL.to_string(),
+            good: "st == 1".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Recurrence,
+            assume_clock_reset: false,
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(out.realizable, "st'=c: the controller forces st=1 i.o.");
+        assert_eq!(out.objective, crate::api::models::GameObjective::Recurrence);
+        assert!(
+            out.strategy.is_none(),
+            "recurrence is verdict-only today (no reachability strategy)"
+        );
+    }
+
     #[tokio::test]
     async fn btor2_game_handler_rejects_unknown_controllable_input() {
         let request = Btor2GameRequest {
@@ -4795,6 +4836,7 @@ members = ["x"]
             good: "st == 1".to_string(),
             controllable: vec!["nope".to_string()], // not a primary input
             discover_assumptions: false,
+            objective: crate::api::models::GameObjective::Reach,
             assume_clock_reset: false,
         };
         let err = btor2_game_handler(Json(request))

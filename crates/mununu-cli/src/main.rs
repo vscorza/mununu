@@ -791,15 +791,29 @@ struct Btor2CheckFsmArgs {
     ci: CiArgs,
 }
 
+/// The two-player game winning objective (`btor2 game --objective`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GameObjective {
+    /// Force `good` at least ONCE — the reachability game `μX. good ∨ ⟨ctrl⟩X`.
+    Reach,
+    /// Force `good` INFINITELY OFTEN — the Büchi game `νZ.μY. (good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y`.
+    Recurrence,
+}
+
 #[derive(Args, Debug)]
 struct Btor2GameArgs {
     /// Path to the BTOR2 input file.
     #[arg(value_name = "BTOR2_FILE")]
     file: PathBuf,
-    /// The reachability target `good` state atom the controller tries to force — a single
-    /// register-comparison atom (`"state_q == 44"`).
+    /// The target `good` atom the controller tries to force — a single register-comparison /
+    /// combinational-output atom (`"state_q == 44"`, `"full_o == 1"`).
     #[arg(long, value_name = "REG op VALUE")]
     good: String,
+    /// The winning objective: `reach` (default) = force `good` ONCE (`μX. good ∨ ⟨ctrl⟩X`); `recurrence`
+    /// = force `good` INFINITELY OFTEN — the Büchi game `νZ.μY. (good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y`. Strategy
+    /// extraction and assumption discovery apply to `reach` only today.
+    #[arg(long = "objective", value_enum, default_value_t = GameObjective::Reach)]
+    objective: GameObjective,
     /// A controller-owned primary input (repeatable). Every other primary input belongs to the
     /// (adversarial) environment. A name that is not a real primary input is rejected.
     #[arg(long = "controllable", value_name = "INPUT")]
@@ -2762,7 +2776,8 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// to the `violated` verdict class); `realizable` maps to `holds`.
 fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_reach_realizable, exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
+        exact_two_player_strategy, game_sound_posture_model,
     };
 
     let raw = std::fs::read_to_string(&args.file)
@@ -2774,15 +2789,29 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
         raw
     };
     let controllable: Vec<&str> = args.controllable.iter().map(String::as_str).collect();
-    // The VERDICT works on any resolvable target (state cell, combinational output, relation); it also
-    // validates the controllable partition. The STRATEGY is best-effort — it needs a STATE-register
-    // target, so it is omitted for a combinational-output / relational `good` (a FIFO's `full_o`).
-    let realizable = exact_two_player_reach_realizable(&content, &args.good, &controllable)?;
-    let strategy = exact_two_player_strategy(&content, &args.good, &controllable).ok();
+    let recurrence = args.objective == GameObjective::Recurrence;
+    // The VERDICT works on any resolvable target (state cell, combinational output, relation) for both
+    // objectives; it also validates the controllable partition. `reach` = force `good` once; `recurrence`
+    // = force `good` infinitely often (Büchi).
+    let realizable = if recurrence {
+        exact_two_player_buchi_realizable(&content, &args.good, &controllable)?
+    } else {
+        exact_two_player_reach_realizable(&content, &args.good, &controllable)?
+    };
+    // STRATEGY extraction + assumption discovery are REACH-only today: the state-indexed strategy is a
+    // reachability attractor (wrong shape for Büchi), and the assumption search is a reach `A ⇒ G` — a
+    // fairness (GF a → GF good) assumption for recurrence is the follow-up. Also best-effort: the strategy
+    // needs a STATE-register target, so it is omitted for a combinational-output / relational `good`.
+    let strategy = if recurrence {
+        None
+    } else {
+        exact_two_player_strategy(&content, &args.good, &controllable).ok()
+    };
 
     let mut summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "good": args.good,
+        "objective": if recurrence { "recurrence" } else { "reach" },
         "controllable": args.controllable,
         "assume_clock_reset": args.assume_clock_reset,
         "realizable": realizable,
@@ -2791,9 +2820,10 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
         summary["strategy"] =
             serde_json::to_value(s).map_err(|e| format!("serialize strategy: {e}"))?;
     }
-    // --discover-assumptions: when the game is unrealizable, search for an environment assumption under
-    // which the controller wins (CONDITIONAL — never flips `realizable`). No-op when already realizable.
-    if args.discover_assumptions {
+    // --discover-assumptions: when the (reach) game is unrealizable, search for an environment assumption
+    // under which the controller wins (CONDITIONAL — never flips `realizable`). No-op when already
+    // realizable or under `--objective recurrence` (fairness discovery is the follow-up).
+    if args.discover_assumptions && !recurrence {
         let holds_under = mununu_core::adapter::recoverability::discover_game_env_assumption(
             &content,
             &args.good,

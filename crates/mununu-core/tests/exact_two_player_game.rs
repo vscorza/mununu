@@ -16,8 +16,8 @@
 //! the oracle.)
 
 use mununu_core::adapter::btor2::symbolic_bitblast::{
-    ExactVerdict, exact_two_player_reach_realizable, exact_two_player_strategy,
-    exact_two_player_verdict,
+    ExactVerdict, exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
+    exact_two_player_strategy, exact_two_player_verdict,
 };
 use mununu_core::mu_calculus::parser;
 
@@ -135,6 +135,36 @@ fn controllable_safety_holds_iff_environment_cannot_knock_out() {
     );
 }
 
+/// Controllable RECURRENCE / Büchi (`νμ`): can the CONTROLLER visit `good = (st == 1)` INFINITELY OFTEN?
+/// The recurrence formula is `νZ. μY. ((good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y)`. This is the DECISIVE soundness gate
+/// for the nested-fixpoint two-player evaluation (the reach/safety tests exercise only a SINGLE fixpoint):
+/// `CTRL` (st'=c) — the controller sets c=1 every step ⇒ st=1 always ⇒ good i.o. ⇒ HOLDS. `ENVBLK`
+/// (st'=c&¬e) — the environment plays e=1 forever ⇒ st=0 after step 1 ⇒ good only finitely often ⇒ VIOLATED.
+#[test]
+fn controllable_recurrence_holds_iff_environment_cannot_starve() {
+    let gf_good =
+        "nu Z. (mu Y. (((st == 1) && <(ctrl = controllable)> Z) || <(ctrl = controllable)> Y))";
+    assert_eq!(
+        verdict(CTRL_INIT1, gf_good),
+        ExactVerdict::Holds,
+        "st'=c: the controller keeps st=1 ⇒ visits good infinitely often"
+    );
+    assert_eq!(
+        verdict(ENVBLK_INIT1, gf_good),
+        ExactVerdict::Violated,
+        "st'=c&¬e: the environment starves good with e=1 forever"
+    );
+    // DUAL sanity: the controller CAN force GF(st==0) on ENVBLK (set c=0 ⇒ st'=0) — confirms the νμ
+    // nesting is not accidentally collapsing to the reach/safety single-fixpoint answer.
+    let gf_zero =
+        "nu Z. (mu Y. (((st == 0) && <(ctrl = controllable)> Z) || <(ctrl = controllable)> Y))";
+    assert_eq!(
+        verdict(ENVBLK_INIT1, gf_zero),
+        ExactVerdict::Holds,
+        "st'=c&¬e: the controller forces st=0 (c=0) ⇒ visits st=0 infinitely often"
+    );
+}
+
 /// The DUAL — environment predecessor (`cpre_environment`). Can the ENVIRONMENT force reaching
 /// `st == 0` (init st=1)? `ENVBLK`: `∃e ∀c: (c&¬e)==0` holds for e=1 ⇒ HOLDS. `CTRL`: the environment
 /// is powerless (`∀c: c==0` fails, c=1 keeps st=1) ⇒ VIOLATED. The mirror image of the controllable
@@ -204,6 +234,30 @@ fn reach_realizable_decides_a_combinational_output_target() {
     assert_eq!(
         exact_two_player_reach_realizable(CTRL_OUT, "st == 1", &["c"]),
         exact_two_player_reach_realizable(CTRL_OUT, "busy_o == 0", &["c"]),
+    );
+}
+
+/// The `exact_two_player_buchi_realizable` HELPER (the recurrence primitive behind `--objective
+/// recurrence`) agrees with the hand-written recurrence formula: realizable on `CTRL` (the controller
+/// keeps `st==1` forever) and unrealizable on `ENVBLK` (the environment starves it), and it accepts a
+/// combinational-output target (`busy_o == 0`) just like the reach helper.
+#[test]
+fn buchi_helper_matches_the_recurrence_known_answer() {
+    assert_eq!(
+        exact_two_player_buchi_realizable(CTRL_INIT1, "st == 1", &["c"]),
+        Ok(true),
+        "st'=c: the controller forces st=1 infinitely often"
+    );
+    assert_eq!(
+        exact_two_player_buchi_realizable(ENVBLK_INIT1, "st == 1", &["c"]),
+        Ok(false),
+        "st'=c&¬e: the environment starves st=1"
+    );
+    // Combinational-output recurrence: force `busy_o == 0` (⇔ st==1) infinitely often on CTRL_OUT (st'=c).
+    assert_eq!(
+        exact_two_player_buchi_realizable(CTRL_OUT, "busy_o == 0", &["c"]),
+        Ok(true),
+        "st'=c: the controller forces busy_o=0 (st=1) infinitely often — a combinational-output target"
     );
 }
 
