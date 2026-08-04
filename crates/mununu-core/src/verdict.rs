@@ -124,6 +124,11 @@ pub enum AssumptionKind {
     ResetEventually,
     /// A synthesized positional environment strategy (1-player: the environment owns all inputs).
     EnvStrategy,
+    /// A LIVENESS / fairness environment assumption `GF(in == v)` — the environment input holds `v`
+    /// INFINITELY OFTEN — under which an unrealizable RECURRENCE (Büchi) game `GF good` becomes realizable
+    /// (`GF a → GF good`, the GR(1) 1-pair objective). Distinct from `InputHold` (a SAFETY hold `G(a)`):
+    /// fairness is strictly weaker (the environment may violate `a` finitely often).
+    InputFairness,
 }
 
 /// See [`VerdictRefinement::holds_under`]. A CONDITIONAL result: the property holds under `phi`.
