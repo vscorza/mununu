@@ -4722,6 +4722,9 @@ members = ["x"]
     // Saturating 1-bit buffer `count' = (c∧¬e) ∨ (count∧¬(e∧¬c))`: recurrence `GF(count==1)` (ctrl=c) is
     // unrealizable (env pops forever), but realizable under the fairness assumption `GF(e==0)`.
     const GAME_BUFFER: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 count\n5 zero 1\n6 init 1 4 5\n7 not 1 3\n8 and 1 2 7\n9 not 1 2\n10 and 1 3 9\n11 not 1 10\n12 and 1 4 11\n13 or 1 8 12\n14 next 1 4 13\n";
+    // TWOGATE: two independent env gates (e1,e2) to `st==2`; recurrence needs BOTH `GF(e1==0)` and
+    // `GF(e2==0)` — no single fairness suffices ⇒ the conjunctive fallback.
+    const GAME_TWOGATE: &str = "1 sort bitvec 1\n2 sort bitvec 2\n3 input 1 c\n4 input 1 e1\n5 input 1 e2\n6 state 2 st\n7 zero 2\n8 init 2 6 7\n9 one 2\n10 constd 2 2\n11 not 1 4\n12 and 1 3 11\n13 not 1 5\n14 and 1 3 13\n15 eq 1 6 7\n16 eq 1 6 9\n17 ite 2 12 9 7\n18 ite 2 14 10 9\n19 ite 2 16 18 7\n20 ite 2 15 17 19\n21 next 2 6 20\n";
 
     /// `assume_clock_reset` over HTTP: the reset-adversarial game is unrealizable raw, but realizable when
     /// the reset is modeled as a posture (the modeling-artifact fix).
@@ -4864,6 +4867,30 @@ members = ["x"]
                 && a.kind == crate::verdict::AssumptionKind::InputFairness
                 && a.non_vacuous),
             "holds_under carries the fairness assumption GF(e==0): {:?}",
+            out.holds_under
+        );
+    }
+
+    /// `objective: "recurrence"` + `discover_assumptions` over HTTP on TWOGATE: no single fairness
+    /// suffices, so the discovery falls through to a CONJUNCTION `GF(e1==0) && GF(e2==0)`
+    /// (`InputFairnessConjunction`).
+    #[tokio::test]
+    async fn btor2_game_handler_discovers_fairness_conjunction() {
+        let request = Btor2GameRequest {
+            content: GAME_TWOGATE.to_string(),
+            good: "st == 2".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: true,
+            objective: crate::api::models::GameObjective::Recurrence,
+            assume_clock_reset: false,
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(!out.realizable, "no single fairness rescues TWOGATE");
+        assert!(
+            out.holds_under.iter().any(|a| a.phi.contains("GF(e1 == 0)")
+                && a.phi.contains("GF(e2 == 0)")
+                && a.kind == crate::verdict::AssumptionKind::InputFairnessConjunction),
+            "holds_under carries the fairness conjunction: {:?}",
             out.holds_under
         );
     }
