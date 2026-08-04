@@ -1086,9 +1086,20 @@ pub struct Btor2CheckFsmResponse {
     pub registers: Vec<FsmRegisterFinding>,
 }
 
-/// Request for the two-player controllable-reachability game (`POST /api/v1/btor2/game`). Mirrors the CLI
-/// `mununu btor2 game`: decide whether the CONTROLLER can force the design to `good` against every
-/// environment move, and synthesize the winner's strategy.
+/// The two-player game winning objective (`objective` field). Mirrors the CLI `--objective`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameObjective {
+    /// Force `good` at least ONCE — the reachability game `μX. good ∨ ⟨ctrl⟩X`.
+    #[default]
+    Reach,
+    /// Force `good` INFINITELY OFTEN — the Büchi game `νZ.μY. (good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y`.
+    Recurrence,
+}
+
+/// Request for the two-player controllable game (`POST /api/v1/btor2/game`). Mirrors the CLI
+/// `mununu btor2 game`: decide whether the CONTROLLER can force the design to `good` (once for `reach`,
+/// infinitely often for `recurrence`) against every environment move, and synthesize the winner's strategy.
 #[derive(Debug, Deserialize)]
 pub struct Btor2GameRequest {
     /// BTOR2 source content.
@@ -1099,9 +1110,15 @@ pub struct Btor2GameRequest {
     /// A name that is not a real primary input is a `BadRequest`.
     #[serde(default)]
     pub controllable: Vec<String>,
+    /// The winning objective: `"reach"` (default) = force `good` ONCE; `"recurrence"` = force `good`
+    /// INFINITELY OFTEN (the Büchi game). Strategy + assumption discovery apply to `reach` only today.
+    /// Mirrors the CLI `--objective`.
+    #[serde(default)]
+    pub objective: GameObjective,
     /// When the game is UNREALIZABLE, also search for an ENVIRONMENT ASSUMPTION under which the controller
     /// wins (the assume-guarantee wedge) → `holds_under`. CONDITIONAL — never flips `realizable`. No-op
-    /// when the game is already realizable. Mirrors the CLI `--discover-assumptions`.
+    /// when the game is already realizable or under `objective = "recurrence"`. Mirrors the CLI
+    /// `--discover-assumptions`.
     #[serde(default)]
     pub discover_assumptions: bool,
     /// Model the clock and reset as a sound POSTURE instead of adversarial inputs — pin the detected reset
@@ -1116,10 +1133,13 @@ pub struct Btor2GameRequest {
 #[derive(Debug, Serialize)]
 pub struct Btor2GameResponse {
     /// `true` = the controller can force `good` against every environment move (the spec is realizable);
-    /// `false` = the environment can prevent it (unrealizable).
+    /// `false` = the environment can prevent it (unrealizable). For `objective = "recurrence"` this is
+    /// "force `good` infinitely often" (the Büchi game).
     pub realizable: bool,
     /// The `good` atom, echoed for provenance.
     pub good: String,
+    /// The winning objective decided, echoed for provenance (`reach` or `recurrence`).
+    pub objective: GameObjective,
     /// The controller-owned inputs, echoed for provenance.
     pub controllable: Vec<String>,
     /// Discovered environment assumption(s) under which the (unrealizable) game becomes realizable —

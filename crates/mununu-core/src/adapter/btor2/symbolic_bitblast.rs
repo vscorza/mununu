@@ -2944,6 +2944,32 @@ pub fn exact_two_player_reach_realizable(
     Ok(exact_two_player_verdict(btor2_content, &formula, controllable)? == ExactVerdict::Holds)
 }
 
+/// P2.5-F — is the controllable-RECURRENCE (Büchi) game "visit `good` INFINITELY OFTEN" REALIZABLE?
+/// Builds the recurrence formula `νZ. μY. ((good ∧ ⟨ctrl⟩Z) ∨ ⟨ctrl⟩Y)` and decides it via
+/// [`exact_two_player_verdict`] — the nested `νμ` is the genuine Büchi winning region (the exact engine
+/// evaluates the two-player nested fixpoint soundly; validated by known answer in
+/// `tests/exact_two_player_game.rs::controllable_recurrence_holds_iff_environment_cannot_starve`). Like
+/// [`exact_two_player_reach_realizable`], `good` may be any atom `predicate_bdd` resolves (state cell,
+/// combinational output, or a relation — a FIFO's `full_o == 1`). `Ok(true)` = the controller can force
+/// `good` recurrently against every environment strategy from the initial state.
+///
+/// This is the OBJECTIVE primitive; a fairness ENVIRONMENT assumption `GF a → GF good` (rescuing an
+/// unrealizable recurrence game) is a SEPARATE follow-up that requires the transition-relativized CPre
+/// (Klein–Pnueli / Bloem GR(1) input-fairness) — a naive νμν with an input-predicate conjunct is UNSOUND
+/// because an input is not part of the state.
+pub fn exact_two_player_buchi_realizable(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Result<bool, String> {
+    let formula_str = format!(
+        "nu Z. (mu Y. ((({good}) && <(ctrl = controllable)> Z) || <(ctrl = controllable)> Y))"
+    );
+    let formula = crate::mu_calculus::parser::parse(&formula_str)
+        .map_err(|e| format!("exact two-player recurrence: parsing `{formula_str}`: {e:?}"))?;
+    Ok(exact_two_player_verdict(btor2_content, &formula, controllable)? == ExactVerdict::Holds)
+}
+
 /// P2.5-F — decide a Control-tagged μ-calculus `formula` on the TWO-PLAYER KMTS (3-valued predicate
 /// cube) game: the scale backend of the unified verifier (past the exact BDD cap). `predicates` is the
 /// abstraction (name → atom); `controllable` names the controller's inputs. Returns the 3-valued verdict
