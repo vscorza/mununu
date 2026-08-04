@@ -57,6 +57,11 @@ pub const BAD_COND_SYMBOL: &str = "mununu_bad";
 /// antecedent truth).
 pub const ANTE_PREV_SYMBOL: &str = "mununu_ante_prev";
 
+/// The 1-bit latch synthesised for a FAIRNESS environment assumption (holds the
+/// previous cycle's truth of the assumption predicate `a`). See
+/// [`emit_latched_predicate_state`].
+pub const ASSUME_PREV_SYMBOL: &str = "mununu_assume_prev";
+
 fn err(message: String) -> AdapterError {
     AdapterError {
         kind: AdapterErrorKind::UnsupportedConstruct,
@@ -396,6 +401,70 @@ pub fn emit_ag_implies_next_monitor(
     ));
     let bad_line = next_nid;
     appended.push(format!("{bad_line} bad {bad_cond}"));
+
+    Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
+}
+
+/// Append a 1-bit latch state (init 0, `next = (atom.signal atom.op atom.value)`) named
+/// [`ASSUME_PREV_SYMBOL`], recording whether the assumption predicate `atom` held on each transition.
+/// The atom's signal may be a STATE cell, a PRIMARY INPUT, or a combinational OUTPUT port.
+///
+/// This is the SOUND encoding of an INPUT/transition-level fairness assumption `GF a` as a
+/// STATE-predicate fairness `GF(mununu_assume_prev == 1)`: an input is not part of the state, so it
+/// cannot appear directly in a state-fairness fixpoint (a naive νμν with an input-predicate conjunct
+/// would be unsound). Latching `a` into a fresh 1-bit state samples the assumption on each transition;
+/// `GF(mununu_assume_prev == 1) ⟺ GF a` on the play (a one-cycle offset is immaterial to an
+/// infinitely-often objective). The latch is a PURE MONITOR — no new choice, no feedback into the
+/// original transition — so every strategy/play is preserved and a game verdict transfers unchanged.
+pub fn emit_latched_predicate_state(
+    content: &str,
+    atom: &OracleAtom,
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+    // The assumption signal: a state cell, a primary input, or a combinational output port.
+    let (sig_nid, sig_sort) = state_nid_and_sort(&file, &atom.signal, reset_pinned)
+        .or_else(|| input_nid_and_sort(&file, &atom.signal))
+        .or_else(|| output_nid_and_sort(&file, &atom.signal))
+        .ok_or_else(|| {
+            err(format!(
+                "adapter/btor2/bad_monitor: fairness assumption signal `{}` does not resolve to a \
+                 state cell, primary input, or output port",
+                atom.signal
+            ))
+        })?;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut appended: Vec<String> = Vec::new();
+    let bool_sort = find_or_make_bool_sort(&file, &mut next_nid, &mut appended);
+
+    // a = (signal op value)
+    let a_const = next_nid;
+    next_nid += 1;
+    appended.push(format!("{a_const} constd {sig_sort} {}", atom.value));
+    let a_cmp = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{a_cmp} {} {bool_sort} {sig_nid} {a_const}",
+        btor2_cmp_keyword(atom.op)
+    ));
+
+    // mununu_assume_prev latch: init 0, next = a_cmp. (`init` needs the state NID > the value NID, so
+    // `zero` is emitted before the state — the same ordering emit_ag_implies_next_monitor relies on.)
+    let zero_bool = next_nid;
+    next_nid += 1;
+    appended.push(format!("{zero_bool} zero {bool_sort}"));
+    let latch = next_nid;
+    next_nid += 1;
+    appended.push(format!("{latch} state {bool_sort} {ASSUME_PREV_SYMBOL}"));
+    let latch_init = next_nid;
+    next_nid += 1;
+    appended.push(format!("{latch_init} init {bool_sort} {latch} {zero_bool}"));
+    let latch_next = next_nid;
+    appended.push(format!("{latch_next} next {bool_sort} {latch} {a_cmp}"));
 
     Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
 }

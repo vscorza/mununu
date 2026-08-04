@@ -1532,6 +1532,108 @@ pub fn discover_game_env_assumption(
     found
 }
 
+/// Capability B, Phase 2c (FAIRNESS / liveness) — when the RECURRENCE (Büchi) game `GF good` is
+/// UNREALIZABLE, find a LIVENESS environment assumption `GF(in == v)` (the environment input holds `v`
+/// INFINITELY OFTEN) under which the controller wins `GF good` — the GR(1) 1-pair objective
+/// `GF a → GF good`. Distinct from [`discover_game_env_assumption`]'s `InputHold` (a SAFETY hold
+/// `G(a)`): fairness is strictly WEAKER — the environment may violate `a` finitely often.
+///
+/// **Scope (measure-first, honest).** Fairness rescues RESPONSE / handshake shapes ("if the environment
+/// eventually acks, the controller eventually completes"), NOT RATE / accumulation targets: a bounded
+/// buffer's `GF(full)` is NOT fairness-rescuable, because `GF(¬drain)` (drain paused infinitely often)
+/// still lets the environment net-drain (drain 99, pause 1) — the accumulation never completes. So this
+/// correctly returns ∅ on a rate machine (the FIFO) and finds the rescue on a response FSM.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD — [`exact_two_player_gr1_realizable`] decides the
+/// state-fairness GR(1) νμν on the assumption-LATCHED model (a sound encoding of the input-level
+/// `GF a`); the reach-portfolio non-vacuity gate rejects a vacuous rescue (`good` unreachable or
+/// stuck-true). Bounded: narrow env inputs (≤ 3 bits) × values, a pin count cap, and a wall-clock
+/// budget. The report is CONDITIONAL — the caller never lifts it to an unconditional realizable.
+pub fn discover_game_fairness_assumption(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Vec<DiscoveredAssumption> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::concrete_oracle::OracleAtom;
+    use crate::adapter::btor2::symbolic_bitblast::{
+        exact_two_player_buchi_realizable, exact_two_player_gr1_realizable,
+    };
+    const MAX_INPUT_BITS: u32 = 3; // ≤ 8 values — a narrow ack/enable, not a datapath
+    const MAX_CANDIDATE_PINS: usize = 48;
+    let budget_ms: u128 = std::env::var("MUNUNU_ASSUMPTION_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let start = std::time::Instant::now();
+
+    // `good` must be `REG == VALUE` (a state register OR a named combinational output) — the non-vacuity
+    // gate needs the register/output + value.
+    let (register, value) = match parse_predicate_expr(good).ok() {
+        Some(PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        }) => (register, value),
+        _ => return Vec::new(),
+    };
+
+    // Only search when the RECURRENCE game is genuinely UNREALIZABLE (a realizable Büchi game needs no
+    // assumption — the false-positive control). This is also what makes a discovered φ a GENUINE rescue:
+    // any realizable GR(1) under `GF a` (given Büchi is ⊥) truly uses the assumption.
+    match exact_two_player_buchi_realizable(btor2_content, good, controllable) {
+        Ok(false) => {}         // unrealizable → search for an enabling fairness assumption
+        _ => return Vec::new(), // realizable, or `good` not resolvable / over-cap
+    }
+
+    let ctrl_set: std::collections::HashSet<&str> = controllable.iter().copied().collect();
+    let Ok(file) = crate::adapter::btor2::parser::parse(btor2_content) else {
+        return Vec::new();
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    // Candidate assumption axes = the design's NARROW ENVIRONMENT primary inputs.
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for line in &file.lines {
+        if let Node::Input { sort, .. } = &line.node
+            && let Some(name) = symbols.get(&line.nid)
+            && !ctrl_set.contains(name.as_str())
+            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+            && w <= MAX_INPUT_BITS
+        {
+            candidates.push((name.clone(), w));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut found: Vec<DiscoveredAssumption> = Vec::new();
+    let mut tried = 0usize;
+    'outer: for (name, w) in candidates {
+        for c in 0..(1u64 << w) {
+            if tried >= MAX_CANDIDATE_PINS || start.elapsed().as_millis() > budget_ms {
+                break 'outer;
+            }
+            tried += 1;
+            let atom = OracleAtom::new(name.clone(), CmpOp::Eq, c as u128);
+            // SOUNDNESS: GR(1) 1-pair on the assumption-latched model (exact/2-valued sound); the
+            // non-vacuity gate rejects a realizable-but-vacuous rescue (good unreachable or stuck-true).
+            // CONDITIONAL — the caller never lifts it to an unconditional realizable.
+            let realizable =
+                exact_two_player_gr1_realizable(btor2_content, good, &atom, controllable)
+                    == Ok(true);
+            if realizable && good_nonvacuous_under(btor2_content, &register, value) {
+                found.push(DiscoveredAssumption {
+                    phi: format!("GF({name} == {c})"),
+                    kind: AssumptionKind::InputFairness,
+                    non_vacuous: true,
+                    engine: "two-player GR(1) game realizable under env-input fairness".to_string(),
+                });
+            }
+        }
+    }
+    found
+}
+
 /// Capability B, Phase 2c (CONJUNCTIVE) — when NO single environment-input hold makes the game realizable
 /// (the design has MULTIPLE independent adversarial blockers, e.g. the OpenTitan edn/otbn boot handshakes:
 /// the environment can block by withholding the ack OR escalating OR requesting a wipe), find a MINIMAL

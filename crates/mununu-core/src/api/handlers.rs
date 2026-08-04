@@ -910,21 +910,30 @@ pub async fn btor2_game_handler(
         message,
         details: None,
     })?;
-    // STRATEGY + assumption discovery are REACH-only today (the strategy is a reachability attractor, the
-    // assumption search a reach `A ⇒ G`; a fairness GF a → GF good assumption for recurrence is the
-    // follow-up). Strategy is also best-effort: it needs a STATE-register target, so it is `null` for a
+    // STRATEGY extraction is REACH-only (the strategy is a reachability attractor, the wrong shape for
+    // Büchi); it is also best-effort — it needs a STATE-register target, so it is `null` for a
     // combinational-output / relational `good` (a FIFO's `full_o`).
     let strategy = if recurrence {
         None
     } else {
         exact_two_player_strategy(&content, &request.good, &controllable).ok()
     };
-    let holds_under = if request.discover_assumptions && !recurrence {
-        crate::adapter::recoverability::discover_game_env_assumption(
-            &content,
-            &request.good,
-            &controllable,
-        )
+    // Assumption discovery: for `reach` a SAFETY hold / conjunction (`A ⇒ G`); for `recurrence` a
+    // FAIRNESS assumption `GF a → GF good` (the GR(1) 1-pair objective).
+    let holds_under = if request.discover_assumptions {
+        if recurrence {
+            crate::adapter::recoverability::discover_game_fairness_assumption(
+                &content,
+                &request.good,
+                &controllable,
+            )
+        } else {
+            crate::adapter::recoverability::discover_game_env_assumption(
+                &content,
+                &request.good,
+                &controllable,
+            )
+        }
     } else {
         Vec::new()
     };
@@ -4710,6 +4719,9 @@ members = ["x"]
     // Reset-artifact game `st' = rst ? 0 : c`: with `rst` adversarial the env holds reset → unrealizable;
     // `assume_clock_reset` pins the reset inactive → the functional game `st'=c` is realizable.
     const GAME_RESET: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 rst\n4 state 1 st\n5 zero 1\n6 init 1 4 5\n7 ite 1 3 5 2\n8 next 1 4 7\n";
+    // Saturating 1-bit buffer `count' = (c∧¬e) ∨ (count∧¬(e∧¬c))`: recurrence `GF(count==1)` (ctrl=c) is
+    // unrealizable (env pops forever), but realizable under the fairness assumption `GF(e==0)`.
+    const GAME_BUFFER: &str = "1 sort bitvec 1\n2 input 1 c\n3 input 1 e\n4 state 1 count\n5 zero 1\n6 init 1 4 5\n7 not 1 3\n8 and 1 2 7\n9 not 1 2\n10 and 1 3 9\n11 not 1 10\n12 and 1 4 11\n13 or 1 8 12\n14 next 1 4 13\n";
 
     /// `assume_clock_reset` over HTTP: the reset-adversarial game is unrealizable raw, but realizable when
     /// the reset is modeled as a posture (the modeling-artifact fix).
@@ -4826,6 +4838,33 @@ members = ["x"]
         assert!(
             out.strategy.is_none(),
             "recurrence is verdict-only today (no reachability strategy)"
+        );
+    }
+
+    /// `objective: "recurrence"` + `discover_assumptions` over HTTP: the unrealizable buffer recurrence
+    /// game returns a `holds_under` carrying the FAIRNESS assumption `GF(e == 0)` (CONDITIONAL —
+    /// `realizable` stays false).
+    #[tokio::test]
+    async fn btor2_game_handler_discovers_fairness_assumption() {
+        let request = Btor2GameRequest {
+            content: GAME_BUFFER.to_string(),
+            good: "count == 1".to_string(),
+            controllable: vec!["c".to_string()],
+            discover_assumptions: true,
+            objective: crate::api::models::GameObjective::Recurrence,
+            assume_clock_reset: false,
+        };
+        let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
+        assert!(
+            !out.realizable,
+            "recurrence is unrealizable without a fairness assumption"
+        );
+        assert!(
+            out.holds_under.iter().any(|a| a.phi == "GF(e == 0)"
+                && a.kind == crate::verdict::AssumptionKind::InputFairness
+                && a.non_vacuous),
+            "holds_under carries the fairness assumption GF(e==0): {:?}",
+            out.holds_under
         );
     }
 

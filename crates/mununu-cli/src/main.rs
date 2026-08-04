@@ -2798,10 +2798,9 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     } else {
         exact_two_player_reach_realizable(&content, &args.good, &controllable)?
     };
-    // STRATEGY extraction + assumption discovery are REACH-only today: the state-indexed strategy is a
-    // reachability attractor (wrong shape for Büchi), and the assumption search is a reach `A ⇒ G` — a
-    // fairness (GF a → GF good) assumption for recurrence is the follow-up. Also best-effort: the strategy
-    // needs a STATE-register target, so it is omitted for a combinational-output / relational `good`.
+    // STRATEGY extraction is REACH-only: the state-indexed strategy is a reachability attractor (the wrong
+    // shape for Büchi). Also best-effort: it needs a STATE-register target, so it is omitted for a
+    // combinational-output / relational `good`.
     let strategy = if recurrence {
         None
     } else {
@@ -2820,15 +2819,24 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
         summary["strategy"] =
             serde_json::to_value(s).map_err(|e| format!("serialize strategy: {e}"))?;
     }
-    // --discover-assumptions: when the (reach) game is unrealizable, search for an environment assumption
-    // under which the controller wins (CONDITIONAL — never flips `realizable`). No-op when already
-    // realizable or under `--objective recurrence` (fairness discovery is the follow-up).
-    if args.discover_assumptions && !recurrence {
-        let holds_under = mununu_core::adapter::recoverability::discover_game_env_assumption(
-            &content,
-            &args.good,
-            &controllable,
-        );
+    // --discover-assumptions: when the game is unrealizable, search for an environment assumption under
+    // which the controller wins (CONDITIONAL — never flips `realizable`). For `reach` this is a SAFETY
+    // hold / conjunction (`A ⇒ G`); for `recurrence` it is a FAIRNESS assumption `GF a → GF good` (the
+    // GR(1) 1-pair objective). No-op when the game is already realizable.
+    if args.discover_assumptions {
+        let holds_under = if recurrence {
+            mununu_core::adapter::recoverability::discover_game_fairness_assumption(
+                &content,
+                &args.good,
+                &controllable,
+            )
+        } else {
+            mununu_core::adapter::recoverability::discover_game_env_assumption(
+                &content,
+                &args.good,
+                &controllable,
+            )
+        };
         if !holds_under.is_empty() {
             summary["holds_under"] = serde_json::to_value(&holds_under)
                 .map_err(|e| format!("serialize holds_under: {e}"))?;
