@@ -225,6 +225,22 @@ cargo test -p mununu-core --test wall_class_matrix -- --ignored --nocapture
 
 The set is the RTL/synthetic union of the ledger's wall taxonomy (§A.3); its *class coverage* is the invariant, and RTL realism per class grows with the P1.1 harness-lift track. Working notes: `.claude/plans/wall-class-lever-evaluation.md`.
 
+### Benchmark ledger & lever-fit catalog `[RULE]` (added 2026-08-04)
+
+**Rule.** All benchmark/corpus verification work — measuring a design, hunting for RTL a lever fits, evaluating a lever's reach — flows through two private working artifacts, and every such change keeps them current:
+
+1. **The benchmark-property ledger** (`.claude/plans/benchmark-property-ledger.md`, gitignored) is the RTL-native validation record and the source of the §D actionable-⊥ % metric. Every corpus MEASUREMENT lands here as a row:
+   - **Measured-only.** A row is a *measured verdict*, never a merely matched candidate. Un-measured candidates go in the tiered **candidate backlog** with their lift-status named.
+   - **Non-vacuity-gated.** Every property row passes the mandatory non-vacuity gate (both directions of the target reachable — ship the `EF(target != v)` dual); a stuck/vacuous target is excluded.
+   - **RTL-native + reproducible.** Rows are lifted from source (recipe recorded), not hand-authored fixtures. Honest ∅ / ⊥ rows are recorded too — they *bound* a lever's reach (the FIFO-rate and csrng-persistence ∅ rows are as load-bearing as the spiCtrl rescue).
+   - Subject to [Claims Integrity]; license-aware (measured-and-recorded ≠ vendored as a CI fixture).
+
+2. **The lever-fit shape catalog** (`.claude/plans/lever-fit-shape-catalog.md`, gitignored) maps *design shape → lever → measurement recipe* for every shipped lever. A corpus hunt matches designs against it; a NEW lever adds its target shape to it (and, per the [wall-class matrix] rule above, a class representative to `wall_class_matrix.rs`).
+
+**Why.** §D's actionable-⊥ % is the number the verification-core track moves; the catalog makes "which RTL benefits from which lever" mechanical and repeatable. Drift between a measurement and the ledger — or an ad-hoc hunt that ignores the catalog — silently loses the corpus-validation signal. The three artifacts compose: the **catalog** finds candidates → the **ledger** records measured rows (and the lift-status of the rest) → the **wall-class matrix** gates whether a lever earns integration.
+
+**How to comply.** After any corpus measurement or lever hunt: add/update the ledger row(s) (measured + backlog), extend the catalog if a new lever/shape appeared, and — for a lever integration — run the wall-class matrix. The gating bottleneck is usually the **P1.1 harness-lift track** (sound cutpoints, submodule blackboxing, state naming — a constant tie that alters control semantics is *not* a sound abstraction), not lever-fit; a lift-blocked candidate is a **backlog row with its lift-wall named**, not a silent omission.
+
 ## Documentation Traceability
 
 **Rule.** Every documentation page or section that describes a feature, flag, endpoint, file format, syntax form, or behavior must be traceable to a *live* code artifact (Rust `struct` / `enum` / `fn`, clap arg, axum handler, TypeScript client, or a checked-in configuration file) that is reachable from at least one of mununu's three user-facing surfaces — **CLI**, **HTTP API**, or **UI**. Documentation that cannot point at such an artifact is either obsolete, aspirational, or unverifiable, and must be marked or removed.
