@@ -1699,21 +1699,34 @@ fn discover_game_fairness_conjunction(
         return None;
     };
     let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
-    let cone = cone_leaf_nids(&file, std::slice::from_ref(&register));
-    let mut axes: Vec<(String, u32)> = Vec::new();
-    for line in &file.lines {
-        if let Node::Input { sort, .. } = &line.node
-            && cone.contains(&line.nid)
-            && let Some(name) = symbols.get(&line.nid)
-            && !ctrl_set.contains(name.as_str())
-            && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
-            && w <= MAX_INPUT_BITS
-        {
-            axes.push((name.clone(), w));
+    // Candidate axes = narrow NON-controllable primary inputs. Prefer `good`'s cone (bounds the product on
+    // wide-env designs); but `cone_leaf_nids` is a COMBINATIONAL cone, so for an OUTPUT / relational target
+    // it EXCLUDES an env input that only drives the target's state-register's NEXT logic (e.g. an ack that
+    // returns an FSM to its home state — `b2r_ack` for `sdrc_req_gen`'s `req_ack`). When the cone yields
+    // < 2 axes, fall back to ALL narrow non-controllable inputs (the single-`GF` candidate set, which is
+    // cone-free); the width cap still bounds the search.
+    let build_axes = |restrict_to_cone: bool| -> Vec<(String, u32)> {
+        let cone = restrict_to_cone.then(|| cone_leaf_nids(&file, std::slice::from_ref(&register)));
+        let mut axes: Vec<(String, u32)> = Vec::new();
+        for line in &file.lines {
+            if let Node::Input { sort, .. } = &line.node
+                && cone.as_ref().is_none_or(|c| c.contains(&line.nid))
+                && let Some(name) = symbols.get(&line.nid)
+                && !ctrl_set.contains(name.as_str())
+                && let Some(w) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+                && w <= MAX_INPUT_BITS
+            {
+                axes.push((name.clone(), w));
+            }
         }
+        axes.sort();
+        axes.dedup();
+        axes
+    };
+    let mut axes = build_axes(true);
+    if axes.len() < 2 {
+        axes = build_axes(false);
     }
-    axes.sort();
-    axes.dedup();
     let total_bits: u32 = axes.iter().map(|(_, w)| *w).sum();
     if axes.len() < 2 || total_bits > MAX_CONJ_BITS {
         return None; // < 2 axes = not a conjunction; too wide = abstain

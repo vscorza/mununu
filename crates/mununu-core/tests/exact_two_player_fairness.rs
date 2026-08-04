@@ -159,6 +159,53 @@ fn discovery_is_empty_when_recurrence_already_holds() {
     );
 }
 
+// TWOGATE with a STATE-FUNCTION OUTPUT `done_o = (st == 2)` (depends on STATE only, not on the current
+// inputs — unlike an input-gated pulse). The output's combinational cone is just `st`, so the cone-
+// restricted axis search sees NEITHER `e1` nor `e2` (they only drive `st`'s NEXT) → the conjunction
+// discovery must FALL BACK to all narrow env inputs. Exercises `discover_game_fairness_conjunction`'s
+// output-target axis fallback end-to-end.
+const TWOGATE_OUT: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 c
+4 input 1 e1
+5 input 1 e2
+6 state 2 st
+7 zero 2
+8 init 2 6 7
+9 one 2
+10 constd 2 2
+11 not 1 4
+12 and 1 3 11
+13 not 1 5
+14 and 1 3 13
+15 eq 1 6 7
+16 eq 1 6 9
+17 ite 2 12 9 7
+18 ite 2 14 10 9
+19 ite 2 16 18 7
+20 ite 2 15 17 19
+21 next 2 6 20
+22 eq 1 6 10 done_o
+23 output 22 done_o
+";
+
+/// AXIS-FALLBACK regression (a fix for the conjunction discovery on OUTPUT / relational targets): the
+/// combinational cone of `done_o = (st==2)` is just `st`, so the cone-restricted axis search finds
+/// NEITHER gate input (both only drive `st`'s next). The discovery must fall back to all narrow env
+/// inputs and still report `GF(e1==0) && GF(e2==0)`. (`done_o` is a STATE-function output — the game
+/// handles it; contrast a `req & ack`-style INPUT-dependent output, which is not a state predicate.)
+#[test]
+fn discovery_finds_conjunction_on_output_target_via_axis_fallback() {
+    let found = discover_game_fairness_assumption(TWOGATE_OUT, "done_o == 1", &["c"]);
+    assert!(
+        found.iter().any(|a| a.phi.contains("GF(e1 == 0)")
+            && a.phi.contains("GF(e2 == 0)")
+            && a.kind == mununu_core::verdict::AssumptionKind::InputFairnessConjunction),
+        "expected the conjunction via the output-target axis fallback: {found:?}"
+    );
+}
+
 /// SOUNDNESS GATE for the CONJUNCTIVE lever — the multi-pair GR(1) `νZ.μY. ⋁_i νX_i(…)`. On TWOGATE,
 /// two independent env gates each need their own pause, so:
 ///   - the bare recurrence is unrealizable,
