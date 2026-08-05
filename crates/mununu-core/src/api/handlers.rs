@@ -4840,10 +4840,11 @@ members = ["x"]
     }
 
     /// `objective: "recurrence"` over HTTP: the Büchi game on `st'=c` is realizable (the controller keeps
-    /// `st==1` forever), the objective is echoed, and the strategy is omitted (recurrence is verdict-only
-    /// today — the reachability strategy would be the wrong shape).
+    /// `st==1` forever), the objective is echoed, and the CONTROLLER's Büchi strategy is returned (a
+    /// `controller_strategy` over the `st` register — force `good` infinitely often).
     #[tokio::test]
-    async fn btor2_game_handler_recurrence_objective_is_verdict_only() {
+    async fn btor2_game_handler_recurrence_realizable_emits_controller_strategy() {
+        use crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy;
         let request = Btor2GameRequest {
             content: GAME_CTRL.to_string(),
             good: "st == 1".to_string(),
@@ -4855,10 +4856,17 @@ members = ["x"]
         let Json(out) = btor2_game_handler(Json(request)).await.expect("game runs");
         assert!(out.realizable, "st'=c: the controller forces st=1 i.o.");
         assert_eq!(out.objective, crate::api::models::GameObjective::Recurrence);
-        assert!(
-            out.strategy.is_none(),
-            "recurrence is verdict-only today (no reachability strategy)"
-        );
+        match out.strategy {
+            Some(TwoPlayerStrategy::ControllerStrategy(m)) => {
+                assert_eq!(
+                    m.state_register, "st",
+                    "strategy indexed by the state register"
+                );
+            }
+            other => {
+                panic!("realizable recurrence must emit a controller Büchi strategy, got {other:?}")
+            }
+        }
     }
 
     /// `objective: "recurrence"` + `discover_assumptions` over HTTP: the unrealizable buffer recurrence
