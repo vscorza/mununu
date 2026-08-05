@@ -3829,6 +3829,79 @@ pub fn exact_two_player_strategy(
         })
 }
 
+/// P2.5-F (b) — the CONTROLLER's Mealy strategy for a REALIZABLE RECURRENCE (Büchi) game `GF good` — how
+/// the controller forces `good` infinitely often. Returns `Ok(Some(ControllerStrategy))` when the game is
+/// realizable from the initial state, `Ok(None)` when it is unrealizable (the actionable witness is then
+/// the environment starvation lasso, [`exact_two_player_recurrence_stall_lasso`]) or the target register
+/// is absent, and `Err` when `good` is not a resolvable `REG op VALUE` STATE atom (a combinational-output
+/// / relational recurrence target has no state-indexed strategy — the verdict + fairness discovery still
+/// apply), the model can't be built, or a declared `controllable` name is not a primary input.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD — the Büchi winning region `W = νZ. Attr_ctrl(good ∧ CPre_ctrl
+/// Z)` and a memoryless controller strategy that attracts to `R = good ∧ CPre_ctrl W` then re-enters `W`
+/// (positional determinacy of Büchi games). The reach analog is [`exact_two_player_strategy`].
+pub fn exact_two_player_buchi_strategy(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Result<Option<TwoPlayerStrategy>, String> {
+    use crate::adapter::btor2::parser;
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good).ok_or_else(|| {
+        format!(
+            "exact two-player recurrence strategy: `{good}` is not a resolvable `REG op VALUE` state \
+             atom, or the model can't be built (over the exact cap / array / input-atom)"
+        )
+    })?;
+    // Validate the partition: every declared controllable input must be a real primary input (same rule +
+    // rationale as `exact_two_player_strategy` — else it would fall back SILENTLY to the environment).
+    if !controllable.is_empty() {
+        let inputs: std::collections::HashSet<String> = crate::adapter::sts_ir::BtorSts::new(&file)
+            .leaf_cells()
+            .map_err(|e| format!("exact two-player recurrence strategy: {e}"))?
+            .into_iter()
+            .filter(|c| !c.is_state)
+            .map(|c| c.name)
+            .collect();
+        let mut unknown: Vec<&str> = controllable
+            .iter()
+            .copied()
+            .filter(|c| !inputs.contains(*c))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            let mut names: Vec<&str> = inputs.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(format!(
+                "exact two-player recurrence strategy: declared controllable input(s) {unknown:?} are \
+                 not primary inputs of the design (primary inputs: {names:?})"
+            ));
+        }
+    }
+    let resolve = |name: &str| -> String {
+        parser::resolve_to_canonical_name(
+            &file,
+            name,
+            parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
+    };
+    let expr = resolve_predicate_expr_registers(
+        &parse_predicate_atom_bool(good)
+            .map_err(|e| format!("exact two-player recurrence strategy: {e}"))?,
+        &resolve,
+    );
+    let mut regs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_predicate_registers(&expr, &mut regs);
+    let reg = regs.into_iter().next().ok_or_else(|| {
+        format!("exact two-player recurrence strategy: `{good}` references no state register")
+    })?;
+    let ctrl: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    Ok(bb.two_player_buchi_strategy(&file, &good_bdd, &reg, &ctrl))
+}
+
 /// P2.5-F (b) — the ENVIRONMENT STARVATION LASSO for an **unrealizable** RECURRENCE game `GF good`: a
 /// concrete play — `prefix` from reset into a repeating `¬good` `cycle`, with the per-step `inputs` the
 /// environment plays — witnessing that the environment can force `good` to be visited only FINITELY
@@ -4102,6 +4175,12 @@ pub fn gr1_response_formula(assume: &str, guarantee: &str) -> String {
 /// staying in `¬p` (the "stall"). The lasso is that path: a `prefix` from the
 /// initial state to the cycle entry, then the repeating `cycle`. Each state is a
 /// concrete valuation of the state registers.
+/// The ranked reachable states of a strategy extraction: the `(state, rank)` pairs reachable from the
+/// initial state within the winner's region, plus the per-state-register-value minimum rank. Shared
+/// between [`BddBitBlaster::reachable_ranked_states`] (which produces it) and
+/// [`BddBitBlaster::controller_mealy_from_layers`] (which consumes it).
+type RankedStates = (Vec<(BTreeMap<String, u128>, u32)>, BTreeMap<u128, u32>);
+
 #[derive(Debug, Clone)]
 pub struct StallLasso {
     /// States from the initial state up to (excluding) the cycle entry. Empty when
@@ -4680,6 +4759,266 @@ impl BddBitBlaster {
         })
     }
 
+    /// Concrete forward reachability from the initial state, kept to `region`, tagging each reachable
+    /// in-region state with its attractor `rank` (the least `k` with the state in `layers[k]`; `0` for a
+    /// state in no layer — e.g. the environment's ¬winning region under the controller's attractor
+    /// layers). Returns the ranked states plus, per `reg_name` value, its minimum rank (fastest
+    /// progress). The FORWARD walk (not a symbolic pre-image) keeps the free reset from making every
+    /// encoding reachable. Shared by the reachability and Büchi strategy extractors.
+    fn reachable_ranked_states(
+        &self,
+        file: &Btor2File,
+        exact: &ExactModel,
+        region: &BDDFunction,
+        layers: &[BDDFunction],
+        reg_name: &str,
+    ) -> RankedStates {
+        let rank_of = |s: &BTreeMap<String, u128>| -> u32 {
+            let mt = self.state_minterm(s);
+            (0..layers.len())
+                .find(|&k| mt.and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(0) as u32
+        };
+        let init = self.initial_state_bdd(file);
+        let mut frontier: Vec<BTreeMap<String, u128>> = Vec::new();
+        {
+            let mut r = init.clone();
+            for _ in 0..1024 {
+                if r == self.ff {
+                    break;
+                }
+                let s = self.pick_state_assignment(&r);
+                r = r.and(&self.state_minterm(&s).not().unwrap()).unwrap();
+                frontier.push(s);
+            }
+        }
+        let mut visited: std::collections::HashSet<BTreeMap<String, u128>> =
+            std::collections::HashSet::new();
+        let mut reached: Vec<(BTreeMap<String, u128>, u32)> = Vec::new();
+        let mut guard = 0usize;
+        while let Some(s) = frontier.pop() {
+            guard += 1;
+            if guard > 200_000 {
+                break;
+            }
+            if !visited.insert(s.clone()) {
+                continue;
+            }
+            for ns in self.concrete_successors(exact, &s) {
+                if !visited.contains(&ns) {
+                    frontier.push(ns);
+                }
+            }
+            // Only states in the winner's region carry a strategy row.
+            if self.state_minterm(&s).and(region).unwrap() != self.ff {
+                let k = rank_of(&s);
+                reached.push((s, k));
+            }
+        }
+        // Min rank per state-register value (its fastest progress, as in the 1-player extractor).
+        let mut min_rank: BTreeMap<u128, u32> = BTreeMap::new();
+        for (s, k) in &reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            min_rank
+                .entry(v)
+                .and_modify(|r| *r = (*r).min(*k))
+                .or_insert(*k);
+        }
+        (reached, min_rank)
+    }
+
+    /// Build the controller's [`MealyStrategy`] from precomputed attractor `layers`, the ranked reachable
+    /// `reached` states and their per-value `min_rank`. `recur_target`: `None` = rank-0 states are
+    /// terminal (a REACH goal — no move); `Some(w)` = rank-0 states force a move into `w` (a BÜCHI recur
+    /// point — visit `good`, then re-enter the winning region so `good` recurs). At each min-rank control
+    /// value force a rank-decreasing (or, at rank 0 with a recur target, region-re-entering) move:
+    /// env-independent when one exists (Moore fast-path, [`ExactModel::ctrl_forcing_moves`]), else one
+    /// response per environment input ([`ExactModel::move_into`] — a genuinely reactive controller, since
+    /// the controller is the `∀env ∃ctrl` responder).
+    fn controller_mealy_from_layers(
+        &self,
+        exact: &ExactModel,
+        reg_name: &str,
+        controllable: &std::collections::HashSet<String>,
+        layers: &[BDDFunction],
+        recur_target: Option<&BDDFunction>,
+        ranked: &RankedStates,
+    ) -> MealyStrategy {
+        let (reached, min_rank) = ranked;
+        const MAX_REACTIVE_MOVES: usize = 256;
+        let is_ctrl = |c: &&Cell| -> bool { !c.is_state && controllable.contains(&c.symbol) };
+        let is_env = |c: &&Cell| -> bool { !c.is_state && !controllable.contains(&c.symbol) };
+        // Per value: the union of its min-rank state minterms + that value's (uniform) rank.
+        let mut states_by_val: BTreeMap<u128, (BDDFunction, u32)> = BTreeMap::new();
+        for (s, k) in reached {
+            let v = *s.get(reg_name).unwrap_or(&0);
+            if *k != min_rank[&v] {
+                continue;
+            }
+            let mt = self.state_minterm(s);
+            states_by_val
+                .entry(v)
+                .and_modify(|(acc, _)| *acc = acc.or(&mt).unwrap())
+                .or_insert((mt, *k));
+        }
+        let mut entries: Vec<MealyEntry> = Vec::new();
+        for (&v, (mt, rank)) in &states_by_val {
+            // The set the forced move must land in: the next-lower attractor layer (rank ≥ 1), or — at a
+            // rank-0 state with a recur target — the winning region itself (Büchi recur). A rank-0 reach
+            // goal (no recur target) needs no move.
+            let target = if *rank == 0 {
+                match recur_target {
+                    None => {
+                        entries.push(MealyEntry {
+                            state_value: v,
+                            rank: 0,
+                            moves: Vec::new(),
+                            complete: true,
+                        });
+                        continue;
+                    }
+                    Some(w) => w,
+                }
+            } else {
+                &layers[(*rank - 1) as usize]
+            };
+            // Moore fast-path: a single controllable move robust to every environment input.
+            let moore = mt.and(&exact.ctrl_forcing_moves(target)).unwrap();
+            if moore != self.ff {
+                let mut forced_ctrl = BTreeMap::new();
+                for cell in self.cells.iter().filter(is_ctrl) {
+                    if let Some(val) = self.forced_cell_value(&moore, cell) {
+                        forced_ctrl.insert(cell.symbol.clone(), val);
+                    }
+                }
+                entries.push(MealyEntry {
+                    state_value: v,
+                    rank: *rank,
+                    moves: vec![MealyMove {
+                        env_inputs: BTreeMap::new(),
+                        forced_ctrl,
+                    }],
+                    complete: true,
+                });
+                continue;
+            }
+            // Reactive: enumerate one controllable response per environment-input valuation. The state is
+            // in the attractor, so `∀env ∃ctrl` — every environment column has a response.
+            let mut rem = mt.and(&exact.move_into(target)).unwrap();
+            let mut moves: Vec<MealyMove> = Vec::new();
+            for _ in 0..MAX_REACTIVE_MOVES {
+                if rem == self.ff {
+                    break;
+                }
+                let full = self.pick_full_assignment(&rem);
+                let mut env_inputs = BTreeMap::new();
+                let mut env_mt = self.tt.clone();
+                for cell in self.cells.iter().filter(is_env) {
+                    let val = *full.get(&cell.symbol).unwrap_or(&0);
+                    env_inputs.insert(cell.symbol.clone(), val);
+                    for (b, var) in cell.vars.iter().enumerate() {
+                        let lit = if (val >> b) & 1 == 1 {
+                            var.clone()
+                        } else {
+                            var.not().unwrap()
+                        };
+                        env_mt = env_mt.and(&lit).unwrap();
+                    }
+                }
+                let mut forced_ctrl = BTreeMap::new();
+                for cell in self.cells.iter().filter(is_ctrl) {
+                    forced_ctrl.insert(cell.symbol.clone(), *full.get(&cell.symbol).unwrap_or(&0));
+                }
+                moves.push(MealyMove {
+                    env_inputs,
+                    forced_ctrl,
+                });
+                rem = rem.and(&env_mt.not().unwrap()).unwrap();
+            }
+            entries.push(MealyEntry {
+                state_value: v,
+                rank: *rank,
+                moves,
+                complete: rem == self.ff, // false = the reactive fan-out hit the bound (no silent cap)
+            });
+        }
+        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
+        MealyStrategy {
+            state_register: reg_name.to_string(),
+            entries,
+        }
+    }
+
+    /// P2.5-F (b) — the CONTROLLER's Mealy strategy for a REALIZABLE recurrence (Büchi) game `GF good`
+    /// (force `good` infinitely often). `None` when the game is unrealizable (the initial state is not in
+    /// the Büchi winning region — the actionable witness is then the environment starvation lasso, see
+    /// [`exact_two_player_recurrence_stall_lasso`]) or `reg_name` is not a state register.
+    ///
+    /// **Engine (§16):** `exact-symbolic` ROBDD. The Büchi winning region is `W = νZ. Attr_ctrl(good ∧
+    /// CPre_ctrl Z)` (Emerson–Lei); the memoryless controller strategy attracts to the recur set `R =
+    /// good ∧ CPre_ctrl W` and, from `R`, re-enters `W`, so `R ⊆ good` is visited infinitely often
+    /// (positional determinacy of Büchi games). Reuses [`Self::controller_mealy_from_layers`] with the
+    /// attractor layers to `R` and a recur target of `W`.
+    fn two_player_buchi_strategy(
+        &self,
+        file: &Btor2File,
+        good: &BDDFunction,
+        reg_name: &str,
+        controllable: &std::collections::HashSet<String>,
+    ) -> Option<TwoPlayerStrategy> {
+        if !self
+            .cells
+            .iter()
+            .any(|c| c.is_state && c.symbol == reg_name)
+        {
+            return None;
+        }
+        let exact = self.exact_model_partitioned(controllable);
+        // Büchi winning region W = νZ. Attr_ctrl(good ∧ CPre_ctrl Z): start at ⊤ and shrink.
+        let mut w = self.tt.clone();
+        loop {
+            let recur = good.and(&exact.cpre_controllable(&w)).unwrap();
+            let mut attr = recur;
+            loop {
+                let next = attr.or(&exact.cpre_controllable(&attr)).unwrap();
+                if next == attr {
+                    break;
+                }
+                attr = next;
+            }
+            if attr == w {
+                break;
+            }
+            w = attr;
+        }
+        let init = self.initial_state_bdd(file);
+        if init.and(&w).unwrap() == self.ff {
+            return None; // unrealizable Büchi → the env starvation lasso is the witness, not a strategy
+        }
+        // Attractor layers to the recur set R = good ∧ CPre_ctrl W (L_0 = R, …, L_last = W).
+        let recur = good.and(&exact.cpre_controllable(&w)).unwrap();
+        let mut layers = vec![recur];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.cpre_controllable(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let ranked = self.reachable_ranked_states(file, &exact, &w, &layers, reg_name);
+        Some(TwoPlayerStrategy::ControllerStrategy(
+            self.controller_mealy_from_layers(
+                &exact,
+                reg_name,
+                controllable,
+                &layers,
+                Some(&w),
+                &ranked,
+            ),
+        ))
+    }
+
     /// P2.5-F — synthesize the two-player strategy for the controllable-reachability game to `good`, with
     /// `controllable` the controller's input names. Solves the attractor `μX. good ∨ CPre_ctrl(X)`; the
     /// controller wins iff `init ⊆ attractor`. Returns the WINNER's strategy, and the Mealy/positional
@@ -4733,169 +5072,30 @@ impl BddBitBlaster {
         } else {
             winning.not().unwrap()
         };
-        // rank(s): the attractor layer for the controller; 0 everywhere for the environment (safety game).
-        let rank_of = |s: &BTreeMap<String, u128>| -> u32 {
-            if !realizable {
-                return 0;
-            }
-            let mt = self.state_minterm(s);
-            (0..layers.len())
-                .find(|&k| mt.and(&layers[k]).unwrap() != self.ff)
-                .unwrap_or(0) as u32
-        };
-        // Concrete forward reachability from init (under all inputs), kept to the winner's region — so the
-        // free reset does not make every encoding "winning", exactly as the 1-player extractor does.
-        let mut frontier: Vec<BTreeMap<String, u128>> = Vec::new();
-        {
-            let mut r = init.clone();
-            for _ in 0..1024 {
-                if r == self.ff {
-                    break;
-                }
-                let s = self.pick_state_assignment(&r);
-                r = r.and(&self.state_minterm(&s).not().unwrap()).unwrap();
-                frontier.push(s);
-            }
-        }
-        let mut visited: std::collections::HashSet<BTreeMap<String, u128>> =
-            std::collections::HashSet::new();
-        let mut reached: Vec<(BTreeMap<String, u128>, u32)> = Vec::new();
-        let mut guard = 0usize;
-        while let Some(s) = frontier.pop() {
-            guard += 1;
-            if guard > 200_000 {
-                break;
-            }
-            if !visited.insert(s.clone()) {
-                continue;
-            }
-            for ns in self.concrete_successors(&exact, &s) {
-                if !visited.contains(&ns) {
-                    frontier.push(ns);
-                }
-            }
-            // Only states in the winner's region carry a strategy row.
-            if self.state_minterm(&s).and(&region).unwrap() != self.ff {
-                let k = rank_of(&s);
-                reached.push((s, k));
-            }
-        }
-        // Min rank per state-register value (its fastest progress, as in the 1-player extractor).
-        let mut min_rank: BTreeMap<u128, u32> = BTreeMap::new();
-        for (s, k) in &reached {
-            let v = *s.get(reg_name).unwrap_or(&0);
-            min_rank
-                .entry(v)
-                .and_modify(|r| *r = (*r).min(*k))
-                .or_insert(*k);
-        }
-        let is_ctrl = |c: &&Cell| -> bool { !c.is_state && controllable.contains(&c.symbol) };
+        let ranked = self.reachable_ranked_states(file, &exact, &region, &layers, reg_name);
         let is_env = |c: &&Cell| -> bool { !c.is_state && !controllable.contains(&c.symbol) };
         if realizable {
-            // CONTROLLER (Mealy: the environment moves, the controller responds — `cpre_controllable` is
-            // `∀env ∃ctrl`). At each min-rank control value force a rank-decreasing move into the next-lower
-            // layer: env-independent when one exists (the Moore fast-path), else one response per
-            // environment input (a genuinely reactive controller — the responder cannot be positional).
-            const MAX_REACTIVE_MOVES: usize = 256;
-            // Per value: the union of its min-rank state minterms + that value's (uniform) rank.
-            let mut states_by_val: BTreeMap<u128, (BDDFunction, u32)> = BTreeMap::new();
-            for (s, k) in &reached {
-                let v = *s.get(reg_name).unwrap_or(&0);
-                if *k != min_rank[&v] {
-                    continue;
-                }
-                let mt = self.state_minterm(s);
-                states_by_val
-                    .entry(v)
-                    .and_modify(|(acc, _)| *acc = acc.or(&mt).unwrap())
-                    .or_insert((mt, *k));
-            }
-            let mut entries: Vec<MealyEntry> = Vec::new();
-            for (&v, (mt, rank)) in &states_by_val {
-                if *rank == 0 {
-                    // already at `good` — no move needed.
-                    entries.push(MealyEntry {
-                        state_value: v,
-                        rank: 0,
-                        moves: Vec::new(),
-                        complete: true,
-                    });
-                    continue;
-                }
-                let lower = &layers[(*rank - 1) as usize];
-                // Moore fast-path: a single controllable move robust to every environment input.
-                let moore = mt.and(&exact.ctrl_forcing_moves(lower)).unwrap();
-                if moore != self.ff {
-                    let mut forced_ctrl = BTreeMap::new();
-                    for cell in self.cells.iter().filter(is_ctrl) {
-                        if let Some(val) = self.forced_cell_value(&moore, cell) {
-                            forced_ctrl.insert(cell.symbol.clone(), val);
-                        }
-                    }
-                    entries.push(MealyEntry {
-                        state_value: v,
-                        rank: *rank,
-                        moves: vec![MealyMove {
-                            env_inputs: BTreeMap::new(),
-                            forced_ctrl,
-                        }],
-                        complete: true,
-                    });
-                    continue;
-                }
-                // Reactive: enumerate one controllable response per environment-input valuation. The state
-                // is in the attractor, so `∀env ∃ctrl` — every environment column has a response.
-                let mut rem = mt.and(&exact.move_into(lower)).unwrap();
-                let mut moves: Vec<MealyMove> = Vec::new();
-                for _ in 0..MAX_REACTIVE_MOVES {
-                    if rem == self.ff {
-                        break;
-                    }
-                    let full = self.pick_full_assignment(&rem);
-                    let mut env_inputs = BTreeMap::new();
-                    let mut env_mt = self.tt.clone();
-                    for cell in self.cells.iter().filter(is_env) {
-                        let val = *full.get(&cell.symbol).unwrap_or(&0);
-                        env_inputs.insert(cell.symbol.clone(), val);
-                        for (b, var) in cell.vars.iter().enumerate() {
-                            let lit = if (val >> b) & 1 == 1 {
-                                var.clone()
-                            } else {
-                                var.not().unwrap()
-                            };
-                            env_mt = env_mt.and(&lit).unwrap();
-                        }
-                    }
-                    let mut forced_ctrl = BTreeMap::new();
-                    for cell in self.cells.iter().filter(is_ctrl) {
-                        forced_ctrl
-                            .insert(cell.symbol.clone(), *full.get(&cell.symbol).unwrap_or(&0));
-                    }
-                    moves.push(MealyMove {
-                        env_inputs,
-                        forced_ctrl,
-                    });
-                    rem = rem.and(&env_mt.not().unwrap()).unwrap();
-                }
-                entries.push(MealyEntry {
-                    state_value: v,
-                    rank: *rank,
-                    moves,
-                    complete: rem == self.ff, // false = the reactive fan-out hit the bound (no silent cap)
-                });
-            }
-            entries.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.state_value.cmp(&b.state_value)));
-            Some(TwoPlayerStrategy::ControllerStrategy(MealyStrategy {
-                state_register: reg_name.to_string(),
-                entries,
-            }))
+            // CONTROLLER (Mealy): a rank-decreasing forced move at each reachable winning state; the
+            // rank-0 (`good`) states are terminal (`recur_target = None` — a REACH goal, not a Büchi
+            // recur). `cpre_controllable = ∀env ∃ctrl`, so the responder may be reactive.
+            Some(TwoPlayerStrategy::ControllerStrategy(
+                self.controller_mealy_from_layers(
+                    &exact,
+                    reg_name,
+                    controllable,
+                    &layers,
+                    None,
+                    &ranked,
+                ),
+            ))
         } else {
             // ENVIRONMENT counterstrategy — positional (the environment is the first-mover). At each
             // reachable state outside the attractor force env inputs keeping the play out of it
             // (`env_forcing_moves`, robust to every controllable move). The `∀ctrl` is the correct dual of
             // `cpre_controllable`'s `∀env ∃ctrl`, so this exists iff the controller has no strategy.
+            let (reached, min_rank) = &ranked;
             let mut moves_by_val: BTreeMap<u128, BDDFunction> = BTreeMap::new();
-            for (s, k) in &reached {
+            for (s, k) in reached {
                 let v = *s.get(reg_name).unwrap_or(&0);
                 if *k != min_rank[&v] {
                     continue;
