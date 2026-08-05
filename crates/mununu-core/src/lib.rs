@@ -3,6 +3,20 @@
 //! Mununu core library — formal verification for reactive systems
 //! modeled as Compositional Labeled Transition Systems (CLTS).
 
+// The exact-symbolic BDD engine catches OxiDD OutOfMemory via std::panic::catch_unwind
+// (see adapter/btor2/symbolic_bitblast.rs) and abstains to the rest of the portfolio when a
+// cone is too wide to bit-blast. A `panic = "abort"` build silently defeats that backstop:
+// abort() fires before catch_unwind can intercept, turning a sound abstain into a process
+// SIGABRT on wide cones (release-only, since dev/test default to unwind). Enforce unwind at
+// compile time so the release profile can never regress this. (`cfg(panic = ...)` is stable
+// since Rust 1.60; inert under the unwind default.)
+#[cfg(panic = "abort")]
+compile_error!(
+    "mununu-core requires panic = \"unwind\" (see [profile.release] in the workspace Cargo.toml): \
+     the exact-symbolic engine relies on catch_unwind to abstain on BDD OutOfMemory; \
+     panic = \"abort\" turns that abstain into a SIGABRT."
+);
+
 pub mod abstraction;
 pub mod adapter;
 pub mod clts;

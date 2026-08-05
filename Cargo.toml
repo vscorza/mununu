@@ -61,7 +61,13 @@ required-features = ["cli"]
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# MUST be "unwind" (NOT "abort"): the exact-symbolic BDD engine catches OxiDD
+# OutOfMemory on a too-wide cone via std::panic::catch_unwind and abstains to the
+# rest of the portfolio (see crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs).
+# `panic = "abort"` calls abort() before catch_unwind can intercept, turning that
+# sound abstain into a process SIGABRT (exit 134) in release only. A compile_error!
+# guard in mununu-core's crate root enforces this.
+panic = "unwind"
 
 [profile.dev]
 debug = true
