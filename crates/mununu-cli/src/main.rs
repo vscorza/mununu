@@ -2777,7 +2777,8 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::{
         exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
-        exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_recurrence_stall_lasso, exact_two_player_strategy,
+        game_sound_posture_model,
     };
 
     let raw = std::fs::read_to_string(&args.file)
@@ -2818,6 +2819,19 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     if let Some(s) = &strategy {
         summary["strategy"] =
             serde_json::to_value(s).map_err(|e| format!("serialize strategy: {e}"))?;
+    }
+    // ENVIRONMENT STARVATION LASSO — the actionable witness for an unrealizable RECURRENCE game: a
+    // concrete play (reset → `¬good` cycle, with the env's per-step inputs) proving the environment can
+    // starve `good` forever. REACH failures already carry the env positional counterstrategy (in
+    // `strategy`); this is the Büchi analog. Best-effort — omitted when there is no simple reachable
+    // force-`¬good`-forever region (a subtler co-Büchi); the `realizable=false` verdict still stands.
+    if recurrence
+        && !realizable
+        && let Some(lasso) =
+            exact_two_player_recurrence_stall_lasso(&content, &args.good, &controllable)?
+    {
+        summary["stall_lasso"] = serde_json::to_value(lasso.to_view())
+            .map_err(|e| format!("serialize stall_lasso: {e}"))?;
     }
     // --discover-assumptions: when the game is unrealizable, search for an environment assumption under
     // which the controller wins (CONDITIONAL — never flips `realizable`). For `reach` this is a SAFETY

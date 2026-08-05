@@ -3829,6 +3829,70 @@ pub fn exact_two_player_strategy(
         })
 }
 
+/// P2.5-F (b) — the ENVIRONMENT STARVATION LASSO for an **unrealizable** RECURRENCE game `GF good`: a
+/// concrete play — `prefix` from reset into a repeating `¬good` `cycle`, with the per-step `inputs` the
+/// environment plays — witnessing that the environment can force `good` to be visited only FINITELY
+/// often, so `GF good` fails and no controller realizes the Büchi objective. This is the actionable
+/// counterpart of the `unrealizable` recurrence verdict ("here is the trace where withholding the ack
+/// starves `good` forever"): it is Verilator-replayable (drive `inputs`, observe `good` false on the
+/// cycle) and is a **sound proof of unrealizability** on its own — a returned lasso means the game is
+/// unrealizable.
+///
+/// **Witness region:** `stall_env = νZ. (¬good ∧ CPre_env Z)` — the states from which the environment
+/// can keep `¬good` FOREVER against every controller move — reached from the initial state under
+/// env-forcing (`μY. (stall_env ∨ CPre_env Y)`). Returns `None` when the game is realizable, when the
+/// env cannot force a reachable `¬good`-forever region (`stall_env` unreachable), or when
+/// unrealizability is a subtler co-Büchi with no such region (the full env co-Büchi strategy is a
+/// follow-up). So a `Some` lasso is the common "the FSM is parked in a `¬good` wait state" case; a
+/// `None` does not by itself certify realizability — read `exact_two_player_buchi_realizable` for that.
+///
+/// **Engine (§16):** `exact-symbolic` ROBDD over the input-partitioned model
+/// ([`BddBitBlaster::exact_model_partitioned`]): `stall_env` and the reach layers are `cpre_environment`
+/// greatest/least fixpoints; the concrete lasso is walked from the initial state, each step picking a
+/// `(ctrl, env)` pair whose successor stays in the target layer (the env's forcing response to the
+/// walked controller move), reusing [`BddBitBlaster::walk_stall_cycle`]. Same partition validation as
+/// [`exact_two_player_strategy`] — a `controllable` name that is not a primary input is rejected.
+pub fn exact_two_player_recurrence_stall_lasso(
+    btor2_content: &str,
+    good: &str,
+    controllable: &[&str],
+) -> Result<Option<StallLasso>, String> {
+    let (bb, file, good_bdd) = build_atom_model(btor2_content, good).ok_or_else(|| {
+        format!(
+            "exact recurrence stall lasso: `{good}` is not a resolvable `REG op VALUE` state atom, or \
+             the model can't be built (over the exact cap / array / input-atom)"
+        )
+    })?;
+    // Validate the partition: every declared controllable input must be a real primary input, else it
+    // would fall back SILENTLY to the environment (the same rule + rationale as `exact_two_player_verdict`).
+    if !controllable.is_empty() {
+        let inputs: std::collections::HashSet<String> = crate::adapter::sts_ir::BtorSts::new(&file)
+            .leaf_cells()
+            .map_err(|e| format!("exact recurrence stall lasso: {e}"))?
+            .into_iter()
+            .filter(|c| !c.is_state)
+            .map(|c| c.name)
+            .collect();
+        let mut unknown: Vec<&str> = controllable
+            .iter()
+            .copied()
+            .filter(|c| !inputs.contains(*c))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            let mut names: Vec<&str> = inputs.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(format!(
+                "exact recurrence stall lasso: declared controllable input(s) {unknown:?} are not \
+                 primary inputs of the design (primary inputs: {names:?})"
+            ));
+        }
+    }
+    let ctrl: std::collections::HashSet<String> =
+        controllable.iter().map(|s| s.to_string()).collect();
+    Ok(bb.two_player_recurrence_stall_lasso(&file, &good_bdd, &ctrl))
+}
+
 /// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
 /// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
 /// - bare `AF p` = `μX. (p ∨ [] X)`,
@@ -4062,6 +4126,53 @@ impl PartialEq for StallLasso {
     }
 }
 impl Eq for StallLasso {}
+
+/// One register's concrete value in a [`StallLassoView`] state (serialized `{register, value}`,
+/// matching the API `CexCellView`). Values fit in `u64` under the exact bit-blast cap.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LassoCell {
+    pub register: String,
+    pub value: u64,
+}
+
+/// The serde-able surface form of a [`StallLasso`] — reset → `prefix` → repeating `cycle`, plus the
+/// per-transition `inputs` (the env-forcing move at each step), each state/input an ordered
+/// `{register, value}` list. Shared by the CLI `btor2 game` JSON and the API `Btor2GameResponse`
+/// so the two surfaces cannot drift. `inputs[i]` drives the transition out of concatenated-path
+/// state `i`; it is the ACTIONABLE signal for an environment-starvation witness ("the env holds
+/// `ack = 0` forever").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StallLassoView {
+    pub prefix: Vec<Vec<LassoCell>>,
+    pub cycle: Vec<Vec<LassoCell>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<Vec<LassoCell>>,
+}
+
+impl StallLasso {
+    /// Convert to the serde surface form ([`StallLassoView`]); `u128` register/input values are
+    /// narrowed to `u64` (they fit under the exact engine's bit-blast cap), as the recoverability
+    /// counterexample surface already does.
+    pub fn to_view(&self) -> StallLassoView {
+        let states = |rows: &[BTreeMap<String, u128>]| -> Vec<Vec<LassoCell>> {
+            rows.iter()
+                .map(|st| {
+                    st.iter()
+                        .map(|(register, value)| LassoCell {
+                            register: register.clone(),
+                            value: *value as u64,
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        StallLassoView {
+            prefix: states(&self.prefix),
+            cycle: states(&self.cycle),
+            inputs: states(&self.inputs),
+        }
+    }
+}
 
 impl BddBitBlaster {
     /// D1.8 — extract a [`StallLasso`] witnessing that `AF p` is **Violated** from the
@@ -4434,6 +4545,138 @@ impl BddBitBlaster {
         Some(PositionalStrategy {
             state_register: reg_name.to_string(),
             entries,
+        })
+    }
+
+    /// P2.5-F (b) — the ENVIRONMENT STARVATION LASSO for an unrealizable RECURRENCE game `GF good` (see
+    /// [`exact_two_player_recurrence_stall_lasso`] for the contract). Mirrors [`Self::exact_reachable_stall_lasso`]
+    /// but on the input-partitioned model with `cpre_environment` in place of `diamond_pre`: the stall is
+    /// `stall_env = νZ. (¬good ∧ CPre_env Z)` (env forces `¬good` forever), reached under env-forcing.
+    /// Returns `None` when the env cannot force a reachable `¬good`-forever region (realizable, or a
+    /// subtler co-Büchi). Each concrete step (descent and cycle) plays the environment's `∀ctrl`-robust
+    /// move ([`ExactModel::env_forcing_moves`]) with an arbitrary controller response, so the recorded
+    /// `inputs` are the FAITHFUL "env forces `¬good` no matter what the controller does" trace — the ack
+    /// the environment withholds — not a lazy coincidence, and `¬good` holds on the whole cycle.
+    fn two_player_recurrence_stall_lasso(
+        &self,
+        file: &Btor2File,
+        good: &BDDFunction,
+        controllable: &std::collections::HashSet<String>,
+    ) -> Option<StallLasso> {
+        let exact = self.exact_model_partitioned(controllable);
+        // stall_env = νZ. (¬good ∧ CPre_env Z): the env forces ¬good forever (∀ctrl ∃env), so `good` is
+        // never visited again once here — the co-Büchi core.
+        let not_good = good.not().unwrap();
+        let mut stall = self.tt.clone();
+        loop {
+            let next = not_good.and(&exact.cpre_environment(&stall)).unwrap();
+            if next == stall {
+                break;
+            }
+            stall = next;
+        }
+        if stall == self.ff {
+            return None; // the env can force ¬good-forever nowhere → no simple starvation witness.
+        }
+        // Reach layers under env-forcing: L_0 = stall_env, L_k = L_{k-1} ∨ CPre_env(L_{k-1}).
+        let mut layers = vec![stall.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.cpre_environment(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(layers.last().unwrap()).unwrap();
+        if bad == self.ff {
+            return None; // the env cannot force the play into the stall from reset.
+        }
+        // One env-forcing concrete step from `s`: pick the env's `∀ctrl`-robust move into `target`
+        // (`env_forcing_moves`), intersected with `to_next(target)` so the chosen `(ctrl, env)` actually
+        // lands in `target` (constraint-respecting), then step via `eval_step`. Non-empty whenever
+        // `s ∈ CPre_env(target)`. Returns `(input, next_state)`.
+        let env_step = |s: &BTreeMap<String, u128>,
+                        target: &BDDFunction|
+         -> Option<(BTreeMap<String, u128>, BTreeMap<String, u128>)> {
+            let moves = self
+                .state_minterm(s)
+                .and(&exact.env_forcing_moves(target))
+                .unwrap()
+                .and(&exact.to_next(target))
+                .unwrap();
+            if moves == self.ff {
+                return None;
+            }
+            let full = self.pick_full_assignment(&moves);
+            let input = self.input_assignment(&full);
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            Some((input, ns))
+        };
+        // Reach phase: descend one env-forcing layer per concrete step, recording the reset→stall prefix.
+        let mut s = self.pick_state_assignment(&bad);
+        let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if self.state_minterm(&s).and(&stall).unwrap() != self.ff {
+                break; // reached the stall
+            }
+            prefix.push(s.clone());
+            // s ∈ L_k \ L_{k-1} (k minimal) ⇒ s ∈ CPre_env(L_{k-1}): the env can force a successor there.
+            let k = (1..layers.len())
+                .find(|&k| self.state_minterm(&s).and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(1);
+            match env_step(&s, &layers[k - 1]) {
+                Some((inp, ns)) => {
+                    inputs.push(inp);
+                    s = ns;
+                }
+                None => {
+                    return Some(StallLasso {
+                        prefix,
+                        cycle: Vec::new(),
+                        inputs,
+                    });
+                }
+            }
+        }
+        // Cycle phase: stay in the stall under env-forcing until a state repeats — the ¬good cycle.
+        let mut cyc: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if let Some(j) = cyc.iter().position(|prev| *prev == s) {
+                let cycle = cyc.split_off(j);
+                prefix.extend(cyc); // pre-cycle stall states → prefix
+                return Some(StallLasso {
+                    prefix,
+                    cycle,
+                    inputs,
+                });
+            }
+            cyc.push(s.clone());
+            match env_step(&s, &stall) {
+                Some((inp, ns)) => {
+                    inputs.push(inp);
+                    s = ns;
+                }
+                None => {
+                    prefix.extend(cyc);
+                    return Some(StallLasso {
+                        prefix,
+                        cycle: Vec::new(),
+                        inputs,
+                    });
+                }
+            }
+        }
+        prefix.extend(cyc);
+        Some(StallLasso {
+            prefix,
+            cycle: Vec::new(),
+            inputs,
         })
     }
 

@@ -886,7 +886,8 @@ pub async fn btor2_game_handler(
 ) -> ApiResult<Json<Btor2GameResponse>> {
     use crate::adapter::btor2::symbolic_bitblast::{
         exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
-        exact_two_player_strategy, game_sound_posture_model,
+        exact_two_player_recurrence_stall_lasso, exact_two_player_strategy,
+        game_sound_posture_model,
     };
     use crate::api::models::GameObjective;
 
@@ -937,6 +938,17 @@ pub async fn btor2_game_handler(
     } else {
         Vec::new()
     };
+    // ENVIRONMENT STARVATION LASSO — the actionable witness for an unrealizable RECURRENCE game (the
+    // Büchi analog of the reach counterstrategy). Best-effort; `null` when there is no simple reachable
+    // force-`¬good`-forever region. A malformed model here would already have failed the verdict above.
+    let stall_lasso = if recurrence && !realizable {
+        exact_two_player_recurrence_stall_lasso(&content, &request.good, &controllable)
+            .ok()
+            .flatten()
+            .map(|l| l.to_view())
+    } else {
+        None
+    };
 
     Ok(Json(Btor2GameResponse {
         realizable,
@@ -945,6 +957,7 @@ pub async fn btor2_game_handler(
         controllable: request.controllable,
         holds_under,
         strategy,
+        stall_lasso,
     }))
 }
 
