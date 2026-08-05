@@ -1154,6 +1154,14 @@ pub struct Btor2GameResponse {
     /// `full_o`), where `realizable` + `holds_under` still apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy>,
+    /// P2.5-F (b) — the ENVIRONMENT STARVATION LASSO for an unrealizable RECURRENCE game: a concrete
+    /// play (reset → repeating `¬good` `cycle`, with the env's per-step `inputs`) proving the environment
+    /// can starve `good` forever — the actionable Büchi counterpart of `realizable = false`. Present only
+    /// for `objective = "recurrence"` when unrealizable AND a simple reachable force-`¬good`-forever
+    /// region exists; `null` for realizable games, the `reach` objective (whose witness is `strategy`),
+    /// or a subtler co-Büchi with no such region.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_lasso: Option<crate::adapter::btor2::symbolic_bitblast::StallLassoView>,
 }
 
 /// The SV → BTOR2 lift inputs shared by the SV-direct verb endpoints

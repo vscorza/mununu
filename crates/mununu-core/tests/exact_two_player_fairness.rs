@@ -18,7 +18,7 @@ use mununu_core::adapter::btor2::concrete_oracle::OracleAtom;
 use mununu_core::adapter::btor2::predicate_expr::CmpOp;
 use mununu_core::adapter::btor2::symbolic_bitblast::{
     exact_two_player_buchi_realizable, exact_two_player_gr1_conjunction_realizable,
-    exact_two_player_gr1_realizable,
+    exact_two_player_gr1_realizable, exact_two_player_recurrence_stall_lasso,
 };
 use mununu_core::adapter::recoverability::discover_game_fairness_assumption;
 
@@ -281,5 +281,71 @@ fn conjunction_reduces_to_single_and_buchi() {
     assert_eq!(
         exact_two_player_gr1_conjunction_realizable(BUFFER, "count == 1", &[], &["c"]),
         exact_two_player_buchi_realizable(BUFFER, "count == 1", &["c"]),
+    );
+}
+
+// ============================================================================================
+// P2.5-F (b): the ENVIRONMENT STARVATION LASSO — the actionable witness for an unrealizable
+// RECURRENCE game. `exact_two_player_recurrence_stall_lasso` returns a concrete play (reset →
+// `¬good` cycle, with the env's per-step inputs) proving the env can starve `good` forever.
+// ============================================================================================
+
+/// On the UNREALIZABLE buffer recurrence `GF(count==1)` the env starves `count` at 0 forever by
+/// popping (`e == 1`). The lasso must be present, the cycle must never satisfy `good` (`count != 1`
+/// on every cycle state), and the env's forcing input on the cycle is uniquely `e == 1` — from
+/// `count == 0`, `∀c count' = c ∧ ¬e`, so `count' == 0 ∀c` requires `e == 1` (the `env_forcing_moves`).
+#[test]
+fn recurrence_stall_lasso_witnesses_the_pop_starvation() {
+    let lasso = exact_two_player_recurrence_stall_lasso(BUFFER, "count == 1", &["c"])
+        .expect("engine call")
+        .expect("unrealizable recurrence has an env starvation lasso");
+    assert!(
+        !lasso.cycle.is_empty(),
+        "the starvation witness must have a non-empty ¬good cycle"
+    );
+    // `good = (count == 1)` is FALSE on every cycle state — the env prevents recurrence.
+    assert!(
+        lasso.cycle.iter().all(|st| st.get("count") != Some(&1)),
+        "good (count==1) must never hold on the stall cycle, got {:?}",
+        lasso.cycle
+    );
+    // The env's ∀ctrl-robust move to keep `count == 0` is `e == 1` (pop) — recorded on every step.
+    assert!(
+        !lasso.inputs.is_empty(),
+        "the lasso must record the env's forcing inputs"
+    );
+    assert!(
+        lasso.inputs.iter().all(|inp| inp.get("e") == Some(&1)),
+        "the env starves by holding e==1 (pop) each step, got {:?}",
+        lasso.inputs
+    );
+}
+
+/// FALSE-POSITIVE control — a REALIZABLE recurrence game has NO env starvation lasso. On `CTRL_INIT1`
+/// (`st' = c`, init `st == 1`) the controller trivially maintains `GF(st==1)` (hold `c == 1`), so the
+/// env can force `¬good` forever from nowhere: `stall_env = ∅` ⇒ `None`.
+#[test]
+fn recurrence_stall_lasso_is_absent_when_realizable() {
+    assert!(
+        exact_two_player_recurrence_stall_lasso(CTRL_INIT1, "st == 1", &["c"])
+            .expect("engine call")
+            .is_none(),
+        "a realizable recurrence game has no environment starvation lasso"
+    );
+}
+
+/// On the TWO-gate design the bare recurrence `GF(st==2)` is unrealizable (a single gate held shut
+/// starves it). The lasso is present and never reaches `good` (`st != 2` on the cycle) — the env keeps
+/// the FSM in the pre-`good` region forever.
+#[test]
+fn recurrence_stall_lasso_on_two_gate_design() {
+    let lasso = exact_two_player_recurrence_stall_lasso(TWOGATE, "st == 2", &["c"])
+        .expect("engine call")
+        .expect("unrealizable two-gate recurrence has an env starvation lasso");
+    assert!(!lasso.cycle.is_empty(), "non-empty ¬good cycle expected");
+    assert!(
+        lasso.cycle.iter().all(|st| st.get("st") != Some(&2)),
+        "good (st==2) must never hold on the stall cycle, got {:?}",
+        lasso.cycle
     );
 }
