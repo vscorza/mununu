@@ -1147,11 +1147,14 @@ pub struct Btor2GameResponse {
     /// was requested and the game is unrealizable; empty otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub holds_under: Vec<crate::verdict::DiscoveredAssumption>,
-    /// The winner's strategy: a `controller_strategy` (Mealy, when realizable) or an
-    /// `environment_counterstrategy` (positional, when not) — the [`crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy`]
-    /// serialized with a `"kind"` tag. **Present only for a STATE-register `good`**: the strategy is
-    /// state-indexed, so it is omitted (`null`) for a combinational-output / relational target (a FIFO's
-    /// `full_o`), where `realizable` + `holds_under` still apply.
+    /// The winner's strategy: a `controller_strategy` (Mealy) or an `environment_counterstrategy`
+    /// (positional) — the [`crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy`] serialized with a
+    /// `"kind"` tag. For `objective = "reach"` it is the controller's attractor strategy when realizable,
+    /// else the environment's positional counterstrategy. For `objective = "recurrence"` it is the
+    /// CONTROLLER's Büchi strategy (force `good` infinitely often) when realizable, and `null` when not —
+    /// the unrealizable recurrence witness is `stall_lasso` below. **Present only for a STATE-register
+    /// `good`**: the strategy is state-indexed, so it is omitted (`null`) for a combinational-output /
+    /// relational target (a FIFO's `full_o`), where `realizable` + `holds_under` still apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<crate::adapter::btor2::symbolic_bitblast::TwoPlayerStrategy>,
     /// P2.5-F (b) — the ENVIRONMENT STARVATION LASSO for an unrealizable RECURRENCE game: a concrete

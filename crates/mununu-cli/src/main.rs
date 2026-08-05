@@ -2776,9 +2776,9 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// to the `violated` verdict class); `realizable` maps to `holds`.
 fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
-        exact_two_player_recurrence_stall_lasso, exact_two_player_strategy,
-        game_sound_posture_model,
+        exact_two_player_buchi_realizable, exact_two_player_buchi_strategy,
+        exact_two_player_reach_realizable, exact_two_player_recurrence_stall_lasso,
+        exact_two_player_strategy, game_sound_posture_model,
     };
 
     let raw = std::fs::read_to_string(&args.file)
@@ -2799,11 +2799,15 @@ fn btor2_game(args: Btor2GameArgs) -> Result<(), String> {
     } else {
         exact_two_player_reach_realizable(&content, &args.good, &controllable)?
     };
-    // STRATEGY extraction is REACH-only: the state-indexed strategy is a reachability attractor (the wrong
-    // shape for Büchi). Also best-effort: it needs a STATE-register target, so it is omitted for a
-    // combinational-output / relational `good`.
+    // STRATEGY extraction — the WINNER's strategy, best-effort (needs a STATE-register target, so it is
+    // omitted for a combinational-output / relational `good`). `reach` = the reachability attractor
+    // strategy (controller Mealy, or the env positional counterstrategy when unrealizable); `recurrence`
+    // = the CONTROLLER's Büchi strategy when realizable (`None` when unrealizable — the env starvation
+    // lasso below is that case's witness).
     let strategy = if recurrence {
-        None
+        exact_two_player_buchi_strategy(&content, &args.good, &controllable)
+            .ok()
+            .flatten()
     } else {
         exact_two_player_strategy(&content, &args.good, &controllable).ok()
     };

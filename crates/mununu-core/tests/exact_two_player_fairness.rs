@@ -17,8 +17,9 @@
 use mununu_core::adapter::btor2::concrete_oracle::OracleAtom;
 use mununu_core::adapter::btor2::predicate_expr::CmpOp;
 use mununu_core::adapter::btor2::symbolic_bitblast::{
-    exact_two_player_buchi_realizable, exact_two_player_gr1_conjunction_realizable,
-    exact_two_player_gr1_realizable, exact_two_player_recurrence_stall_lasso,
+    TwoPlayerStrategy, exact_two_player_buchi_realizable, exact_two_player_buchi_strategy,
+    exact_two_player_gr1_conjunction_realizable, exact_two_player_gr1_realizable,
+    exact_two_player_recurrence_stall_lasso,
 };
 use mununu_core::adapter::recoverability::discover_game_fairness_assumption;
 
@@ -347,5 +348,70 @@ fn recurrence_stall_lasso_on_two_gate_design() {
         lasso.cycle.iter().all(|st| st.get("st") != Some(&2)),
         "good (st==2) must never hold on the stall cycle, got {:?}",
         lasso.cycle
+    );
+}
+
+// ============================================================================================
+// P2.5-F (b): the CONTROLLER's Büchi (recurrence) STRATEGY — how the controller forces `good`
+// infinitely often when the recurrence game is REALIZABLE. `exact_two_player_buchi_strategy`
+// returns the winning controller Mealy strategy, or `None` when unrealizable (env-lasso case).
+// ============================================================================================
+
+/// On the REALIZABLE recurrence game `CTRL_INIT1` (`st' = c`, init `st == 1`), the controller forces
+/// `GF(st==1)`: it must drive `c == 1` from the non-good state `st == 0` to return to `good`. The result
+/// is a CONTROLLER strategy (not the environment counterstrategy), and — all inputs being controllable —
+/// a Moore (positional) discipline. NOTE the recur/good state `st == 1` legitimately leaves `c` FREE:
+/// the whole winning region re-attracts to `good`, so any move from `st == 1` is winning (`c = 0` drops
+/// to `st = 0`, whence `c == 1` is forced back). The load-bearing forced move is at `st == 0`.
+#[test]
+fn recurrence_strategy_forces_good_when_realizable() {
+    // Sanity: the game is realizable, so a strategy must exist.
+    assert!(exact_two_player_buchi_realizable(CTRL_INIT1, "st == 1", &["c"]).unwrap());
+    let strat = exact_two_player_buchi_strategy(CTRL_INIT1, "st == 1", &["c"])
+        .expect("engine call")
+        .expect("a realizable recurrence game has a controller strategy");
+    let mealy = match strat {
+        TwoPlayerStrategy::ControllerStrategy(m) => m,
+        TwoPlayerStrategy::EnvironmentCounterstrategy(_) => {
+            panic!("realizable recurrence must yield a CONTROLLER strategy")
+        }
+    };
+    assert_eq!(mealy.state_register, "st");
+    // All-controllable ⇒ Moore, so the strategy projects to a positional discipline.
+    let positional = mealy
+        .as_positional()
+        .expect("all-controllable Büchi strategy is positional (Moore)");
+    // The good state st==1 is the recur point (a strategy row exists for it).
+    assert!(
+        positional.entries.iter().any(|e| e.state_value == 1),
+        "the good state st==1 must be a strategy row (the recur point), got {:?}",
+        positional.entries
+    );
+    // The load-bearing progress move: from the non-good, reachable state st==0 the controller forces
+    // c==1 to return to good — this is what makes GF(st==1) recur.
+    let from_zero = positional
+        .entries
+        .iter()
+        .find(|e| e.state_value == 0)
+        .expect("st==0 is reachable (c==0 from st==1) and carries a strategy row");
+    assert_eq!(
+        from_zero.forced_inputs.get("c"),
+        Some(&1),
+        "from the non-good state st==0 the controller forces c==1 to reach good, got {:?}",
+        from_zero.forced_inputs
+    );
+}
+
+/// FALSE-POSITIVE control — an UNREALIZABLE recurrence game has NO controller strategy (`None`); its
+/// actionable witness is the environment starvation lasso instead. BUFFER `GF(count==1)` (env pops
+/// forever) is the ⊥ case.
+#[test]
+fn recurrence_strategy_is_absent_when_unrealizable() {
+    assert!(!exact_two_player_buchi_realizable(BUFFER, "count == 1", &["c"]).unwrap());
+    assert!(
+        exact_two_player_buchi_strategy(BUFFER, "count == 1", &["c"])
+            .expect("engine call")
+            .is_none(),
+        "an unrealizable recurrence game has no controller strategy (the env lasso is its witness)"
     );
 }

@@ -885,9 +885,9 @@ pub async fn btor2_game_handler(
     Json(request): Json<Btor2GameRequest>,
 ) -> ApiResult<Json<Btor2GameResponse>> {
     use crate::adapter::btor2::symbolic_bitblast::{
-        exact_two_player_buchi_realizable, exact_two_player_reach_realizable,
-        exact_two_player_recurrence_stall_lasso, exact_two_player_strategy,
-        game_sound_posture_model,
+        exact_two_player_buchi_realizable, exact_two_player_buchi_strategy,
+        exact_two_player_reach_realizable, exact_two_player_recurrence_stall_lasso,
+        exact_two_player_strategy, game_sound_posture_model,
     };
     use crate::api::models::GameObjective;
 
@@ -911,11 +911,15 @@ pub async fn btor2_game_handler(
         message,
         details: None,
     })?;
-    // STRATEGY extraction is REACH-only (the strategy is a reachability attractor, the wrong shape for
-    // Büchi); it is also best-effort — it needs a STATE-register target, so it is `null` for a
-    // combinational-output / relational `good` (a FIFO's `full_o`).
+    // STRATEGY extraction — the WINNER's strategy, best-effort (needs a STATE-register target, so it is
+    // `null` for a combinational-output / relational `good` like a FIFO's `full_o`). `reach` = the
+    // reachability attractor strategy (controller Mealy, or the env positional counterstrategy when
+    // unrealizable); `recurrence` = the CONTROLLER's Büchi strategy when realizable (`null` when
+    // unrealizable — the `stall_lasso` below is that case's witness).
     let strategy = if recurrence {
-        None
+        exact_two_player_buchi_strategy(&content, &request.good, &controllable)
+            .ok()
+            .flatten()
     } else {
         exact_two_player_strategy(&content, &request.good, &controllable).ok()
     };
