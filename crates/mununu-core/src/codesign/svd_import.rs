@@ -198,13 +198,11 @@ pub fn import_svd(text: &str) -> Result<SvdImport, SvdError> {
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "peripheral")
     {
-        match import_peripheral(periph, &mut warnings) {
-            Ok(Some(map)) => maps.push(map),
-            // `Ok(None)` is used today only for derivedFrom-only
-            // peripherals that have no own registers; the warning
-            // was already pushed.
-            Ok(None) => {}
-            Err(e) => return Err(e),
+        // `?` propagates the import error; the returned `Option` is `None`
+        // only for derivedFrom-only peripherals that have no own registers
+        // (the warning was already pushed).
+        if let Some(map) = import_peripheral(periph, &mut warnings)? {
+            maps.push(map);
         }
     }
 
