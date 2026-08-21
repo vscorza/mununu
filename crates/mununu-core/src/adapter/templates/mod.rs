@@ -28,7 +28,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt;
 
 use super::ir::{PropertyKind, PropertyRole};
 
@@ -167,40 +166,25 @@ pub struct InstantiatedProperty {
 // ---------------------------------------------------------------------------
 
 /// Errors during template instantiation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TemplateError {
     /// Template ID not found in the registry.
+    #[error("unknown template: {0}")]
     UnknownTemplate(String),
     /// A required parameter was not provided.
+    #[error("template '{template}' requires parameter '{param}'")]
     MissingParam { template: String, param: String },
     /// A parameter value doesn't match its type constraint.
+    #[error("parameter '{param}': expected {expected}, got '{got}'")]
     InvalidParamType {
         param: String,
         expected: String,
         got: String,
     },
     /// The catalog JSON failed to parse.
+    #[error("catalog parse error: {0}")]
     CatalogParseError(String),
 }
-
-impl fmt::Display for TemplateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TemplateError::UnknownTemplate(id) => write!(f, "unknown template: {id}"),
-            TemplateError::MissingParam { template, param } => {
-                write!(f, "template '{template}' requires parameter '{param}'")
-            }
-            TemplateError::InvalidParamType {
-                param,
-                expected,
-                got,
-            } => write!(f, "parameter '{param}': expected {expected}, got '{got}'"),
-            TemplateError::CatalogParseError(msg) => write!(f, "catalog parse error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for TemplateError {}
 
 // ---------------------------------------------------------------------------
 // Registry

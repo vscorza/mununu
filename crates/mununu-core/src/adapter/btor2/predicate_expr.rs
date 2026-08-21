@@ -511,18 +511,11 @@ fn cmp_constraint(bv: &z3::ast::BV, op: CmpOp, value: u64) -> z3::ast::Bool {
 // --------------------------------------------------------------------------
 
 /// Error parsing a predicate-expression string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("predicate expression parse error: {message}")]
 pub struct PredicateExprParseError {
     pub message: String,
 }
-
-impl std::fmt::Display for PredicateExprParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "predicate expression parse error: {}", self.message)
-    }
-}
-
-impl std::error::Error for PredicateExprParseError {}
 
 fn perr(message: impl Into<String>) -> PredicateExprParseError {
     PredicateExprParseError {

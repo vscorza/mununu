@@ -28,18 +28,18 @@ use crate::adapter::btor2::parser::bv_width;
 use crate::adapter::btor2::term_backend::{WalkError, walk_design};
 
 /// Error variants raised by [`encode_design`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
-    UnsupportedOperator {
-        nid: i64,
-        op_name: &'static str,
-    },
-    ArraySortUnsupportedInBvOnly {
-        nid: i64,
-    },
+    #[error("BTOR2 NID {nid}: operator '{op_name}' not supported by the predicate-image encoder.")]
+    UnsupportedOperator { nid: i64, op_name: &'static str },
+    #[error("BTOR2 NID {nid}: array sort under Theory::BvOnly. Use Theory::BvUfArray (step 4.5).")]
+    ArraySortUnsupportedInBvOnly { nid: i64 },
     /// A `next` line references an operand whose width does not match
     /// its state cell. The BTOR2 parser usually catches this; surfaced
     /// here only as a defence-in-depth.
+    #[error(
+        "BTOR2 NID {nid}: width mismatch — state cell is {state_width} bits, operand is {operand_width} bits."
+    )]
     WidthMismatch {
         nid: i64,
         state_width: u32,
@@ -48,39 +48,9 @@ pub enum EncodeError {
     /// Bit-vector width too small for the integer constant. Should
     /// not happen on well-formed BTOR2; surfaced as a hard error
     /// rather than silently truncating.
-    ConstantOutOfRange {
-        nid: i64,
-    },
+    #[error("BTOR2 NID {nid}: constant value does not fit in declared sort width.")]
+    ConstantOutOfRange { nid: i64 },
 }
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::UnsupportedOperator { nid, op_name } => write!(
-                f,
-                "BTOR2 NID {nid}: operator '{op_name}' not supported by the predicate-image encoder."
-            ),
-            EncodeError::ArraySortUnsupportedInBvOnly { nid } => write!(
-                f,
-                "BTOR2 NID {nid}: array sort under Theory::BvOnly. Use Theory::BvUfArray (step 4.5)."
-            ),
-            EncodeError::WidthMismatch {
-                nid,
-                state_width,
-                operand_width,
-            } => write!(
-                f,
-                "BTOR2 NID {nid}: width mismatch — state cell is {state_width} bits, operand is {operand_width} bits."
-            ),
-            EncodeError::ConstantOutOfRange { nid } => write!(
-                f,
-                "BTOR2 NID {nid}: constant value does not fit in declared sort width."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
 
 /// A signal exposed by the encoded design — state cell, input, or
 /// (H.E.1) a named **combinational** node. Carries the human-readable
