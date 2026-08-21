@@ -357,6 +357,9 @@ impl std::fmt::Display for ConflictError {
     }
 }
 
+// ConflictError / UnrollingError keep hand-rolled Display: their formatting is
+// conditional (message override + Option-field branches), which thiserror's
+// per-variant `#[error("...")]` attribute cannot express.
 impl std::error::Error for ConflictError {}
 
 impl std::error::Error for UnrollingError {}

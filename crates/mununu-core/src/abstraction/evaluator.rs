@@ -8,28 +8,17 @@ use crate::guard::ComparisonOp;
 use std::collections::HashMap;
 
 /// Errors that can occur during evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvaluationError {
+    #[error("unknown variable: {0}")]
     UnknownVariable(String),
+    #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
+    #[error("division by zero")]
     DivisionByZero,
+    #[error("arithmetic overflow")]
     ArithmeticOverflow,
 }
-
-impl std::fmt::Display for EvaluationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownVariable(name) => write!(f, "unknown variable: {}", name),
-            Self::TypeMismatch { expected, actual } => {
-                write!(f, "type mismatch: expected {}, got {}", expected, actual)
-            }
-            Self::DivisionByZero => write!(f, "division by zero"),
-            Self::ArithmeticOverflow => write!(f, "arithmetic overflow"),
-        }
-    }
-}
-
-impl std::error::Error for EvaluationError {}
 
 /// Helper for evaluating expressions and guards over a single abstract state.
 ///
