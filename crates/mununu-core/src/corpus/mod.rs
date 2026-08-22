@@ -260,28 +260,13 @@ impl Corpus {
 }
 
 /// Errors raised by the corpus loader.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CorpusError {
+    #[error("corpus: I/O error at {}: {message}", path.display())]
     Io { path: PathBuf, message: String },
+    #[error("corpus: failed to parse {} as a ContractEntry: {message}", path.display())]
     ParseEntry { path: PathBuf, message: String },
 }
-
-impl std::fmt::Display for CorpusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CorpusError::Io { path, message } => {
-                write!(f, "corpus: I/O error at {}: {message}", path.display())
-            }
-            CorpusError::ParseEntry { path, message } => write!(
-                f,
-                "corpus: failed to parse {} as a ContractEntry: {message}",
-                path.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CorpusError {}
 
 #[cfg(test)]
 mod tests {

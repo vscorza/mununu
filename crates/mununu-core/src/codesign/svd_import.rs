@@ -55,17 +55,23 @@ use crate::codesign::register_map::{
 use std::fmt;
 
 /// Errors raised by [`import_svd`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SvdError {
     /// The input failed to parse as XML.
+    #[error("SVD XML failed to parse: {0}")]
     XmlParseFailed(String),
     /// The XML parsed but did not look like a CMSIS-SVD document
     /// (missing required `<device>` or `<peripherals>` element).
+    #[error("input does not look like a CMSIS-SVD document: {0}")]
     NotSvd(String),
     /// A peripheral was found but had no parseable registers.
+    #[error("peripheral '{peripheral}' has no registers (or all registers failed to parse)")]
     EmptyPeripheral { peripheral: String },
     /// A field's bit-range could not be parsed in any of the three
     /// SVD formats.
+    #[error(
+        "{peripheral}.{register}.{field}: bit range '{raw}' did not match bitOffset+bitWidth / bitRange[msb:lsb] / lsb+msb"
+    )]
     UnparseableBitRange {
         peripheral: String,
         register: String,
@@ -73,34 +79,6 @@ pub enum SvdError {
         raw: String,
     },
 }
-
-impl fmt::Display for SvdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SvdError::XmlParseFailed(msg) => write!(f, "SVD XML failed to parse: {msg}"),
-            SvdError::NotSvd(reason) => {
-                write!(f, "input does not look like a CMSIS-SVD document: {reason}")
-            }
-            SvdError::EmptyPeripheral { peripheral } => {
-                write!(
-                    f,
-                    "peripheral '{peripheral}' has no registers (or all registers failed to parse)"
-                )
-            }
-            SvdError::UnparseableBitRange {
-                peripheral,
-                register,
-                field,
-                raw,
-            } => write!(
-                f,
-                "{peripheral}.{register}.{field}: bit range '{raw}' did not match bitOffset+bitWidth / bitRange[msb:lsb] / lsb+msb"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SvdError {}
 
 /// Warnings raised by [`import_svd`] — non-fatal observations the
 /// caller may want to surface to the user but which don't block the
@@ -198,13 +176,11 @@ pub fn import_svd(text: &str) -> Result<SvdImport, SvdError> {
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "peripheral")
     {
-        match import_peripheral(periph, &mut warnings) {
-            Ok(Some(map)) => maps.push(map),
-            // `Ok(None)` is used today only for derivedFrom-only
-            // peripherals that have no own registers; the warning
-            // was already pushed.
-            Ok(None) => {}
-            Err(e) => return Err(e),
+        // `?` propagates the import error; the returned `Option` is `None`
+        // only for derivedFrom-only peripherals that have no own registers
+        // (the warning was already pushed).
+        if let Some(map) = import_peripheral(periph, &mut warnings)? {
+            maps.push(map);
         }
     }
 

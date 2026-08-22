@@ -30,26 +30,15 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// Errors raised by [`parse_module`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ParseError {
     /// The input was empty.
+    #[error("empty IR input")]
     EmptyInput,
     /// A `define` line was malformed.
+    #[error("could not parse `define` line: {0}")]
     MalformedDefine(String),
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::EmptyInput => write!(f, "empty IR input"),
-            ParseError::MalformedDefine(line) => {
-                write!(f, "could not parse `define` line: {line}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 struct Regexes {
     source_filename: Regex,

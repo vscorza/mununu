@@ -18,6 +18,25 @@ use crate::context_dsl::RealizedContext;
 use crate::guard::sanitize_identifier;
 use crate::mu_calculus::{Environment, EvaluationOptions, Formula};
 
+/// P22 — run a synchronous, CPU-heavy handler body on the blocking threadpool so
+/// it does not stall a tokio worker. Verification (parse/realize/BMC/CEGAR/
+/// synthesis) is CPU-bound and can run for seconds; on the async executor that
+/// blocks every other request sharing the worker. The heavy body lives in a
+/// sibling `*_impl` fn; this wrapper just moves it off-thread and flattens the
+/// `JoinError` (task panic/cancel) into an `ApiError`.
+async fn blocking<T, F>(f: F) -> ApiResult<T>
+where
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::Internal {
+            message: format!("handler task panicked or was cancelled: {e}"),
+            source: None,
+        })?
+}
+
 /// Health check endpoint
 pub async fn health_check() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -61,6 +80,12 @@ pub struct TemplatesQuery {
 /// Summarize context (automata, formulas, controllers)
 pub async fn context_summarize_handler(
     Json(request): Json<ContextSummarizeRequest>,
+) -> ApiResult<Json<ContextSummarizeResponse>> {
+    blocking(move || context_summarize_handler_impl(request)).await
+}
+
+fn context_summarize_handler_impl(
+    request: ContextSummarizeRequest,
 ) -> ApiResult<Json<ContextSummarizeResponse>> {
     let handler_start = Instant::now();
 
@@ -180,6 +205,12 @@ fn resolve_controller_mode(
 /// Synthesize controller from ctxdsl specification
 pub async fn context_synthesize_handler(
     Json(request): Json<ContextSynthesizeRequest>,
+) -> ApiResult<Json<ContextSynthesizeResponse>> {
+    blocking(move || context_synthesize_handler_impl(request)).await
+}
+
+fn context_synthesize_handler_impl(
+    request: ContextSynthesizeRequest,
 ) -> ApiResult<Json<ContextSynthesizeResponse>> {
     let handler_start = Instant::now();
 
@@ -353,6 +384,12 @@ pub async fn context_synthesize_handler(
 pub async fn gr1_synthesize_handler(
     Json(request): Json<Gr1SynthesizeRequest>,
 ) -> ApiResult<Json<Gr1SynthesizeResponse>> {
+    blocking(move || gr1_synthesize_handler_impl(request)).await
+}
+
+fn gr1_synthesize_handler_impl(
+    request: Gr1SynthesizeRequest,
+) -> ApiResult<Json<Gr1SynthesizeResponse>> {
     let adapter = request.adapter.as_deref().unwrap_or("tlsf");
     if adapter != "tlsf" {
         return Err(ApiError::BadRequest {
@@ -387,6 +424,12 @@ pub async fn gr1_synthesize_handler(
 /// Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) into CTXDSL.
 pub async fn context_import_handler(
     Json(request): Json<ContextImportRequest>,
+) -> ApiResult<Json<ContextImportResponse>> {
+    blocking(move || context_import_handler_impl(request)).await
+}
+
+fn context_import_handler_impl(
+    request: ContextImportRequest,
 ) -> ApiResult<Json<ContextImportResponse>> {
     use crate::adapter::{AdapterOptions, FormatAdapter};
 
@@ -640,6 +683,10 @@ fn run_controllability_aware_lift(
 pub async fn btor2_cegar_handler(
     Json(request): Json<Btor2CegarRequest>,
 ) -> ApiResult<Json<Btor2CegarResponse>> {
+    blocking(move || btor2_cegar_handler_impl(request)).await
+}
+
+fn btor2_cegar_handler_impl(request: Btor2CegarRequest) -> ApiResult<Json<Btor2CegarResponse>> {
     if request.predicates.is_empty() {
         return Err(ApiError::BadRequest {
             message: "at least one predicate is required to bootstrap the cube space".to_string(),
@@ -673,6 +720,10 @@ pub async fn btor2_cegar_handler(
 pub async fn btor2_verify_handler(
     Json(request): Json<Btor2VerifyRequest>,
 ) -> ApiResult<Json<Btor2VerifyResponse>> {
+    blocking(move || btor2_verify_handler_impl(request)).await
+}
+
+fn btor2_verify_handler_impl(request: Btor2VerifyRequest) -> ApiResult<Json<Btor2VerifyResponse>> {
     use crate::adapter::reach_portfolio::{ReachVerdict, decide_reach_portfolio_parallel};
 
     let file = crate::adapter::btor2::parser::parse(&request.content).map_err(|e| {
@@ -705,6 +756,12 @@ pub async fn btor2_verify_handler(
 /// A malformed atom or unparseable BTOR2 is a `BadRequest`.
 pub async fn btor2_verify_liveness_handler(
     Json(request): Json<Btor2VerifyLivenessRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    blocking(move || btor2_verify_liveness_handler_impl(request)).await
+}
+
+fn btor2_verify_liveness_handler_impl(
+    request: Btor2VerifyLivenessRequest,
 ) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
     use crate::adapter::liveness_rescue::{parse_response_atom, response_liveness_rescue_atoms};
 
@@ -745,6 +802,12 @@ pub async fn btor2_verify_liveness_handler(
 /// unparseable BTOR2 is a `BadRequest`.
 pub async fn btor2_verify_liveness_all_handler(
     Json(request): Json<Btor2VerifyLivenessAllRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    blocking(move || btor2_verify_liveness_all_handler_impl(request)).await
+}
+
+fn btor2_verify_liveness_all_handler_impl(
+    request: Btor2VerifyLivenessAllRequest,
 ) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
     use crate::adapter::liveness_rescue::{
         parse_response_pairs, response_conjunction_property, response_liveness_rescue_conjunction,
@@ -787,6 +850,12 @@ pub async fn btor2_verify_liveness_all_handler(
 /// target atom is a `BadRequest`.
 pub async fn btor2_verify_recoverability_handler(
     Json(request): Json<Btor2VerifyRecoverabilityRequest>,
+) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
+    blocking(move || btor2_verify_recoverability_handler_impl(request)).await
+}
+
+fn btor2_verify_recoverability_handler_impl(
+    request: Btor2VerifyRecoverabilityRequest,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
     use crate::adapter::recoverability::{
         parse_config_value_specs, parse_extra_predicate, recoverability_property_str,
@@ -846,6 +915,12 @@ pub async fn btor2_verify_recoverability_handler(
 pub async fn btor2_check_fsm_handler(
     Json(request): Json<Btor2CheckFsmRequest>,
 ) -> ApiResult<Json<Btor2CheckFsmResponse>> {
+    blocking(move || btor2_check_fsm_handler_impl(request)).await
+}
+
+fn btor2_check_fsm_handler_impl(
+    request: Btor2CheckFsmRequest,
+) -> ApiResult<Json<Btor2CheckFsmResponse>> {
     use crate::adapter::fsm_scan::fsm_encoding_scan;
 
     let findings = fsm_encoding_scan(&request.content, request.max_width).map_err(|message| {
@@ -884,6 +959,10 @@ pub async fn btor2_check_fsm_handler(
 pub async fn btor2_game_handler(
     Json(request): Json<Btor2GameRequest>,
 ) -> ApiResult<Json<Btor2GameResponse>> {
+    blocking(move || btor2_game_handler_impl(request)).await
+}
+
+fn btor2_game_handler_impl(request: Btor2GameRequest) -> ApiResult<Json<Btor2GameResponse>> {
     use crate::adapter::btor2::symbolic_bitblast::{
         exact_two_player_buchi_realizable, exact_two_player_buchi_strategy,
         exact_two_player_reach_realizable, exact_two_player_recurrence_stall_lasso,
@@ -975,6 +1054,10 @@ pub async fn btor2_game_handler(
 pub async fn sv_verify_handler(
     Json(request): Json<SvVerifyRequest>,
 ) -> ApiResult<Json<Btor2VerifyResponse>> {
+    blocking(move || sv_verify_handler_impl(request)).await
+}
+
+fn sv_verify_handler_impl(request: SvVerifyRequest) -> ApiResult<Json<Btor2VerifyResponse>> {
     use crate::adapter::reach_portfolio::ReachVerdict;
     use crate::adapter::sv_verify::{SvLift, sv_verify_safety};
 
@@ -1018,6 +1101,12 @@ pub async fn sv_verify_handler(
 /// `POST /api/v1/sv/verify-liveness` — lift SV and decide `AG(request → AF grant)`.
 pub async fn sv_verify_liveness_handler(
     Json(request): Json<SvVerifyLivenessRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    blocking(move || sv_verify_liveness_handler_impl(request)).await
+}
+
+fn sv_verify_liveness_handler_impl(
+    request: SvVerifyLivenessRequest,
 ) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
     use crate::adapter::sv_verify::{SvLift, sv_verify_liveness};
 
@@ -1068,6 +1157,12 @@ pub async fn sv_verify_liveness_handler(
 pub async fn sv_verify_liveness_all_handler(
     Json(request): Json<SvVerifyLivenessAllRequest>,
 ) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    blocking(move || sv_verify_liveness_all_handler_impl(request)).await
+}
+
+fn sv_verify_liveness_all_handler_impl(
+    request: SvVerifyLivenessAllRequest,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
     use crate::adapter::liveness_rescue::response_conjunction_property;
     use crate::adapter::sv_verify::{SvLift, sv_verify_liveness_all};
 
@@ -1114,6 +1209,12 @@ pub async fn sv_verify_liveness_all_handler(
 /// `POST /api/v1/sv/verify-recoverability` — lift SV and decide `AG EF target`.
 pub async fn sv_verify_recoverability_handler(
     Json(request): Json<SvVerifyRecoverabilityRequest>,
+) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
+    blocking(move || sv_verify_recoverability_handler_impl(request)).await
+}
+
+fn sv_verify_recoverability_handler_impl(
+    request: SvVerifyRecoverabilityRequest,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
     use crate::adapter::recoverability::{
         parse_config_value_specs, parse_extra_predicate, recoverability_property_str,
@@ -1192,6 +1293,10 @@ pub async fn sv_verify_recoverability_handler(
 pub async fn sv_check_fsm_handler(
     Json(request): Json<SvCheckFsmRequest>,
 ) -> ApiResult<Json<Btor2CheckFsmResponse>> {
+    blocking(move || sv_check_fsm_handler_impl(request)).await
+}
+
+fn sv_check_fsm_handler_impl(request: SvCheckFsmRequest) -> ApiResult<Json<Btor2CheckFsmResponse>> {
     use crate::adapter::sv_verify::{SvLift, sv_check_fsm};
 
     let lift = SvLift {
@@ -1249,6 +1354,10 @@ pub async fn sv_check_fsm_handler(
 pub async fn sv_cegar_handler(
     Json(request): Json<SvCegarRequest>,
 ) -> ApiResult<Json<Btor2CegarResponse>> {
+    blocking(move || sv_cegar_handler_impl(request)).await
+}
+
+fn sv_cegar_handler_impl(request: SvCegarRequest) -> ApiResult<Json<Btor2CegarResponse>> {
     use crate::adapter::yosys::{YosysOptions, sv_to_btor2};
 
     if request.predicates.is_empty() {
@@ -1301,6 +1410,12 @@ pub async fn sv_cegar_handler(
 /// `/sv/verify-auto`). Surface peer of the CLI `mununu sv extract-sva`.
 pub async fn sv_extract_sva_handler(
     Json(request): Json<SvExtractSvaRequest>,
+) -> ApiResult<Json<SvExtractSvaResponse>> {
+    blocking(move || sv_extract_sva_handler_impl(request)).await
+}
+
+fn sv_extract_sva_handler_impl(
+    request: SvExtractSvaRequest,
 ) -> ApiResult<Json<SvExtractSvaResponse>> {
     use crate::adapter::slang::extract::extract_sva;
     use crate::adapter::slang::translate::SvaKind;
@@ -1360,6 +1475,12 @@ pub async fn sv_extract_sva_handler(
 /// auto-seeded cube predicates → CEGAR). Surface peer of `mununu sv verify-auto`.
 pub async fn sv_verify_auto_handler(
     Json(request): Json<SvVerifyAutoRequest>,
+) -> ApiResult<Json<SvVerifyAutoResponse>> {
+    blocking(move || sv_verify_auto_handler_impl(request)).await
+}
+
+fn sv_verify_auto_handler_impl(
+    request: SvVerifyAutoRequest,
 ) -> ApiResult<Json<SvVerifyAutoResponse>> {
     use crate::adapter::btor2::kmts_lift::MustEdgeInference;
     use crate::adapter::slang::verify_auto::{VerifyAutoOptions, VerifyOutcome, verify_auto};
@@ -1871,6 +1992,12 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
 pub async fn context_graphs_handler(
     Json(request): Json<ContextGraphsRequest>,
 ) -> ApiResult<Json<ContextGraphsResponse>> {
+    blocking(move || context_graphs_handler_impl(request)).await
+}
+
+fn context_graphs_handler_impl(
+    request: ContextGraphsRequest,
+) -> ApiResult<Json<ContextGraphsResponse>> {
     let handler_start = Instant::now();
 
     // Cache parse + realize.
@@ -1968,6 +2095,12 @@ pub async fn context_graphs_handler(
 /// Verify context by evaluating μ-calculus formulas over automata
 pub async fn context_verify_handler(
     Json(request): Json<ContextVerifyRequest>,
+) -> ApiResult<Json<ContextVerifyResponse>> {
+    blocking(move || context_verify_handler_impl(request)).await
+}
+
+fn context_verify_handler_impl(
+    request: ContextVerifyRequest,
 ) -> ApiResult<Json<ContextVerifyResponse>> {
     let handler_start = Instant::now();
     let counterstrategy_requested = request.counterstrategy;
@@ -2579,6 +2712,13 @@ pub async fn extraction_domains_handler()
 pub async fn extraction_propose_composition_handler(
     Json(request): Json<super::models::ProposeCompositionRequest>,
 ) -> ApiResult<Json<super::models::ProposeCompositionResponse>> {
+    blocking(move || extraction_propose_composition_handler_impl(request)).await
+}
+
+#[cfg(feature = "ast-extract")]
+fn extraction_propose_composition_handler_impl(
+    request: super::models::ProposeCompositionRequest,
+) -> ApiResult<Json<super::models::ProposeCompositionResponse>> {
     use crate::adapter::extraction::ast_extract::{concurrency_detect, parser};
 
     let lang_name = request
@@ -2645,6 +2785,13 @@ pub async fn extraction_composition_modes_handler()
 pub async fn extraction_extract_handler(
     Json(request): Json<super::models::ExtractionExtractRequest>,
 ) -> ApiResult<Json<super::models::ExtractionExtractResponse>> {
+    blocking(move || extraction_extract_handler_impl(request)).await
+}
+
+#[cfg(feature = "ast-extract")]
+fn extraction_extract_handler_impl(
+    request: super::models::ExtractionExtractRequest,
+) -> ApiResult<Json<super::models::ExtractionExtractResponse>> {
     let language = request.language.as_deref().unwrap_or("typescript");
 
     let spec = crate::adapter::extraction::ast_extract::extract_from_source(
@@ -2695,6 +2842,12 @@ pub async fn extraction_extract_handler(
 /// Validate an extraction spec against source code.
 pub async fn extraction_validate_handler(
     Json(request): Json<ExtractionValidateRequest>,
+) -> ApiResult<Json<ExtractionValidateResponse>> {
+    blocking(move || extraction_validate_handler_impl(request)).await
+}
+
+fn extraction_validate_handler_impl(
+    request: ExtractionValidateRequest,
 ) -> ApiResult<Json<ExtractionValidateResponse>> {
     use crate::adapter::extraction::validate;
 
@@ -2801,6 +2954,12 @@ pub async fn extraction_validate_handler(
 pub async fn context_predicates_handler(
     Json(request): Json<ContextPredicatesRequest>,
 ) -> ApiResult<Json<ContextPredicatesResponse>> {
+    blocking(move || context_predicates_handler_impl(request)).await
+}
+
+fn context_predicates_handler_impl(
+    request: ContextPredicatesRequest,
+) -> ApiResult<Json<ContextPredicatesResponse>> {
     let instant = Instant::now();
 
     // Cache parse + realize.
@@ -2902,6 +3061,12 @@ fn resolve_template_ref_for_cache(
 pub async fn contract_validate_handler(
     Json(set): Json<crate::contract::ContractSet>,
 ) -> ApiResult<Json<crate::contract::discharge::DischargeVerdict>> {
+    blocking(move || contract_validate_handler_impl(set)).await
+}
+
+fn contract_validate_handler_impl(
+    set: crate::contract::ContractSet,
+) -> ApiResult<Json<crate::contract::discharge::DischargeVerdict>> {
     let verdict = crate::contract::discharge::validate(&set);
     Ok(Json(verdict))
 }
@@ -2930,6 +3095,12 @@ pub struct ContractDiscoverRequest {
 /// the UI to render.
 pub async fn contract_discover_handler(
     Json(request): Json<ContractDiscoverRequest>,
+) -> ApiResult<Json<crate::contract::discover::Phase1Output>> {
+    blocking(move || contract_discover_handler_impl(request)).await
+}
+
+fn contract_discover_handler_impl(
+    request: ContractDiscoverRequest,
 ) -> ApiResult<Json<crate::contract::discover::Phase1Output>> {
     use crate::contract::discover::{DiscoverOptions, discover_phase1};
     use crate::corpus::Corpus;
@@ -2990,6 +3161,12 @@ pub struct ContractQueryResponse {
 pub async fn contract_query_handler(
     Json(request): Json<ContractQueryRequest>,
 ) -> ApiResult<Json<ContractQueryResponse>> {
+    blocking(move || contract_query_handler_impl(request)).await
+}
+
+fn contract_query_handler_impl(
+    request: ContractQueryRequest,
+) -> ApiResult<Json<ContractQueryResponse>> {
     let (domain, name) = match request.id.split_once('/') {
         Some((d, n)) if !d.is_empty() && !n.is_empty() => (d.to_string(), n.to_string()),
         _ => {
@@ -3048,6 +3225,12 @@ pub struct ContractReviewRequest {
 /// the CLI / UI surfaces.
 pub async fn contract_review_handler(
     Json(request): Json<ContractReviewRequest>,
+) -> ApiResult<Json<crate::contract::review::ReviewPackage>> {
+    blocking(move || contract_review_handler_impl(request)).await
+}
+
+fn contract_review_handler_impl(
+    request: ContractReviewRequest,
 ) -> ApiResult<Json<crate::contract::review::ReviewPackage>> {
     use crate::contract::discover::DiscoverOptions;
     use crate::contract::review::build_review_package;
@@ -3146,6 +3329,12 @@ pub struct CodesignCompositionInfo {
 /// verdict plus the composed CTXDSL so the UI can render both.
 pub async fn codesign_verify_handler(
     Json(request): Json<CodesignVerifyRequest>,
+) -> ApiResult<Json<CodesignVerifyResponse>> {
+    blocking(move || codesign_verify_handler_impl(request)).await
+}
+
+fn codesign_verify_handler_impl(
+    request: CodesignVerifyRequest,
 ) -> ApiResult<Json<CodesignVerifyResponse>> {
     use crate::codesign::compose::{ComposeOptions, compose_codesign_ctxdsl};
     use crate::context_dsl::{parse, realize_context};
@@ -3287,6 +3476,12 @@ pub struct VerifyProjectRequest {
 pub async fn verify_project_handler(
     Json(request): Json<VerifyProjectRequest>,
 ) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
+    blocking(move || verify_project_handler_impl(request)).await
+}
+
+fn verify_project_handler_impl(
+    request: VerifyProjectRequest,
+) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
     let mut config = match (request.config, request.config_toml) {
         (Some(c), None) => c,
         (None, Some(toml_text)) => crate::verify::config::VerifyConfig::from_toml(&toml_text)
@@ -3352,6 +3547,12 @@ pub struct MemoryCheckRequest {
 /// treat warnings as a gate.
 pub async fn memory_check_handler(
     Json(request): Json<MemoryCheckRequest>,
+) -> ApiResult<Json<crate::verify::memory_check::MemoryCheckReport>> {
+    blocking(move || memory_check_handler_impl(request)).await
+}
+
+fn memory_check_handler_impl(
+    request: MemoryCheckRequest,
 ) -> ApiResult<Json<crate::verify::memory_check::MemoryCheckReport>> {
     let config = match (request.config, request.config_toml) {
         (Some(c), None) => c,
@@ -3420,6 +3621,12 @@ pub struct CodesignReconcileLabelsResponse {
 pub async fn codesign_reconcile_labels_handler(
     Json(request): Json<CodesignReconcileLabelsRequest>,
 ) -> ApiResult<Json<CodesignReconcileLabelsResponse>> {
+    blocking(move || codesign_reconcile_labels_handler_impl(request)).await
+}
+
+fn codesign_reconcile_labels_handler_impl(
+    request: CodesignReconcileLabelsRequest,
+) -> ApiResult<Json<CodesignReconcileLabelsResponse>> {
     use crate::codesign::reconcile::{ReconcileError, reconcile_label_alphabets};
     use std::collections::BTreeSet;
 
@@ -3469,6 +3676,12 @@ pub struct CodesignEmitChaoticStubResponse {
 /// Mirrors `mununu codesign emit-chaotic-stub` (CLI).
 pub async fn codesign_emit_chaotic_stub_handler(
     Json(request): Json<CodesignEmitChaoticStubRequest>,
+) -> ApiResult<Json<CodesignEmitChaoticStubResponse>> {
+    blocking(move || codesign_emit_chaotic_stub_handler_impl(request)).await
+}
+
+fn codesign_emit_chaotic_stub_handler_impl(
+    request: CodesignEmitChaoticStubRequest,
 ) -> ApiResult<Json<CodesignEmitChaoticStubResponse>> {
     use crate::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
 

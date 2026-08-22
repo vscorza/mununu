@@ -51,11 +51,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Errors raised by [`extract_c_via_llvm`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LlvmExtractError {
     /// `clang` could not be spawned (not installed, not on PATH).
+    #[error(
+        "could not spawn clang (tried `{tried}`): {message}. Install via xcode-select --install (macOS) or `apt install clang` (Linux), or pass --clang <path>."
+    )]
     ClangNotFound { tried: String, message: String },
     /// `clang` ran but returned a non-zero exit code.
+    #[error("clang exited {status}\ninvocation: {invocation}\nstderr:\n{stderr}")]
     ClangFailed {
         status: String,
         stderr: String,
@@ -63,41 +67,12 @@ pub enum LlvmExtractError {
     },
     /// `clang` ran cleanly but produced output the IR parser
     /// rejected.
+    #[error("LLVM IR parser rejected clang output: {0}")]
     IrParseFailed(String),
     /// Failed to read the source file before invoking clang.
+    #[error("failed to read source file {}: {message}", path.display())]
     SourceReadFailed { path: PathBuf, message: String },
 }
-
-impl fmt::Display for LlvmExtractError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LlvmExtractError::ClangNotFound { tried, message } => write!(
-                f,
-                "could not spawn clang (tried `{tried}`): {message}. Install via xcode-select --install (macOS) or `apt install clang` (Linux), or pass --clang <path>."
-            ),
-            LlvmExtractError::ClangFailed {
-                status,
-                stderr,
-                invocation,
-            } => write!(
-                f,
-                "clang exited {status}\ninvocation: {invocation}\nstderr:\n{stderr}"
-            ),
-            LlvmExtractError::IrParseFailed(msg) => {
-                write!(f, "LLVM IR parser rejected clang output: {msg}")
-            }
-            LlvmExtractError::SourceReadFailed { path, message } => {
-                write!(
-                    f,
-                    "failed to read source file {}: {message}",
-                    path.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for LlvmExtractError {}
 
 /// Configuration for [`extract_c_via_llvm`]. Mirrors the AST path's
 /// `CExtractOptions` shape so a CLI / API can thread options through
