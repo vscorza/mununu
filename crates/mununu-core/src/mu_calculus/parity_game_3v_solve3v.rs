@@ -112,7 +112,7 @@ pub fn solve_3v(game: &Game3v, leaf_winners: &HashMap<PositionId, Player>) -> So
     let mut verdicts = HashMap::with_capacity(game.positions.len());
     let mut indefinite = Vec::new();
     for pid_idx in 0..game.positions.len() {
-        let pid = PositionId(pid_idx);
+        let pid = PositionId::new(pid_idx);
         let over = over_solution.winner(pid);
         let under = under_solution.winner(pid);
         let t = match (over, under) {
@@ -212,7 +212,7 @@ mod tests {
         let leaves = leaf_winners_from_oracle(&game, &formula, |_, _| false);
         let solution = solve_3v(&game, &leaves);
         for pid_idx in 0..game.positions.len() {
-            let pid = PositionId(pid_idx);
+            let pid = PositionId::new(pid_idx);
             let verdict = solution.verdict(pid).expect("position has verdict");
             assert!(
                 matches!(verdict, Trit3v::DefiniteEve | Trit3v::DefiniteAdam),

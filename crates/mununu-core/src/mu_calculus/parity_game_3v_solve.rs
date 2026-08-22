@@ -93,7 +93,7 @@ impl Solution {
 ///   (`True`, `False`, `Predicate(_)`). The caller is responsible
 ///   for evaluating the leaf truth against the CLTS + Environment
 ///   (sub-item 4.5 ships the integration). Leaf positions correspond
-///   to nodes whose `Game3v::successors[pid.0]` is empty.
+///   to nodes whose `Game3v::successors[pid.index()]` is empty.
 ///
 /// Returns: `Solution` mapping every `PositionId` in the game to its
 /// parity-game winner per Zielonka 1998.
@@ -118,13 +118,13 @@ pub fn solve_2v(game: &Game3v, leaf_winners: &HashMap<PositionId, Player>) -> So
     // an arbitrary winner).
     let mut winners: HashMap<PositionId, Player> = HashMap::with_capacity(game.positions.len());
     for (pid, w) in leaf_winners {
-        if pid.0 < game.positions.len() {
+        if pid.index() < game.positions.len() {
             winners.insert(*pid, *w);
         }
     }
 
     let mut active: BTreeSet<PositionId> = (0..game.positions.len())
-        .map(PositionId)
+        .map(PositionId::new)
         .filter(|pid| !winners.contains_key(pid))
         .collect();
 
@@ -172,8 +172,8 @@ fn propagate_from_resolved(
         let mut changed = false;
         let candidates: Vec<PositionId> = active.iter().copied().collect();
         for pid in candidates {
-            let pos = &game.positions[pid.0];
-            let succs = &game.successors[pid.0];
+            let pos = &game.positions[pid.index()];
+            let succs = &game.successors[pid.index()];
             let owner = pos.owner;
             let opponent = other_player(owner);
 
@@ -235,7 +235,7 @@ fn zielonka(
     // win if cycled" is determined by the parity of d.
     let mut d: u32 = 0;
     for pid in active {
-        let p = game.positions[pid.0].priority;
+        let p = game.positions[pid.index()].priority;
         if p > d {
             d = p;
         }
@@ -257,7 +257,7 @@ fn zielonka(
     let u: BTreeSet<PositionId> = active
         .iter()
         .copied()
-        .filter(|pid| game.positions[pid.0].priority == d)
+        .filter(|pid| game.positions[pid.index()].priority == d)
         .collect();
 
     // A := player-attractor(active, U). Attractor reads `winners`
@@ -377,8 +377,8 @@ fn attractor(
         let mut changed = false;
         let candidates: Vec<PositionId> = active.difference(&result).copied().collect();
         for pid in candidates {
-            let pos = &game.positions[pid.0];
-            let succs = &game.successors[pid.0];
+            let pos = &game.positions[pid.index()];
+            let succs = &game.successors[pid.index()];
             // Active positions are non-leaves (succs non-empty) by
             // `solve_2v`'s construction. Still defend against empty
             // succs for robustness.
@@ -434,7 +434,7 @@ where
     use crate::mu_calculus::Node;
     let mut result = HashMap::new();
     for (pid_idx, pos) in game.positions.iter().enumerate() {
-        let pid = PositionId(pid_idx);
+        let pid = PositionId::new(pid_idx);
         match formula.node(pos.node) {
             Node::True => {
                 result.insert(pid, Player::Existential);
@@ -710,14 +710,14 @@ mod tests {
             },
         ];
         let successors = vec![
-            vec![PositionId(1), PositionId(3)], // p0 → p1, p3
-            vec![PositionId(0), PositionId(2)], // p1 → p0, p2
-            vec![],                             // p2: leaf
-            vec![],                             // p3: leaf
+            vec![PositionId::new(1), PositionId::new(3)], // p0 → p1, p3
+            vec![PositionId::new(0), PositionId::new(2)], // p1 → p0, p2
+            vec![],                                       // p2: leaf
+            vec![],                                       // p3: leaf
         ];
         let mut index = HashMap::new();
         for (i, p) in positions.iter().enumerate() {
-            index.insert((p.state, p.node), PositionId(i));
+            index.insert((p.state, p.node), PositionId::new(i));
         }
         // R.5.0 sub-item 4.3 — All hand-built game edges default to
         // Sharp modality (the test pre-dates 4.3's modality
@@ -734,17 +734,23 @@ mod tests {
         };
         // Leaf assignment: p2 → Adam, p3 → Eve.
         let mut leaf_winners = HashMap::new();
-        leaf_winners.insert(PositionId(2), Player::Universal);
-        leaf_winners.insert(PositionId(3), Player::Existential);
+        leaf_winners.insert(PositionId::new(2), Player::Universal);
+        leaf_winners.insert(PositionId::new(3), Player::Existential);
 
         let solution = solve_2v(&game, &leaf_winners);
 
         // Eve always has the p0 → p3 move available, immediately
         // winning. Adam at p1 can pick p2 (Adam-leaf), also winning.
         // So: p0 → Eve, p1 → Adam, p2 → Adam, p3 → Eve.
-        assert_eq!(solution.winner(PositionId(0)), Some(Player::Existential));
-        assert_eq!(solution.winner(PositionId(1)), Some(Player::Universal));
-        assert_eq!(solution.winner(PositionId(2)), Some(Player::Universal));
-        assert_eq!(solution.winner(PositionId(3)), Some(Player::Existential));
+        assert_eq!(
+            solution.winner(PositionId::new(0)),
+            Some(Player::Existential)
+        );
+        assert_eq!(solution.winner(PositionId::new(1)), Some(Player::Universal));
+        assert_eq!(solution.winner(PositionId::new(2)), Some(Player::Universal));
+        assert_eq!(
+            solution.winner(PositionId::new(3)),
+            Some(Player::Existential)
+        );
     }
 }

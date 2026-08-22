@@ -253,7 +253,7 @@ where
         .positions
         .iter()
         .map(|pid| {
-            let pos = &game.positions[pid.0];
+            let pos = &game.positions[pid.index()];
             Position3v {
                 state: pos.state,
                 node: pos.node,
@@ -262,8 +262,8 @@ where
         .collect();
     let mut classifying_transitions: Vec<(usize, usize, OwningPlayer)> = Vec::new();
     for (src, tgt) in &precise.classifying_edges {
-        let src_pos = &game.positions[src.0];
-        let tgt_pos = &game.positions[tgt.0];
+        let src_pos = &game.positions[src.index()];
+        let tgt_pos = &game.positions[tgt.index()];
         let Some(source_id) = StateId::<S>::from_index(src_pos.state) else {
             continue;
         };
@@ -339,7 +339,7 @@ fn build_leaf_oracle_from_env(
 
     let mut result: HashMap<PositionId, Player> = HashMap::new();
     for (pid_idx, pos) in game.positions.iter().enumerate() {
-        let pid = PositionId(pid_idx);
+        let pid = PositionId::new(pid_idx);
         let node = formula.node(pos.node);
         let winner = match node {
             Node::True => Some(Player::Existential),

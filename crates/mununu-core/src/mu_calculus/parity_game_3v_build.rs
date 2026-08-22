@@ -98,7 +98,21 @@ pub enum Player {
 /// R.5.0 sub-item 4.1 — Opaque identifier for a position in the game.
 /// Indexes into `Game3v::positions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PositionId(pub usize);
+pub struct PositionId(usize);
+
+impl PositionId {
+    /// Construct a position id from its index into `Game3v::positions`.
+    #[inline]
+    pub fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// The index into `Game3v::positions` this id refers to.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// R.5.0 sub-item 4.1 — A single `(state, formula_node)` position.
 #[derive(Debug, Clone)]
