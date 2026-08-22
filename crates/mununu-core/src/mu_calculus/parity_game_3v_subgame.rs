@@ -101,7 +101,7 @@ pub fn extract_failure_subgame(
         let mods = &game.edge_modalities[src_idx];
         for (s, m) in succs.iter().zip(mods.iter()) {
             if *m == EdgeModality::MayOnly {
-                may_only_edges.push((PositionId(src_idx), *s));
+                may_only_edges.push((PositionId::new(src_idx), *s));
             }
         }
     }
@@ -114,7 +114,7 @@ pub fn extract_failure_subgame(
         let perturbed = remove_single_edge(game, src, tgt);
         let perturbed_sol = solve_2v(&perturbed, leaf_winners);
         let changed = (0..game.positions.len())
-            .map(PositionId)
+            .map(PositionId::new)
             .any(|pid| over_baseline.winner(pid) != perturbed_sol.winner(pid));
         if changed {
             classifying_edges.push((src, tgt));
@@ -134,8 +134,8 @@ pub fn extract_failure_subgame(
 fn remove_single_edge(game: &Game3v, src: PositionId, tgt: PositionId) -> Game3v {
     let mut successors = game.successors.clone();
     let mut edge_modalities = game.edge_modalities.clone();
-    let src_succs = &mut successors[src.0];
-    let src_mods = &mut edge_modalities[src.0];
+    let src_succs = &mut successors[src.index()];
+    let src_mods = &mut edge_modalities[src.index()];
     if let Some(pos) = src_succs.iter().position(|s| *s == tgt) {
         src_succs.remove(pos);
         src_mods.remove(pos);
@@ -225,8 +225,8 @@ mod tests {
         );
         // Each classifying edge must be a MayOnly edge in the game.
         for (src, tgt) in &subgame.classifying_edges {
-            let mods = &game.edge_modalities[src.0];
-            let succs = &game.successors[src.0];
+            let mods = &game.edge_modalities[src.index()];
+            let succs = &game.successors[src.index()];
             let edge_pos = succs.iter().position(|s| *s == *tgt);
             assert!(edge_pos.is_some(), "classifying edge must exist in game");
             assert_eq!(
@@ -249,8 +249,8 @@ mod tests {
         let subgame = extract_failure_subgame(&game, &leaves, &solution3v);
 
         for (src, tgt) in &subgame.classifying_edges {
-            let succs = &game.successors[src.0];
-            let mods = &game.edge_modalities[src.0];
+            let succs = &game.successors[src.index()];
+            let mods = &game.edge_modalities[src.index()];
             let i = succs
                 .iter()
                 .position(|s| *s == *tgt)
@@ -293,7 +293,7 @@ mod tests {
             .find_map(|src_idx| {
                 game.successors[src_idx]
                     .first()
-                    .map(|&t| (PositionId(src_idx), t))
+                    .map(|&t| (PositionId::new(src_idx), t))
             })
             .expect("game has at least one edge");
 
