@@ -176,10 +176,32 @@ Adapters to cover: SystemVerilog (+ Yosys / BTOR2 / KMTS lift), AIGER, TLSF, Pro
 
 ### 6.1 Rust idioms specific to mununu
 
-> **Stability:** —
-> **Last reviewed:** — (Chapter 0)
+> **Stability:** stable
+> **Last reviewed:** 2026-08-22 (Chapter 0)
 
-*To be written during Chapter 0. A condensed 200-word recap of patterns 9–22 from the review plan with one canonical anchor each; cross-link to the longer list for newcomers who want all 22.*
+The house style is conservative and consistent — read it once, recognize it everywhere. Fourteen patterns worth internalizing (one canonical anchor each; the longer walk with synthetic-vs-misimpl examples lives in the review's Chapter 0 notes):
+
+- **Lifetime-parameterized structs** tie borrow scope to struct validity — [abstraction/evaluator.rs:39](crates/mununu-core/src/abstraction/evaluator.rs#L39).
+- **`&str` in params, `String` in owned fields, `&'static str` for compile-time constants** — never `Box::leak` runtime strings in production paths — [library.rs:50](crates/mununu-core/src/library.rs#L50).
+- **`Box<dyn Trait> + '_`** trait objects erase concrete iterator types at API boundaries — [iter.rs:10](crates/mununu-core/src/iter.rs#L10).
+- **Newtype IDs over `IdStorage`** (`StateId<S>`, `LabelId<L>`) — storage width is a type parameter, ID arithmetic is impossible by construction — [clts/mod.rs:183](crates/mununu-core/src/clts/mod.rs#L183).
+- **`#[serde(default)]` + `deny_unknown_fields` + `rename_all = "snake_case"`** on every deserialized API struct — [contract/discover.rs:46](crates/mununu-core/src/contract/discover.rs#L46).
+- **`thiserror::Error` + `#[from]`** for error enums; hand-rolled `Display + Error` only when messages need dynamic formatting — [ltl/translator.rs:41](crates/mununu-core/src/ltl/translator.rs#L41).
+- **Pattern-first `match` guards** — reserve `if` clauses for runtime predicates, not shape checks a pattern would express — [abstraction/domains.rs:363](crates/mununu-core/src/abstraction/domains.rs#L363).
+- **`unsafe { … }` with a `// SAFETY:` line naming the invariant** — every naked block is a review finding — [adapter/yosys/mod.rs:1910](crates/mununu-core/src/adapter/yosys/mod.rs#L1910).
+- **`macro_rules!`** used only when a `fn` or a generic won't do (item-emitting macros, ≥ 3 call sites) — [clts/mod.rs:159](crates/mununu-core/src/clts/mod.rs#L159) (`impl_id_storage!`).
+- **Consume-self builders** (`mut self` chain → terminal `.finish()`) — no accidental re-use, no partial-state escape — [context/mod.rs:1147](crates/mununu-core/src/context/mod.rs#L1147) (`ContextBuilder`).
+- **`RefCell` inside `&self`-only structs** for interned caches — [composition/mod.rs:41](crates/mununu-core/src/composition/mod.rs#L41) (`ProductStateArena`). Prefer `&mut self` when the callsite shape allows.
+- **`impl From<X> for Y`** (or `#[from]` on the variant) to enable `?` across module boundaries — [abstraction/unrolling.rs:320](crates/mununu-core/src/abstraction/unrolling.rs#L320).
+- **`SmallVec<[T; N]>`** with a comment justifying `N` against measured workload — [clts/mod.rs:265](crates/mununu-core/src/clts/mod.rs#L265) (`[LabelId; 4]` sized against corpus p95).
+- **Async axum handlers wrap CPU-heavy work in `tokio::task::spawn_blocking`**, and every handler emits `tracing::info!` per parse / realize / verify phase — [api/handlers.rs](crates/mununu-core/src/api/handlers.rs).
+
+Two crosscutting rules that recur inside those patterns:
+
+- **Never `_ =>` on an internal-crate enum** — the compiler-forced audit when a variant lands is load-bearing; wildcards on external `#[non_exhaustive]` enums are the sole legit case.
+- **Never `.unwrap()` on a path that isn't provably unreachable** — prefer `?`, `ok_or_else`, or an `.expect("<invariant>")` that names the reason.
+
+Consume-self and exhaustive-match aren't stylistic choices — they're enforcement mechanisms that push whole classes of bugs from runtime to compile time. When you see them, treat them as load-bearing, not decorative.
 
 ### 6.2 The CI gate
 

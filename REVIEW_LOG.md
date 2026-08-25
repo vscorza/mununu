@@ -60,18 +60,22 @@ Status: in-progress
 
 ## Chapter 0 — Rust Orientation Primer
 
-Started:
-Reviewer:
-Status: not started
+Started: 2026-08-20
+Completed: 2026-08-22
+Reviewer: Mariano Cerrutti
+Status: done
 
 ### Acceptance Criteria
-- [ ] Explain patterns 9–22 in your own words
-- [ ] Smoke test: `cargo build --workspace && cargo test --workspace -- --skip slow`
-- [ ] First finding logged (even a `note`) so the log mechanism is working
+- [x] Explain patterns 9–22 in your own words
+- [x] Smoke test: `cargo build --workspace && cargo test --workspace -- --skip slow`
+- [x] First finding logged (even a `note`) so the log mechanism is working
+- [x] **Onboarding contribution**: `ONBOARDING.md` §6.1 (Rust idioms) updated with a ~200-word recap of patterns 9–22, `Stability:` set (`stable`), `Last reviewed:` stamped (2026-08-22)
 
 ### Findings
 | ID | Severity | Category | Anchor | Description | Status |
 |----|----------|----------|--------|-------------|--------|
+| 00-F01 | note | arch | crates/mununu-core/src/adapter/btor2/ast.rs:388 | Calling a method with `self` by value (not `&self` / `&mut self`) is a first-class API design tool. It enforces at compile time: (a) transformations that must invalidate the original binding (the caller cannot keep using the pre-transform value); (b) builder patterns that consume the builder at `.build()` / `.finish()` (no double-build, no partial-state builder escaping); (c) "use once" semantics on tokens/handles/permits that cannot be legitimately reused. When you see `pub fn foo(self, …) -> …`, treat it as a load-bearing signal, not a stylistic choice. | open |
+| 00-F02 | note | arch | crates/mununu-core/src/ltl/ast.rs:8 | Exhaustive `match` over an `enum` with **no `_ =>` wildcard** turns "handled every case" from a runtime assumption into a compile-time proof. When a new variant lands, the compiler surfaces every unhandled site; a wildcard hides them and forces the failure mode to become either a runtime `panic!` or a silent `Ok(())` / `default()` drop that swallows the case. Wildcards are legitimate only when the enum is `#[non_exhaustive]` from an external crate; internal-crate enums should default to no-wildcard so refactors are compiler-audited. | open |
 
 ### Decisions
 -
@@ -474,6 +478,7 @@ Status: not started
 - [ ] **AQ9.2** answered in §Architecture Q&A
 - [ ] **AQ9.3** answered in §Architecture Q&A
 - [ ] **AQ9.4** answered in §Architecture Q&A
+- [ ] **AQ9.5** answered in §Architecture Q&A
 
 ### Findings
 | ID | Severity | Category | Anchor | Description | Status |
@@ -493,6 +498,10 @@ Status: not started
   - Evidence:
   - Action:
 - **AQ9.4 — Witness vs counterexample vs counterstrategy**: Same underlying notion under three names, or genuinely three artefacts?
+  - Answer:
+  - Evidence:
+  - Action:
+- **AQ9.5 — Assumption-discovery output shape**: Does `--discover-assumptions` (per memory `refined-verdicts-assumption-discovery`) emit a single strongest assumption or a ranked set of candidates? For each discovered assumption, what metadata is attached — the two-sided non-vacuity gate result, a weakness/strength ordering, the discovering engine, the motivating counterexample? If single-best, would a ranked-set output improve downstream utility (human triage, repair loops, differential-oracle cross-check)? A single-best output also makes it hard to record *rejected* candidates and *why*.
   - Answer:
   - Evidence:
   - Action:
@@ -617,6 +626,7 @@ Status: not started
 - [ ] **AQ13.2** answered in §Architecture Q&A
 - [ ] **AQ13.3** answered in §Architecture Q&A
 - [ ] **AQ13.4** answered in §Architecture Q&A
+- [ ] **AQ13.5** answered in §Architecture Q&A
 
 ### Findings
 | ID | Severity | Category | Anchor | Description | Status |
@@ -636,6 +646,10 @@ Status: not started
   - Evidence:
   - Action:
 - **AQ13.4 — Composition with the rest of the verification stack**: Does contract validation reuse the μ-calculus evaluator, or have its own?
+  - Answer:
+  - Evidence:
+  - Action:
+- **AQ13.5 — Declarative environment context**: Does the contract/codesign layer let a user declare *neighbor modules* or *named interface contracts* (e.g. ready/valid, AXI-lite, ready-to-send handshakes) as first-class inputs whose guarantees bound the DUT's inputs, or must every environment assumption be hand-encoded in μ-calculus? A named-contract layer would enable a library of reusable protocol assumptions; hand-encoding forces every user to re-derive them and makes cross-project comparison harder. Check: does `codesign/` or `contract/` expose anything shaped like `interface_contract: "ready_valid"` today?
   - Answer:
   - Evidence:
   - Action:
@@ -757,7 +771,7 @@ Status: not started
 
 ### Acceptance Criteria
 - [ ] Every architectural claim from Chapter 1A§4 has a verdict line (survived / falsified / partial / unanswered)
-- [ ] Every architecture question (1A§5 + AQ2.x + AQ4.x + AQ6.x + AQ7.x + AQ9.x + AQ13.x) has a verdict line
+- [ ] Every architecture question (1A§5 + AQ2.1–2.4 + AQ4.1–4.4 + AQ6.1–6.4 + AQ7.1–7.4 + AQ9.1–9.5 + AQ13.1–13.5) has a verdict line
 - [ ] All `arch`+`bug` findings are resolved OR have a filed follow-up (RFC stub or refactor plan)
 - [ ] CLAUDE.md or `docs/architecture/` updated with each surviving rationale
 - [ ] Any theme with ≥3 findings has an RFC stub linked from this entry
@@ -801,10 +815,12 @@ Status: not started
 | AQ9.2 | | | |
 | AQ9.3 | | | |
 | AQ9.4 | | | |
+| AQ9.5 | | | |
 | AQ13.1 | | | |
 | AQ13.2 | | | |
 | AQ13.3 | | | |
 | AQ13.4 | | | |
+| AQ13.5 | | | |
 
 ### §3 Themes and decisions
 
