@@ -1,0 +1,19 @@
+1 sort bitvec 1
+2 sort bitvec 48
+3 state 2 hi
+4 state 2 lo
+5 zero 2
+6 one 2
+7 constd 2 100
+8 constd 2 140737488355328
+9 init 2 3 8
+10 init 2 4 7
+11 eq 1 4 5
+12 sub 2 4 6
+13 ite 2 11 7 12
+14 next 2 4 13
+15 eq 1 3 5
+16 sub 2 3 6
+17 ite 2 15 5 16
+18 ite 2 11 17 3
+19 next 2 3 18

@@ -1,0 +1,30 @@
+; SPCR clean fixture (P-A1) — CLEAN full-width write mem[waddr]=wdata (no RMW read),
+; latched index key' in {key, waddr}, recovery gated on mem[key]==3. AG EF(busy==0) HOLDS.
+; Read-set = {(mem, key)}; single unconditional write. SPCR-applicable (stable/move-to-waddr).
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+15 read 2 9 8
+16 eq 1 15 14
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+24 ite 2 18 5 8
+25 next 2 8 24
+26 write 3 9 5 6
+27 next 3 9 26

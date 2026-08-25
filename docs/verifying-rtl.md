@@ -196,7 +196,50 @@ works when you want the intermediate BTOR2.)
 
 The SVA translator supports a defined fragment (implication `|->` / `|=>`, `$past` /
 `$stable` / `$rose` / `$fell`, `$onehot` / `$onehot0`, …); assertions outside it come
-back in the `unsupported` list. Some designs hit the abstraction ceiling and return
+back in the `unsupported` list.
+
+The history functions work over a **register or a primary input**. That second
+half matters more than it sounds: it is what makes a data-integrity property —
+"what goes in comes out" — checkable at all, since the antecedent samples an
+input.
+
+> Source of truth: [`augment_with_past_shadows`](../crates/mununu-core/src/adapter/btor2/shadow.rs) — surface: (CLI+API+UI)
+
+```systemverilog
+(push && !pop && cnt_q == 0) |=> (d0_q == $past(din))
+```
+
+Each `$past` base becomes a real 1-step flop in the model (`next(b__past) = b`),
+so the verdict transfers to the concrete design. This is a **history variable** —
+its next value is a function of the present, nothing in the design reads it, and
+so the augmented system is a conservative extension of the original: it can
+neither create nor destroy a counterexample. The base may be a register or a
+primary **input**; both produce the same flop.
+
+Only the initial state needs care, because a history variable has no value before
+the first transition. A state cell's shadow mirrors its `init`, giving
+`b__past == b` at cycle 0. An input has no `init` to mirror, so **its shadow is
+pinned to an explicit zero** rather than left free: an init-less BTOR2 cell reads
+as 0 to the cube and exact engines but stays free for the reachability portfolio,
+and that split is a verdict disagreement, not a nuance.
+
+That invented value is read **only by a property that reads `$past` in the same
+cycle as its trigger**. The lift settles it structurally: `|=>` places the atom
+under a `[]`, so it is evaluated only at states that have a predecessor — where
+the shadow holds a value the design actually drove — while `|->` evaluates it at
+the initial state too. So every data-integrity property, which is `|=>` by
+construction, is unaffected; a `|->` property over `$past` of an input reads an
+invented cycle-0 history and its verdict there does not transfer.
+
+Two caveats that are **not** about the shadow's source. `must_edge_inference` is
+unsound on any `$past` model today (it can report `violated` for a correct
+design), and `--engine symbolic` aborts on one; both reproduce on a
+register-sourced `$past`. Leave must-edge inference off, which is the default.
+[`docs/design/past-shadow-soundness.md`](design/past-shadow-soundness.md) carries
+the full argument, the per-engine ledger, and why no engine may ever assume
+stutter equivalence here.
+
+Some designs hit the abstraction ceiling and return
 `unknown`. Crucially, **a `holds` or `violated` verdict is sound** (Bruns–Godefroid
 3-valued preservation for the abstraction; k-induction / IC3 / BDD for the exact and
 portfolio engines) — an agent can trust a definite verdict and treat `unknown` /

@@ -1,0 +1,40 @@
+; Hand-authored array-content recoverability fixture (P1-a shot-①b MECHANISM test).
+; NAMED state FFs (busy/key/mem) + DIRECT mem[key] read (no yosys reset-mux/observable
+; artifacts), so the reset-cube gate pins every register and the ONLY hard axis is the
+; in-cone array content. Recovery: busy -> 0 iff mem[key] == all-ones(3); mem is freely
+; env-writable (mem[waddr]=wdata), so from any busy state the env can write mem[key]=3
+; and recover -> AG EF(busy==0) HOLDS. The array is in-cone, so the exact ROBDD SKIPs and
+; the property falls to the predicate cube; the deciding predicate is the Select mem[key]==3.
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+; inputs (free environment)
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+; state cells (named -> pinned in init_values; init 0)
+7 state 1 busy
+8 state 2 key
+9 state 3 mem
+10 const 1 0
+11 init 1 7 10
+12 const 2 00
+13 init 2 8 12
+14 const 2 11
+; recovery guard: mem[key] == 3
+15 read 2 9 8
+16 eq 1 15 14
+; control: busy' = (start & !busy) ? 1 : ((busy & mem[key]==3) ? 0 : busy)
+17 not 1 7
+18 and 1 4 17
+19 const 1 1
+20 and 1 7 16
+21 ite 1 20 10 7
+22 ite 1 18 19 21
+23 next 1 7 22
+; key' = (start & !busy) ? waddr : key
+24 ite 2 18 5 8
+25 next 2 8 24
+; mem' = write(mem, waddr, wdata)  (freely env-writable)
+26 write 3 9 5 6
+27 next 3 9 26

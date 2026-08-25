@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(set-option :produce-interpolants true)
+(declare-fun x () (_ BitVec 8))
+(declare-fun y () (_ BitVec 8))
+(assert (and (= x (bvadd y (_ bv1 8))) (bvult y (_ bv200 8))))
+(get-interpolant I (bvugt x y))

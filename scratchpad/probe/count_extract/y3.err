@@ -1,0 +1,1 @@
+ERROR: Unsupported cell type $sdffe for cell count_top.$auto$ff.cc:266:slice$139 -- please run `dffunmap` before `write_btor`.

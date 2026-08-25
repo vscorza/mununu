@@ -1900,8 +1900,15 @@ pub(crate) fn prepare_model(
         btor2 = crate::adapter::btor2::reset_init::inject_zero_init(&btor2)?;
     }
 
-    // Augment only the `__past` shadows whose base resolves to a BTOR2 state cell (a renamed base is
-    // skipped → its properties are SKIPPED below, not an abort).
+    // Augment only the `__past` shadows whose base resolves to a shadowable
+    // signal — a state cell or a primary input (a renamed base is skipped → its
+    // properties are SKIPPED below, not an abort).
+    //
+    // This asks `can_shadow`, the same predicate the augmentation itself uses,
+    // rather than re-deciding here. An earlier version filtered on
+    // `resolve_state_by_symbol` and so dropped every primary-input base before
+    // `augment_with_past_shadows` saw it — which made `$past(<input>)` report
+    // `unknown register/signal` no matter what the augmentation supported.
     let pre_file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
         e.message = format!("verify_auto: parse lifted BTOR2: {}", e.message);
         e
@@ -1910,7 +1917,7 @@ pub(crate) fn prepare_model(
         .required_shadows
         .iter()
         .map(|s| s.base.as_str())
-        .filter(|b| crate::adapter::btor2::parser::resolve_state_by_symbol(&pre_file, b).is_some())
+        .filter(|b| crate::adapter::btor2::can_shadow(&pre_file, b))
         .collect();
     let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
 

@@ -1,0 +1,2 @@
+/work/scratchpad/t6507_src/t6507lp_fsm.v:158:40: Warning: Number literal 8'b000000001 exceeds 8 bits; truncating to 8'b00000001.
+/work/scratchpad/t6507_src/t6507lp_fsm.v:161:41: Warning: Number literal 8'b000000001 exceeds 8 bits; truncating to 8'b00000001.

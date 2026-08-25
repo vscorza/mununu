@@ -1,0 +1,43 @@
+1 sort bitvec 4
+2 sort bitvec 1
+3 sort bitvec 48
+4 state 1 ctrl
+5 state 3 data
+6 state 1 mode
+10 zero 1
+11 one 1
+12 constd 3 42
+20 constd 1 2
+21 constd 1 3
+22 constd 1 4
+23 constd 1 5
+24 constd 1 6
+25 constd 1 7
+26 constd 1 8
+27 constd 1 9
+13 init 1 4 11
+14 init 3 5 12
+15 init 1 6 20
+28 eq 2 4 11
+29 eq 2 5 12
+30 and 2 28 29
+31 ite 1 30 10 4
+32 next 1 4 31
+33 next 3 5 5
+34 eq 2 6 20
+35 ite 1 34 21 6
+36 eq 2 6 21
+37 ite 1 36 22 35
+38 eq 2 6 22
+39 ite 1 38 23 37
+40 eq 2 6 23
+41 ite 1 40 24 39
+42 eq 2 6 24
+43 ite 1 42 25 41
+44 eq 2 6 25
+45 ite 1 44 26 43
+46 eq 2 6 26
+47 ite 1 46 27 45
+48 eq 2 6 27
+49 ite 1 48 20 47
+50 next 1 6 49

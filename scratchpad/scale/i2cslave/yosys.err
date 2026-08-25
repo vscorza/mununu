@@ -1,0 +1,3 @@
+/aLLM/designs/COMMUNICATION_CONTROLLER/i2c_slave/include/i2cSlave.v:97: Warning: Yosys has only limited support for tri-state logic at the moment.
+Warning: Encountered `parallel_case' comment! Such legacy hot comments are supported by Yosys, but are not part of any formal language specification. Using the Verilog `parallel_case' attribute or the SystemVerilog `unique' or `priority' keywords is recommended!
+Warning: Encountered `full_case' comment! Such legacy hot comments are supported by Yosys, but are not part of any formal language specification. Using the Verilog `full_case' attribute or the SystemVerilog `unique' or `unique0' keywords is recommended!
