@@ -1,3 +1,0 @@
-Warning: Encountered `full_case' comment! Such legacy hot comments are supported by Yosys, but are not part of any formal language specification. Using the Verilog `full_case' attribute or the SystemVerilog `unique' or `unique0' keywords is recommended!
-Warning: Encountered `parallel_case' comment! Such legacy hot comments are supported by Yosys, but are not part of any formal language specification. Using the Verilog `parallel_case' attribute or the SystemVerilog `unique' or `priority' keywords is recommended!
-/aLLM/designs/COMMUNICATION_CONTROLLER/rtfsimpleuart/include/rtfSimpleUartRx.v:95: ERROR: syntax error, unexpected TOK_ID, expecting ')' or ',' or '='
