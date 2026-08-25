@@ -196,7 +196,30 @@ works when you want the intermediate BTOR2.)
 
 The SVA translator supports a defined fragment (implication `|->` / `|=>`, `$past` /
 `$stable` / `$rose` / `$fell`, `$onehot` / `$onehot0`, …); assertions outside it come
-back in the `unsupported` list. Some designs hit the abstraction ceiling and return
+back in the `unsupported` list.
+
+The history functions work over a **register or a primary input**. That second
+half matters more than it sounds: it is what makes a data-integrity property —
+"what goes in comes out" — checkable at all, since the antecedent samples an
+input.
+
+> Source of truth: [`augment_with_past_shadows`](../crates/mununu-core/src/adapter/btor2/shadow.rs) — surface: (CLI+API+UI)
+
+```systemverilog
+(push && !pop && cnt_q == 0) |=> (d0_q == $past(din))
+```
+
+Each `$past` base becomes a real 1-step flop in the model (`next(b__past) = b`),
+so the verdict transfers to the concrete design. A state cell's shadow mirrors
+its `init`, giving `b__past == b` at cycle 0 — the "no history before the first
+clock edge" convention. An input has no `init` to mirror, so **its shadow is
+pinned to an explicit zero** rather than left free: an init-less BTOR2 cell reads
+as 0 to the cube and exact engines but stays free for the reachability portfolio,
+and that split is a verdict disagreement, not a nuance. The cost is stated rather
+than hidden — **at cycle 0 only, `$past` of an input reads 0**, so
+`$stable`/`$rose`/`$fell` of an input are decided there against an invented
+history and those cycle-0 verdicts do not transfer to hardware. Every later cycle
+is exact. Some designs hit the abstraction ceiling and return
 `unknown`. Crucially, **a `holds` or `violated` verdict is sound** (Bruns–Godefroid
 3-valued preservation for the abstraction; k-induction / IC3 / BDD for the exact and
 portfolio engines) — an agent can trust a definite verdict and treat `unknown` /
