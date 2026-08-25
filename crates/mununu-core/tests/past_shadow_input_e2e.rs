@@ -200,3 +200,77 @@ fn the_shadow_flop_is_actually_in_the_model() {
         "the atom must bind to the shadow; got `{formula}`"
     );
 }
+
+// ---------------------------------------------------------------------------
+// When is the invented cycle-0 value OBSERVABLE?
+//
+// Pinning the shadow's power-up picks one of the 2^n histories the hardware
+// could have had, so it matters exactly when a property READS the shadow in the
+// initial state — the only state whose shadow was never driven by the design.
+//
+// The lift answers this structurally. `nu X. (body && [] X)` evaluates `body` at
+// every reachable state INCLUDING the initial one, and the two implication forms
+// place the consequent differently:
+//
+//     push |-> d0_q == $past(din)   ->  nu X. ((!push ||    (d0_q == din__past)) && [] X)
+//     push |=> d0_q == $past(din)   ->  nu X. ((!push || [] (d0_q == din__past)) && [] X)
+//
+// Under `[]` the atom is only ever read at a state that HAS a predecessor, where
+// the shadow holds a value the design actually drove. Outside it, the atom is
+// read at the initial state, against the invented history.
+//
+// So: the approximation is invisible to the `|=>` shapes — which is every
+// data-integrity property, because sampling an antecedent and checking the
+// result one cycle later is what `|=>` means — and visible to `|->`.
+
+/// The same property with a same-cycle implication. Nothing else differs.
+const SVA_SAME_CYCLE: &str = r#"
+module past_input_sva (input logic clk, input logic rst_n, input logic push,
+    input logic [3:0] din, input logic [3:0] d0_q);
+    a_same: assert property (@(posedge clk) disable iff (!rst_n)
+        push |-> d0_q == $past(din));
+endmodule
+bind past_input past_input_sva u_sva (.*);
+"#;
+
+fn formula_for(sva: &str) -> String {
+    let sources = vec![
+        ("past_input.sv".to_string(), DUT.to_string()),
+        ("past_input_sva.sv".to_string(), sva.to_string()),
+    ];
+    let yopts = YosysOptions {
+        top: Some("past_input".to_string()),
+        frontend: SvFrontend::Slang,
+        additional_sources: sources[1..].to_vec(),
+        ..Default::default()
+    };
+    verify_auto(&sources, &yopts, &VerifyAutoOptions::default())
+        .expect("verify_auto setup")
+        .properties
+        .first()
+        .expect("one assertion")
+        .formula
+        .clone()
+}
+
+#[test]
+#[ignore = "requires slang + yosys (mununu-sva image); run with --ignored"]
+fn only_a_same_cycle_past_reads_the_invented_history() {
+    let atom = "(d0_q == din__past)";
+    let boxed = format!("[] {atom}");
+
+    let next = formula_for(SVA);
+    assert!(
+        next.contains(&boxed),
+        "a `|=>` property must read the shadow under `[]`, so never in the \
+         initial state; got `{next}`"
+    );
+
+    let same = formula_for(SVA_SAME_CYCLE);
+    assert!(
+        same.contains(atom) && !same.contains(&boxed),
+        "a `|->` property reads the shadow at the current state, so it DOES see \
+         the invented cycle-0 value — that is the boundary of the approximation; \
+         got `{same}`"
+    );
+}

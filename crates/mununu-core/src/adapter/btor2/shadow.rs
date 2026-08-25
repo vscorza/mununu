@@ -166,13 +166,19 @@ pub fn augment_with_past_shadows(content: &str, bases: &[&str]) -> Result<String
             // the shadow. A free shadow would escape the mitigation by
             // construction.
             //
-            // What is given up is stated rather than hidden: at CYCLE 0 ONLY, an
-            // atom over an input shadow reads `$past(din) == 0`, so
-            // `$stable`/`$rose`/`$fell` of an input are decided there against an
-            // invented history and those cycle-0 verdicts do not transfer to
-            // hardware. Every later cycle is exact. Pinning also matches the
-            // power-up the rest of the adapter already assumes, so every engine
-            // now decides the same model.
+            // What is given up is bounded, and observable in only one shape. The
+            // lift puts a `|=>` consequent under a `[]`, so it is evaluated only
+            // at states that HAVE a predecessor — where the shadow holds a value
+            // the design actually drove. A `|->` consequent is evaluated at the
+            // initial state too, and there it reads this invented zero. So every
+            // data-integrity property (`|=>` by construction) is unaffected; a
+            // `|->` over `$past` of an input is not, and its cycle-0 verdict does
+            // not transfer to hardware. Every later cycle is exact — a real added
+            // flop, not an abstraction. Pinning also matches the power-up the rest
+            // of the adapter already assumes, so every engine decides one model.
+            //
+            // Full argument, per-engine ledger, and why no engine may assume
+            // stutter equivalence here: docs/design/past-shadow-soundness.md
             ShadowSource::PrimaryInput { .. } => {
                 let zero = zero_nid.expect("an input source allocates its zero above");
                 let shadow_init = next_nid;
