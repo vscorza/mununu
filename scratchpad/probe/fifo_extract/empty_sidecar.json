@@ -1,1 +1,0 @@
-{"module":"prim_fifo_sync_cnt","compound_predicates":[{"name":"empty","expr":"wcnt == rcnt"}]}
