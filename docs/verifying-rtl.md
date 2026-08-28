@@ -194,9 +194,14 @@ works when you want the intermediate BTOR2.)
 
 ### 3. Coverage is a fragment, and verdicts are honest
 
-The SVA translator supports a defined fragment (implication `|->` / `|=>`, `$past`
+The SVA translator supports a defined fragment (implication `|->` / `|=>` with a
+boolean or a bounded cycle-delay consequent `##k b` / `##[m:n] b`, `$past`
 (including a depth `$past(x, k)`, k ≥ 1) / `$stable` / `$rose` / `$fell`, `$onehot`
-/ `$onehot0`, …); assertions outside it come back in the `unsupported` list.
+/ `$onehot0`, …); assertions outside it come back in the `unsupported` list. A
+cycle-delay consequent lowers to nested `[]` — `a |-> ##2 b` → `AG(a → AX² b)`,
+`a |-> ##[1:3] b` → "b within the window" — so a definite verdict transfers just
+like the plain `|=>` (one `[]`) case. Multi-element `##` chains, `[*n]`
+repetition, and sequence *antecedents* remain out of fragment.
 
 The history functions work over a **register or a primary input**. That second
 half matters more than it sounds: it is what makes a data-integrity property —

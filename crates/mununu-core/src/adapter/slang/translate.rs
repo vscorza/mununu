@@ -12,6 +12,8 @@
 //! | `assert property (b)` | `nu X. (b && [] X)` (AG b) |
 //! | `a \|-> b` | `nu X. ((!a \|\| b) && [] X)` (AG(a→b)) |
 //! | `a \|=> b` | `nu X. ((!a \|\| [] b) && [] X)` (AG(a→AX b)) |
+//! | `a \|-> ##k b` (XL.4) | `nu X. ((!a \|\| []…[] b) && [] X)` — k boxes (AG(a→AXᵏ b)) |
+//! | `a \|-> ##[m:n] b` (XL.4) | `nu X. ((!a \|\| []ᵐ(b\|\|[](b\|\|…\|\|[]b))) && [] X)` — b within [m,n] |
 //! | `cover property (b)` | `mu X. (b \|\| <> X)` (EF b) |
 //! | `cover property (b)` **recoverability lens** (XL.2) | `nu Y. ((mu X. (b \|\| <> X)) && [] Y)` (AG EF b) |
 //! | `disable iff (r) P` | gate the body: `(r \|\| body)` (vacuous while disabled) |
@@ -49,9 +51,11 @@
 //! `x ∈ {0,1,2,4,…}` / `x ∈ {1,2,4,…}` (one `Or`-of-`Cmp` atom). Anything still
 //! outside the fragment — bit-arithmetic, bit-select indexing (`sig[i]`),
 //! reduction-or/xor (`|x`, `^x`), system calls (`$isunknown`, `$countones`),
-//! sequences (`##`, `[*n]`), etc. — is **rejected with a reason, never silently
-//! dropped** (claims-integrity), and every emitted formula is validated through the
-//! mu-calculus parser as a safety net.
+//! multi-element `##` chains (`a ##1 b ##2 c`), `[*n]` repetition, sequence
+//! *antecedents* (`a ##1 c |-> …`), etc. — is **rejected with a reason, never
+//! silently dropped** (claims-integrity), and every emitted formula is validated
+//! through the mu-calculus parser as a safety net. (A single `##k` / `##[m:n]`
+//! delayed boolean *consequent* is supported — XL.4, `consequent_expr`.)
 //!
 //! [XL.0]: ../../../../.claude/plans/measurements/XL-0-sva-parser-spike-2026-06-26.md
 
@@ -515,11 +519,14 @@ fn property_body(
             let cond = bool_expr(cond_node)?;
             Ok(format!("({cond} || {inner})"))
         }
-        // `a |-> b` / `a |=> b` — left/right are boolean (Tier-1 `Simple`).
+        // `a |-> <conseq>` / `a |=> <conseq>` — a boolean antecedent (Tier-1
+        // `Simple`) implies a boolean OR a bounded cycle-delay consequent
+        // (`##k b` / `##[m:n] b`, XL.4). The antecedent stays boolean; a sequence
+        // antecedent is out of fragment (Tier-3).
         "Binary" => {
             let op = spec.get("op").and_then(Value::as_str).unwrap_or("?");
             let l = simple_bool(child(spec, "left")?)?;
-            let r = simple_bool(child(spec, "right")?)?;
+            let r = consequent_expr(child(spec, "right")?)?;
             match op {
                 "OverlappedImplication" => Ok(format!("(!({l}) || {r})")),
                 "NonOverlappedImplication" => Ok(format!("(!({l}) || [] {r})")),
@@ -539,6 +546,92 @@ fn simple_bool(spec: &Value) -> Result<String, String> {
             "unsupported operand (Tier-1 expects a boolean, got {other:?})"
         )),
     }
+}
+
+/// XL.4 — an implication *consequent*: a boolean leaf (`Simple`), OR a bounded
+/// cycle-delay of a boolean (`##k b` / `##[m:n] b`), which slang serialises as a
+/// single-element `SequenceConcat`:
+///
+/// ```json
+/// { "kind": "SequenceConcat",
+///   "elements": [ { "sequence": { "kind": "Simple", … }, "min": k, "max": k } ] }
+/// ```
+///
+/// Fixed delay `##k b` → `[]…[] b` (k boxes); range `##[m:n] b` →
+/// `[]^m ( b || [](b || … || [] b) )` — "b holds at some cycle in [m,n]". Both
+/// compose with the implication's own `[]` (`|=>` adds one). A multi-element
+/// concat (`a ##1 b ##2 c`), a non-boolean delayed sub-sequence, `[*n]`
+/// repetition, or a sequence *antecedent* are out of fragment (Tier-3) and are
+/// rejected with a reason — never silently dropped.
+fn consequent_expr(spec: &Value) -> Result<String, String> {
+    match spec.get("kind").and_then(Value::as_str) {
+        Some("Simple") => bool_expr(child(spec, "expr")?),
+        Some("SequenceConcat") => {
+            let elements = spec
+                .get("elements")
+                .and_then(Value::as_array)
+                .ok_or("SequenceConcat without an `elements` array")?;
+            if elements.len() != 1 {
+                return Err(format!(
+                    "multi-element sequence (a `##` chain of {} elements) is out of fragment; \
+                     XL.4 supports a single `##k b` / `##[m:n] b` delayed boolean consequent",
+                    elements.len()
+                ));
+            }
+            let el = &elements[0];
+            let seq = el
+                .get("sequence")
+                .ok_or("sequence element without a `sequence`")?;
+            let b = simple_bool(seq).map_err(|e| {
+                format!("the delayed sub-sequence must be a boolean (`##k <bool>`); {e}")
+            })?;
+            let min = el
+                .get("min")
+                .and_then(Value::as_u64)
+                .ok_or("sequence element without a `min` delay")?;
+            let max = el
+                .get("max")
+                .and_then(Value::as_u64)
+                .ok_or("sequence element without a `max` delay")?;
+            if max < min {
+                return Err(format!("sequence delay range max {max} < min {min}"));
+            }
+            // Bounded-unroll cap: each cycle is a modality; a runaway `##[0:$]`
+            // (unbounded, slang encodes `$` as a very large max) or an absurd
+            // fixed delay is rejected rather than exploding the formula.
+            const MAX_DELAY: u64 = 64;
+            if max > MAX_DELAY {
+                return Err(format!(
+                    "sequence delay {max} exceeds the bounded-unroll cap {MAX_DELAY} \
+                     (an unbounded `##[m:$]` or a very deep `##k` is out of fragment)"
+                ));
+            }
+            Ok(delayed_bool(&b, min as u32, max as u32))
+        }
+        other => Err(format!(
+            "unsupported implication consequent (expected a boolean or a `##k`/`##[m:n]` \
+             delayed boolean, got {other:?})"
+        )),
+    }
+}
+
+/// Lower `##[min:max] b` (a delayed boolean) to nested `[]` modalities. Fixed
+/// delay (`min == max == k`) → `[]…[] b` (k boxes). Range → `[]^min ( b || [](b
+/// || … || [] b) )` with `(max-min)` extra `|| []` levels — "b holds at some
+/// cycle in [min,max]". SOUNDNESS: over the may-relation `[]φ = ∀ may-succ φ`, so
+/// a definite verdict transfers (Bruns–Godefroid), exactly as the shipped `|=>`
+/// single-`[]` case; more boxes only lengthen the (still step-exact) window.
+fn delayed_bool(b: &str, min: u32, max: u32) -> String {
+    // Innermost first: b at the deepest cycle; wrap `(b || [] …)` (max-min) times
+    // to admit any cycle in the window, then prefix `min` boxes for the offset.
+    let mut out = b.to_string();
+    for _ in 0..(max - min) {
+        out = format!("({b} || [] {out})");
+    }
+    for _ in 0..min {
+        out = format!("[] {out}");
+    }
+    out
 }
 
 /// Translate a boolean `Expression` into mu-calculus atom/connective text.
@@ -1243,6 +1336,84 @@ mod tests {
         .expect("translates");
         assert!(f.contains("[] b"), "|=> must put b under a next ([]): {f}");
         crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl4_fixed_cycle_delay_consequent() {
+        // a |-> ##2 b  →  b two cycles later ([] [] b). slang shape: right =
+        // SequenceConcat { elements: [{ sequence: Simple(b), min:2, max:2 }] }
+        // (captured from real slang 11.0.0 --ast-json).
+        let spec = serde_json::json!({
+            "kind": "Binary",
+            "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}},
+                 "min": 2, "max": 2}
+            ]}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(f.contains("(!(a) || [] [] b)"), "##2 → two boxes: {f}");
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl4_bounded_range_delay_consequent() {
+        // a |=> ##[1:3] b  →  b somewhere in the window, plus one [] from |=>.
+        let spec = serde_json::json!({
+            "kind": "Binary",
+            "op": "NonOverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}},
+                 "min": 1, "max": 3}
+            ]}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("[] [] (b || [] (b || [] b))"),
+            "range [1:3] under |=>: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl4_multi_element_and_deep_delay_rejected() {
+        // A two-element `##` chain is a sequence (Tier-3) — rejected, not dropped.
+        let multi = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}, "min":1, "max":1},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "3 c"}}, "min":1, "max":1}
+            ]}
+        });
+        let err = property_body(&multi, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("multi-element must reject");
+        assert!(err.contains("multi-element"), "got: {err}");
+        // A delay past the unroll cap is rejected (no formula explosion / `##[m:$]`).
+        let deep = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}, "min":100, "max":100}
+            ]}
+        });
+        let err = property_body(&deep, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("deep delay must reject");
+        assert!(err.contains("cap"), "got: {err}");
     }
 
     #[test]
