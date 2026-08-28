@@ -231,13 +231,17 @@ the initial state too. So every data-integrity property, which is `|=>` by
 construction, is unaffected; a `|->` property over `$past` of an input reads an
 invented cycle-0 history and its verdict there does not transfer.
 
-Two caveats that are **not** about the shadow's source. `must_edge_inference` is
-unsound on any `$past` model today (it can report `violated` for a correct
-design), and `--engine symbolic` aborts on one; both reproduce on a
-register-sourced `$past`. Leave must-edge inference off, which is the default.
+Two caveats that used to be about `$past` under must-edge inference. Both are now
+fixed at the lift (2026-08-28): the abstraction enforces the KMTS invariant
+`R_must ⊆ R_may` where must-edges are created — it no longer fabricates a must-edge
+out of an unsatisfiable predicate cube, and a per-lift check rejects any residual
+containment violation before it reaches an engine. So `must_edge_inference` no
+longer reports a spurious `violated` for a correct `$past` design, and
+`--engine symbolic` no longer aborts on one. (Default is still must-edge inference
+off, which was already sound for `holds`.)
 [`docs/design/past-shadow-soundness.md`](design/past-shadow-soundness.md) carries
-the full argument, the per-engine ledger, and why no engine may ever assume
-stutter equivalence here.
+the full argument, the per-engine ledger, the §6 fix note, and why no engine may
+ever assume stutter equivalence here.
 
 Some designs hit the abstraction ceiling and return
 `unknown`. Crucially, **a `holds` or `violated` verdict is sound** (Bruns–Godefroid

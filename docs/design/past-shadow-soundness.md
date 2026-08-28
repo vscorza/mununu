@@ -157,6 +157,27 @@ about it; §6 is what happens when it is not met.
 
 ## 6. Two defects this surfaced
 
+> **Update (2026-08-28) — fixed at the lift.** The root cause below (a must-edge
+> created without enforcing `R_must ⊆ R_may`) is now closed in
+> [`kmts_lift.rs`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs) by three
+> composing changes: (A) the `SmtAllPairs` standard-must arm restricts the ∀∃
+> must-image to the emitted `may_edges` (`must_edges_over`) instead of the full
+> grid, so a vacuous must out of an empty src — which the ∃-witness may-check never
+> emits — can no longer be promoted; (B) `apply_sampled_must_inference` proves each
+> candidate source cube feasible (`smt_source_cube_proven_feasible`, `∃ s. ⋀ src_i`)
+> and drops must-promotion out of the proven-empty ones, closing the sampling path
+> where the canonical representative fabricates a may-edge for an unsatisfiable cube;
+> (C) `assert_must_subset_may` runs once per lift (release included) and returns an
+> `IrConsistencyError` if any `MustHyperOnly` target is not a may-successor, rather
+> than letting an inconsistent KMTS reach `TritBdd::from_parts`. Unit-tested in
+> `kmts_lift.rs` (`must_subset_may_no_vacuous_must_from_unsat_cube_{all_pairs,sampling}`,
+> `assert_must_subset_may_{rejects,accepts}_*`). The `from_parts` `debug_assert!`
+> stays as the debug tripwire (§5); the release guarantee is now (C).
+>
+> The table below is the **pre-fix** measurement. Re-run the `$past` e2e in the
+> `mununu-sva` image to confirm each `Violated`/`panic` entry flips to a sound
+> verdict on the real design (host runs cannot exercise the slang path).
+
 Both are **pre-existing** and reproduce identically on a *register*-sourced
 `$past`, so neither comes from input support. A property with no `$past` is
 unaffected in both postures. All three designs below are correct.
@@ -211,8 +232,8 @@ step-collapsing optimisation must exclude models carrying `__past` shadows, or
 | reach portfolio (btormc / pono / Boolector) | **Exact.** Consumes the BTOR2 directly; the shadow is a real flop. Requires the `init` value's NID to precede the state's — see §4. |
 | exact-symbolic (ROBDD, 2-valued) | **Exact** on the augmented model. Independently refuses any property whose atom names a primary input (`push \|=> …`), because it leaves inputs free and a formula pinning one would decouple antecedent from consequent. It says so and skips rather than guessing. |
 | explicit / symbolic cube, `must_edge_inference: Off` | **Sound for HOLDS** (may over-approximation + safety). Cannot refute a data-dependent violation; reports ⊥. |
-| explicit / symbolic cube, must-edge inference on | **Unsound today** — §6. |
-| `symbolic_engine: true` | **Panics** on any `$past` model in debug; inconsistent `TritBdd` in release — §6. |
+| explicit / symbolic cube, must-edge inference on | **Sound at the lift (2026-08-28, §6 update box)** — the vacuous must out of an empty cube that caused the false `Violated` is no longer created, and `assert_must_subset_may` gates any residual. e2e confirmation in `mununu-sva` pending. Was **unsound** pre-fix — §6. |
+| `symbolic_engine: true` | **No longer fed an inconsistent KMTS (2026-08-28)** — the lift enforces `R_must ⊆ R_may` before `TritBdd::from_parts`, so the debug panic / release miscompute of §6 cannot arise from a `$past` model. Was **panic (debug) / wrong verdict (release)** pre-fix — §6. |
 
 ## 9. What is argued vs verified vs gap
 
@@ -222,10 +243,16 @@ step-collapsing optimisation must exclude models carrying `__past` shadows, or
   model are pinned by tests in `tests/past_shadow_input_e2e.rs`, run against live
   slang + yosys in the `mununu-sva` image.
 - **Measured** (§6): the two defects, and the ⊥ ceiling for refutation, reproduced
-  across four engine postures and two data widths.
-- **Gap**: `R_must ⊆ R_may` is not enforced where must-edges are created. Fixing that
-  is what would turn the ⊥ in §6 into a definite VIOLATED, and is the single change
-  that would most improve `$past` coverage.
+  across four engine postures and two data widths (pre-fix).
+- **Gap — CLOSED at the lift (2026-08-28, §6 update box).** `R_must ⊆ R_may` is now
+  enforced where must-edges are created: the ∀∃ must is restricted to the emitted
+  may-relation (Fix A), proven-empty source cubes are excluded from must-promotion
+  (Fix B), and a per-lift `assert_must_subset_may` rejects any residual containment
+  violation before the evaluator (Fix C). Mechanism-level unit tests pass; the
+  remaining confirmation is the e2e `$past` reproduction in the `mununu-sva` image
+  (host runs cannot exercise slang), which should show the §6 `Violated`/`panic`
+  entries turn into a sound `holds`/`violated`, and a genuine data-dependent
+  violation reach a definite `VIOLATED` rather than ⊥.
 
 ## 10. References
 
