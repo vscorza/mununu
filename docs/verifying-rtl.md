@@ -120,6 +120,29 @@ The response reports a verdict per translated assertion, plus a list of assertio
 that did **not** translate (surfaced honestly, never silently dropped) and
 model-level diagnostics.
 
+### Shrinking a parameterised design: `--param`
+
+> Source of truth: [`build_chparam_passes`](../crates/mununu-core/src/adapter/yosys/mod.rs) — surface: (CLI+API+UI)
+
+A design whose timing intervals are **parameters** sizes its counters by those
+parameters — a 20 000-cycle power-up wait makes a 15-bit counter, and the exact
+engine then abstains (`skip-diameter-bound`) even though the properties are about
+the *order* of operations, not durations. `--param NAME=VALUE` (API `params: [...]`)
+overrides a module parameter **before elaboration**, so the counters get smaller
+without a wrapper module (a wrapper would rename the SVA atoms and break binding):
+
+```bash
+mununu sv verify-auto sdram_ctrl.sv --top sdram_ctrl --param INIT_WAIT=4
+```
+
+`NAME=VALUE` targets the top module; `MODULE.NAME=VALUE` a submodule. The
+mechanism is frontend-appropriate — yosys `chparam` on the read_verilog frontend
+(parameters stay unresolved until `hierarchy`), slang `-G` on the `--frontend
+slang` path (slang elaborates at read time). A parameter that is **not** a real
+parameter of the design is a hard **error** (it lists the declared parameters),
+never a silent drop; the applied overrides are echoed as a `parameter-override`
+scope note — the verdicts are scoped to those values.
+
 ---
 
 ## Driving it from an external agent (e.g. an agent writing RTL)

@@ -147,6 +147,12 @@ pub struct TranslationReport {
     /// [`TranslateOptions::gate_reset`]. The verify-auto path pins these inputs
     /// inactive at the model level.
     pub reset_signals: Vec<ResetSignal>,
+    /// Every `parameter` / `localparam` NAME declared anywhere in the design (from
+    /// the slang AST). The verify-auto `--param` path validates each requested
+    /// override name against this set — the slang front-end's `-G` override
+    /// silently ignores an unknown name, so this is where an unapplicable `--param`
+    /// is turned into a hard error rather than a silent drop. Deduped.
+    pub parameter_names: Vec<String>,
 }
 
 /// Options controlling translation.
@@ -258,7 +264,37 @@ pub fn translate_ast_json_with_options(
             }),
         }
     }
+    // Design-wide parameter names (for `--param` override validation), collected
+    // once from the whole AST rather than per-assertion.
+    collect_parameter_names(&root, &mut report.parameter_names);
     Ok(report)
+}
+
+/// Collect every `parameter` / `localparam` NAME in a slang `--ast-json` document
+/// (slang serialises both as a `"kind": "Parameter"` node with a `"name"`). Used
+/// to validate `--param` override names — the slang `-G` override silently ignores
+/// an unknown one, so an unapplicable override must be caught here. Deduped.
+fn collect_parameter_names(node: &Value, out: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            if map.get("kind").and_then(Value::as_str) == Some("Parameter")
+                && let Some(name) = map.get("name").and_then(Value::as_str)
+                && !name.is_empty()
+                && !out.iter().any(|n| n == name)
+            {
+                out.push(name.to_string());
+            }
+            for v in map.values() {
+                collect_parameter_names(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_parameter_names(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively collect `ConcurrentAssertion` nodes, tracking the nearest
@@ -2203,6 +2239,27 @@ mod tests {
         });
         let err = bool_expr(&two_reg).expect_err("two-register addend must reject");
         assert!(err.contains("arithmetic"), "got: {err}");
+    }
+
+    #[test]
+    fn collect_parameter_names_finds_declared_params() {
+        // slang serialises `parameter`/`localparam` as a `Parameter` node with a
+        // `name`; --param validation checks override names against these.
+        let ast = serde_json::json!({
+            "members": [
+                {"kind": "Parameter", "name": "INIT_WAIT", "value": "20000"},
+                {"kind": "Parameter", "name": "W", "value": "15"},
+                {"kind": "Variable", "name": "cnt"}
+            ]
+        });
+        let mut out = Vec::new();
+        collect_parameter_names(&ast, &mut out);
+        assert!(out.contains(&"INIT_WAIT".to_string()), "got {out:?}");
+        assert!(out.contains(&"W".to_string()), "got {out:?}");
+        assert!(
+            !out.contains(&"cnt".to_string()),
+            "non-Parameter excluded: {out:?}"
+        );
     }
 
     #[test]

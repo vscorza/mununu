@@ -369,6 +369,7 @@ fn build_notes(
     report: &AutoVerifyReport,
     must_edge_inference: MustEdgeInference,
     applied_config_values: &[(String, u64)],
+    applied_params: &[(String, String)],
     counter_bounds: &[String],
     cutpoint_signals: &[String],
     posture: &NotePosture,
@@ -418,6 +419,30 @@ fn build_notes(
             items: applied_config_values
                 .iter()
                 .map(|(sig, v)| format!("{sig}={v}"))
+                .collect(),
+        });
+    }
+
+    // Parameter overrides (ScopeCaveat) — present only when the user passed
+    // `--param` / `params`. The design was re-elaborated with these module
+    // parameters, so the verdicts are scoped to them (a different parameter value
+    // could size a different design).
+    if !applied_params.is_empty() {
+        notes.push(VerificationNote {
+            kind: "parameter-override".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "{} module parameter(s) overridden before the lift (yosys chparam / slang -G) — verdicts hold for THESE parameter values.",
+                applied_params.len()
+            ),
+            detail: "A module parameter was set before elaboration (e.g. to shrink a timing \
+                     interval so its counters fit the exact engine), so the design verified here \
+                     is the one sized by these parameters. A different parameter value would size \
+                     a different design; re-run to cover other values."
+                .into(),
+            items: applied_params
+                .iter()
+                .map(|(lhs, v)| format!("{lhs}={v}"))
                 .collect(),
         });
     }
@@ -1828,6 +1853,34 @@ pub(crate) fn prepare_model(
         predicate_hints,
     } = extract_front(sources, opts)?;
 
+    // Validate `--param` override names against the design's declared parameters
+    // (from the slang AST). The read_verilog lift's `chparam` errors on an unknown
+    // name, but the slang lift's `-G` override SILENTLY ignores it — so an
+    // unapplicable `--param` is caught here, uniformly, as a hard error rather than
+    // a silent drop (contrast `--config-value`, mununu#459). A `MODULE.NAME`
+    // override is validated on its bare `NAME`.
+    if !yosys_opts.params.is_empty() {
+        for (lhs, value) in &yosys_opts.params {
+            let name = lhs.rsplit('.').next().unwrap_or(lhs);
+            if !extraction.parameter_names.iter().any(|p| p == name) {
+                return Err(AdapterError {
+                    kind: AdapterErrorKind::UnsupportedConstruct,
+                    location: None,
+                    message: format!(
+                        "--param {lhs}={value}: `{name}` is not a parameter of the design. \
+                         A parameter override must name a real module parameter — it is never \
+                         silently dropped. Declared parameters: {}.",
+                        if extraction.parameter_names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            extraction.parameter_names.join(", ")
+                        }
+                    ),
+                });
+            }
+        }
+    }
+
     let mut report = AutoVerifyReport {
         unsupported: extraction
             .unsupported
@@ -1847,6 +1900,7 @@ pub(crate) fn prepare_model(
             &report,
             opts.must_edge_inference,
             &[],
+            &yosys_opts.params,
             &[],
             &yosys_opts.cutpoint_signals,
             &posture,
@@ -2538,6 +2592,7 @@ pub(crate) fn verify_auto_impl(
         &report,
         opts.must_edge_inference,
         &applied_config_values,
+        &yosys_opts.params,
         &counter_bound_items_vec,
         &yosys_opts.cutpoint_signals,
         &posture,
@@ -3020,6 +3075,7 @@ mod tests {
             build_notes(
                 report,
                 MustEdgeInference::Off,
+                &[],
                 &[],
                 &[],
                 &["cnt".to_string()],
@@ -4022,6 +4078,7 @@ module uart_tx(); endmodule"#;
             &report,
             MustEdgeInference::SmtHyperMust,
             &[("cfg_detect_timer_i".into(), 7)],
+            &[],
             &["cnt_q <= 7 (config-inferred)".to_string()],
             &[],
             &NotePosture::Cube,
@@ -4080,6 +4137,7 @@ module uart_tx(); endmodule"#;
             &[],
             &[],
             &[],
+            &[],
             &NotePosture::Cube,
         );
         assert!(
@@ -4119,6 +4177,7 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::SmtHyperMust,
             &[],
             &[],
+            &[],
             &["must_refresh".to_string(), "precharge_done".to_string()],
             &NotePosture::Exact,
         );
@@ -4133,6 +4192,7 @@ module uart_tx(); endmodule"#;
         let none = build_notes(
             &report,
             MustEdgeInference::Off,
+            &[],
             &[],
             &[],
             &[],
@@ -4167,6 +4227,7 @@ module uart_tx(); endmodule"#;
             build_notes(
                 &report,
                 MustEdgeInference::SmtHyperMust,
+                &[],
                 &[],
                 &[],
                 &[],
