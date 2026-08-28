@@ -190,9 +190,27 @@ about it; §6 is what happens when it is not met.
 > `assert_must_subset_may_{rejects,accepts}_*`). The `from_parts` `debug_assert!`
 > stays as the debug tripwire (§5); the release guarantee is now (C).
 >
-> The table below is the **pre-fix** measurement. Re-run the `$past` e2e in the
-> `mununu-sva` image to confirm each `Violated`/`panic` entry flips to a sound
-> verdict on the real design (host runs cannot exercise the slang path).
+> **Update (2026-08-28, part 2) — the symbolic engine had a SEPARATE path.**
+> (A)–(C) fix the cube / `kmts_lift` must-edge inference (the explicit + cube
+> engines). The `symbolic` engine builds its **own** may/must abstraction in
+> [`symbolic_bitblast.rs`](../../crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs)
+> (`AbstractRelation`), which (A)–(C) do not touch — and an **e2e run in the
+> `mununu-sva` image caught it still panicking** on a `$past` data-integrity
+> property (`push |=> stored == $past(din)`). Root cause: an **input predicate**
+> (`push`) makes the abstraction depend on an input var, which is both a present
+> *observable* and the transition *nondeterminism* — the same conflation the exact
+> ROBDD engine refuses an input atom over. It left `R_must`'s BDD support dirty, so
+> `box.must ⊄ box.may`. Fix (D): `AbstractRelation::build` now detects an
+> input-predicate abstraction (quantifying inputs changes feasibility) and falls
+> back to **may-only** (`r_must = None`) — sound (definite HOLDS transfers;
+> refutation → ⊥), no panic, no wrong verdict. `feasible_present` also now
+> quantifies inputs (`xi_cube`), a no-op for register-only predicates.
+>
+> The table below is the **pre-fix** measurement. The `$past` e2e was run in the
+> `mununu-sva` image (that is what caught (D)); a register-`$past` / `##k` design
+> now decides cleanly (see the XL.4/XL.5 e2e). A `push |=> stored == $past(din)`
+> input-antecedent property is may-only (⊥ under abstraction, or decided by the
+> reach portfolio) — sound, never a spurious `Violated`/panic.
 
 Both are **pre-existing** and reproduce identically on a *register*-sourced
 `$past`, so neither comes from input support. A property with no `$past` is
@@ -248,8 +266,8 @@ step-collapsing optimisation must exclude models carrying `__past` shadows, or
 | reach portfolio (btormc / pono / Boolector) | **Exact.** Consumes the BTOR2 directly; the shadow is a real flop. Requires the `init` value's NID to precede the state's — see §4. |
 | exact-symbolic (ROBDD, 2-valued) | **Exact** on the augmented model. Independently refuses any property whose atom names a primary input (`push \|=> …`), because it leaves inputs free and a formula pinning one would decouple antecedent from consequent. It says so and skips rather than guessing. |
 | explicit / symbolic cube, `must_edge_inference: Off` | **Sound for HOLDS** (may over-approximation + safety). Cannot refute a data-dependent violation; reports ⊥. |
-| explicit / symbolic cube, must-edge inference on | **Sound at the lift (2026-08-28, §6 update box)** — the vacuous must out of an empty cube that caused the false `Violated` is no longer created, and `assert_must_subset_may` gates any residual. e2e confirmation in `mununu-sva` pending. Was **unsound** pre-fix — §6. |
-| `symbolic_engine: true` | **No longer fed an inconsistent KMTS (2026-08-28)** — the lift enforces `R_must ⊆ R_may` before `TritBdd::from_parts`, so the debug panic / release miscompute of §6 cannot arise from a `$past` model. Was **panic (debug) / wrong verdict (release)** pre-fix — §6. |
+| explicit / symbolic cube, must-edge inference on | **Sound at the lift (2026-08-28, §6 update box, A–C)** — the vacuous must out of an empty cube that caused the false `Violated` is no longer created, and `assert_must_subset_may` gates any residual. Was **unsound** pre-fix — §6. |
+| `symbolic` engine (`symbolic_bitblast::AbstractRelation`) | **Sound (2026-08-28, §6 update box, D)** — an input-predicate abstraction now falls back to may-only (`r_must = None`) instead of building a support-dirty `R_must`; definite HOLDS transfers, refutation → ⊥. e2e-confirmed in `mununu-sva` (this is the path that still panicked after A–C). Was **panic (debug) / wrong verdict (release)** pre-fix — §6. |
 
 ## 9. What is argued vs verified vs gap
 
