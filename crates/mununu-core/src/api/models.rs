@@ -1419,6 +1419,9 @@ pub struct UnsupportedAssertionView {
 pub struct ShadowSignalView {
     pub base: String,
     pub width: u32,
+    /// Deepest `$past` history depth synthesised for `base` (1 for the
+    /// depth-1 family; `k` for `$past(base, k)`).
+    pub depth: u32,
 }
 
 /// XL.6b — automated SVA verification endpoint (`POST /api/v1/sv/verify-auto`).

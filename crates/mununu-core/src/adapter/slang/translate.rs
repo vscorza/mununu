@@ -100,13 +100,19 @@ pub struct UnsupportedAssertion {
 
 /// XL.3 (Tier-2): a base signal whose previous-cycle value a translated
 /// assertion needs. The BTOR2 model-augmentation step (XL.3b) must synthesise a
-/// 1-step shadow flop named `<base>__past` of this width — `next(<base>__past)
-/// = <base>` — so the `<base>__past` atoms the translator emits actually bind.
+/// `depth`-stage shadow shift chain for it — `next(<base>__past) = <base>`,
+/// `next(<base>__past2) = <base>__past`, … up to `<base>__past{depth}` — so the
+/// shadow atoms the translator emits (`past_shadow_name(base, k)` for every
+/// `k <= depth`) actually bind. `depth` is the DEEPEST history any assertion
+/// reads for this base; the chain covers every shallower `$past(base, j)` too.
 /// Reported only for *successfully* translated assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowSignal {
     pub base: String,
     pub width: u32,
+    /// Deepest `$past` depth read for `base` (1 for `$stable`/`$rose`/… and
+    /// bare `$past(base)`; `k` for `$past(base, k)`).
+    pub depth: u32,
 }
 
 /// A reset signal recognized in a `disable iff (...)` guard: the input to pin
@@ -346,18 +352,31 @@ fn resolve_enum_refs(node: &Value, enums: &std::collections::HashMap<String, i64
 fn collect_shadow_signals(node: &Value, out: &mut Vec<ShadowSignal>) {
     match node {
         Value::Object(map) => {
+            let sub = map.get("subroutine").and_then(Value::as_str);
             if map.get("kind").and_then(Value::as_str) == Some("Call")
                 && matches!(
-                    map.get("subroutine").and_then(Value::as_str),
+                    sub,
                     Some("$past" | "$stable" | "$changed" | "$rose" | "$fell")
                 )
-                && let Ok((base, width)) = call_arg_signal(node)
-                && !out.iter().any(|s| s.base == base)
             {
-                out.push(ShadowSignal {
-                    base: base.to_string(),
-                    width,
-                });
+                // `$past` carries a depth; the others are depth-1. Record the
+                // DEEPEST depth per base (the shift chain covers all shallower).
+                let resolved = if sub == Some("$past") {
+                    past_call_arg(node).ok()
+                } else {
+                    call_arg_signal(node).ok().map(|(b, w)| (b, w, 1))
+                };
+                if let Some((base, width, depth)) = resolved {
+                    if let Some(existing) = out.iter_mut().find(|s| s.base == base) {
+                        existing.depth = existing.depth.max(depth);
+                    } else {
+                        out.push(ShadowSignal {
+                            base: base.to_string(),
+                            width,
+                            depth,
+                        });
+                    }
+                }
             }
             for v in map.values() {
                 collect_shadow_signals(v, out);
@@ -606,7 +625,7 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
             match sub {
                 "$stable" | "$changed" => {
                     let (sig, _w) = call_arg_signal(expr)?;
-                    let shadow = past_shadow_name(sig);
+                    let shadow = past_shadow_name(sig, 1);
                     let cmp = if sub == "$stable" { "==" } else { "!=" };
                     Ok(format!("({sig} {cmp} {shadow})"))
                 }
@@ -618,17 +637,18 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                              {sub} on 1-bit signals only"
                         ));
                     }
-                    let shadow = past_shadow_name(sig);
+                    let shadow = past_shadow_name(sig, 1);
                     Ok(if sub == "$rose" {
                         format!("({sig} && (!({shadow})))") // 1 now, 0 last cycle
                     } else {
                         format!("((!({sig})) && {shadow})") // 0 now, 1 last cycle
                     })
                 }
-                // `$past(x)` is a value; in boolean position a vector → `!= 0`.
+                // `$past(x[, k])` is a value; in boolean position a vector → `!= 0`.
+                // `k` (default 1) selects the depth-`k` shadow along the shift chain.
                 "$past" => {
-                    let (sig, w) = call_arg_signal(expr)?;
-                    let shadow = past_shadow_name(sig);
+                    let (sig, w, depth) = past_call_arg(expr)?;
+                    let shadow = past_shadow_name(sig, depth);
                     Ok(if w > 1 {
                         format!("({shadow} != 0)")
                     } else {
@@ -881,11 +901,21 @@ fn reduction_to_cmp(operand: &Value, op: &str, need_all_ones: bool) -> Result<St
     Ok(format!("({sig} {op} {rhs})"))
 }
 
-/// The `__past` shadow-register name for a base signal — the XL.3 naming
-/// contract shared with the BTOR2 model-augmentation step (XL.3b synthesises a
-/// 1-step flop with `next(<base>__past) = <base>` so the atom binds).
-fn past_shadow_name(base: &str) -> String {
-    format!("{base}__past")
+/// The `__past` shadow-register name for a base signal at history `depth` — the
+/// XL.3 naming contract shared with the BTOR2 model-augmentation step (XL.3b
+/// synthesises a `depth`-stage shift chain `next(<base>__past) = <base>`,
+/// `next(<base>__past2) = <base>__past`, … so the atom binds).
+///
+/// Depth 1 keeps the historical bare `<base>__past` (backward compatible with
+/// `$past`/`$stable`/`$rose`/`$fell` and every existing model); depth `k ≥ 2`
+/// (from `$past(x, k)`) is `<base>__past{k}`. `shadow::shadow_stage_name` MUST
+/// mirror this exactly — the two are the two halves of one naming contract.
+fn past_shadow_name(base: &str, depth: u32) -> String {
+    if depth <= 1 {
+        format!("{base}__past")
+    } else {
+        format!("{base}__past{depth}")
+    }
 }
 
 /// True if `expr` (modulo `Conversion` peeling) is a `$past(...)` call.
@@ -896,13 +926,13 @@ fn is_past_call(expr: &Value) -> bool {
 }
 
 /// A comparison operand that resolves to a mu-calc atom name: a plain signal, or
-/// `$past(signal)` → its `__past` shadow. `None` for anything else.
+/// `$past(signal[, k])` → its depth-`k` `__past` shadow. `None` for anything else.
 fn cmp_signal_atom(expr: &Value) -> Option<String> {
     let expr = unwrap(expr);
     if is_past_call(expr) {
-        return call_arg_signal(expr)
+        return past_call_arg(expr)
             .ok()
-            .map(|(sig, _)| past_shadow_name(sig));
+            .map(|(sig, _, depth)| past_shadow_name(sig, depth));
     }
     signal_name(expr).ok().map(|s| s.to_string())
 }
@@ -934,9 +964,11 @@ fn add_signal_literal(expr: &Value) -> Option<(String, u64)> {
     None
 }
 
-/// A Tier-2 history call (`$past`/`$stable`/`$changed`/`$rose`/`$fell`) takes
-/// exactly one signal argument; return its `(name, width)`. Rejects depth>1
-/// `$past` (≥2 args), multi-arg forms, and non-signal arguments.
+/// A single-signal Tier-2 call (`$stable`/`$changed`/`$rose`/`$fell`, and the
+/// one-hot `$onehot`/`$onehot0`) takes exactly one signal argument; return its
+/// `(name, width)`. These are inherently previous-cycle / current-cycle forms, so
+/// a second (depth) argument is rejected here. `$past` — the only depth-carrying
+/// history call — goes through [`past_call_arg`] instead.
 fn call_arg_signal(call: &Value) -> Result<(&str, u32), String> {
     let sub = call
         .get("subroutine")
@@ -948,13 +980,53 @@ fn call_arg_signal(call: &Value) -> Result<(&str, u32), String> {
         .ok_or_else(|| format!("{sub} without an argument list"))?;
     if args.len() != 1 {
         return Err(format!(
-            "{sub} with {} arguments; Tier-2 supports single-signal depth-1 history only",
+            "{sub} with {} arguments; this Tier-2 call takes a single signal \
+             (only `$past` carries a depth argument)",
             args.len()
         ));
     }
     let arg = unwrap(&args[0]);
     let sig = signal_name(arg).map_err(|_| format!("{sub} argument is not a plain signal"))?;
     Ok((sig, signal_width(arg)))
+}
+
+/// `$past(signal[, depth])` — Tier-2 history with an optional constant depth `k`
+/// (default 1). Returns `(name, width, depth)`. A second argument is the history
+/// depth: a constant integer literal ≥ 1 (`$past(x, 3)` = "x, three cycles ago").
+/// The XL.3b augmentation builds a `depth`-stage shift chain so the shadow atom
+/// [`past_shadow_name`]`(name, depth)` binds. Rejects depth 0 / negative, a
+/// non-literal depth, more than two arguments, and a non-signal first argument.
+fn past_call_arg(call: &Value) -> Result<(&str, u32, u32), String> {
+    let sub = call
+        .get("subroutine")
+        .and_then(Value::as_str)
+        .unwrap_or("$past");
+    let args = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{sub} without an argument list"))?;
+    if args.is_empty() || args.len() > 2 {
+        return Err(format!(
+            "{sub} with {} arguments; expected `$past(signal[, depth])`",
+            args.len()
+        ));
+    }
+    let arg = unwrap(&args[0]);
+    let sig =
+        signal_name(arg).map_err(|_| format!("{sub} first argument is not a plain signal"))?;
+    let depth = if args.len() == 2 {
+        let d = sv_integer(unwrap(&args[1]))
+            .ok_or_else(|| format!("{sub} depth argument must be a constant integer literal"))?;
+        if d < 1 {
+            return Err(format!(
+                "{sub} depth {d} is not >= 1 (a $past depth is a positive number of cycles)"
+            ));
+        }
+        d as u32
+    } else {
+        1
+    };
+    Ok((sig, signal_width(arg), depth))
 }
 
 /// `~x` in boolean position: logical-not on a 1-bit operand; a vector `~x` is a
@@ -1649,17 +1721,46 @@ mod tests {
     }
 
     #[test]
-    fn xl3_past_depth_gt_1_is_rejected() {
-        // `$past(x, 2)` — two arguments → out of Tier-2 (depth-1 only).
-        let call = serde_json::json!({
+    fn xl3_past_depth_k_lowers_to_the_suffixed_shadow() {
+        // `$past(x, 2)` — depth 2 now lowers to the stage-2 shadow `x__past2`
+        // (Tier-1 k-deep history). Bare `$past(x)` / depth 1 stays `x__past`.
+        let two = serde_json::json!({
             "kind": "Call", "subroutine": "$past",
             "arguments": [
                 {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
                 {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
             ]
         });
-        let err = bool_expr(&call).expect_err("depth>1 must reject");
-        assert!(err.contains("depth-1"), "got: {err}");
+        assert_eq!(bool_expr(&two).expect("depth 2 accepted"), "x__past2");
+        let one = serde_json::json!({
+            "kind": "Call", "subroutine": "$past",
+            "arguments": [{"kind": "NamedValue", "symbol": "1 x", "type": "logic"}]
+        });
+        assert_eq!(bool_expr(&one).expect("depth 1 accepted"), "x__past");
+    }
+
+    #[test]
+    fn xl3_past_depth_zero_and_stable_with_depth_are_rejected() {
+        // `$past(x, 0)` — a depth must be a positive number of cycles.
+        let zero = serde_json::json!({
+            "kind": "Call", "subroutine": "$past",
+            "arguments": [
+                {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
+                {"kind": "IntegerLiteral", "value": "0", "constant": "0"}
+            ]
+        });
+        let err = bool_expr(&zero).expect_err("depth 0 must reject");
+        assert!(err.contains(">= 1"), "got: {err}");
+        // `$stable(x, 2)` — only `$past` carries a depth argument.
+        let stable2 = serde_json::json!({
+            "kind": "Call", "subroutine": "$stable",
+            "arguments": [
+                {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
+                {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
+            ]
+        });
+        let err = bool_expr(&stable2).expect_err("$stable depth must reject");
+        assert!(err.contains("single signal"), "got: {err}");
     }
 
     #[test]
@@ -1789,14 +1890,16 @@ mod tests {
             vec![
                 ShadowSignal {
                     base: "state_q".into(),
-                    width: 6
+                    width: 6,
+                    depth: 1
                 },
                 ShadowSignal {
                     base: "v".into(),
-                    width: 1
+                    width: 1,
+                    depth: 1
                 },
             ],
-            "required_shadows must dedup by base + carry width"
+            "required_shadows must dedup by base + carry width + depth"
         );
     }
 

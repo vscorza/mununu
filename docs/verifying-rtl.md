@@ -194,9 +194,9 @@ works when you want the intermediate BTOR2.)
 
 ### 3. Coverage is a fragment, and verdicts are honest
 
-The SVA translator supports a defined fragment (implication `|->` / `|=>`, `$past` /
-`$stable` / `$rose` / `$fell`, `$onehot` / `$onehot0`, …); assertions outside it come
-back in the `unsupported` list.
+The SVA translator supports a defined fragment (implication `|->` / `|=>`, `$past`
+(including a depth `$past(x, k)`, k ≥ 1) / `$stable` / `$rose` / `$fell`, `$onehot`
+/ `$onehot0`, …); assertions outside it come back in the `unsupported` list.
 
 The history functions work over a **register or a primary input**. That second
 half matters more than it sounds: it is what makes a data-integrity property —
@@ -209,27 +209,33 @@ input.
 (push && !pop && cnt_q == 0) |=> (d0_q == $past(din))
 ```
 
-Each `$past` base becomes a real 1-step flop in the model (`next(b__past) = b`),
-so the verdict transfers to the concrete design. This is a **history variable** —
-its next value is a function of the present, nothing in the design reads it, and
-so the augmented system is a conservative extension of the original: it can
-neither create nor destroy a counterexample. The base may be a register or a
-primary **input**; both produce the same flop.
+Each `$past` base becomes a real flop in the model (`next(b__past) = b`), so the
+verdict transfers to the concrete design. `$past(x, k)` becomes a **k-stage shift
+chain** (`b__past ← b`, `b__past2 ← b__past`, … `b__past{k}`); the common
+`$past(x)` is the 1-stage case. Each stage is a **history variable** — its next
+value is a function of the present, nothing in the design reads it, so the
+augmented system is a conservative extension of the original: it can neither
+create nor destroy a counterexample (the argument composes stage by stage). The
+base may be a register or a primary **input**; both produce the same chain.
 
-Only the initial state needs care, because a history variable has no value before
-the first transition. A state cell's shadow mirrors its `init`, giving
-`b__past == b` at cycle 0. An input has no `init` to mirror, so **its shadow is
-pinned to an explicit zero** rather than left free: an init-less BTOR2 cell reads
-as 0 to the cube and exact engines but stays free for the reachability portfolio,
-and that split is a verdict disagreement, not a nuance.
+Only the initial cycles need care, because a history variable has no value before
+the first transition. A state cell's stages mirror its `init`, so before the chain
+fills (cycles `< j` for stage `j`) `$past(b, j)` reads `b`'s reset value. An input
+has no `init` to mirror, so **every stage is pinned to an explicit zero** rather
+than left free: an init-less BTOR2 cell reads as 0 to the cube and exact engines
+but stays free for the reachability portfolio, and that split is a verdict
+disagreement, not a nuance.
 
-That invented value is read **only by a property that reads `$past` in the same
-cycle as its trigger**. The lift settles it structurally: `|=>` places the atom
-under a `[]`, so it is evaluated only at states that have a predecessor — where
-the shadow holds a value the design actually drove — while `|->` evaluates it at
-the initial state too. So every data-integrity property, which is `|=>` by
-construction, is unaffected; a `|->` property over `$past` of an input reads an
-invented cycle-0 history and its verdict there does not transfer.
+That invented value is read only in the first few cycles after reset. The lift
+settles it structurally: `|=>` places the atom under a `[]`, so it is evaluated
+only at states that have a predecessor — for depth 1 that fully hides the invented
+value, while `|->` evaluates it at the initial state too. So a depth-1
+data-integrity property (`|=>` by construction) is unaffected; a `|->` property
+over `$past` of an input reads an invented cycle-0 history and its verdict there
+does not transfer. For a **depth-k** `$past` of an input the chain takes k cycles
+to fill, so even under a `[]` the first k-1 post-reset cycles read the invented
+zero — an over-approximation bounded to those cycles (a register base reads its
+reset value there, which is the SVA convention, not an approximation).
 
 Two caveats that used to be about `$past` under must-edge inference. Both are now
 fixed at the lift (2026-08-28): the abstraction enforces the KMTS invariant

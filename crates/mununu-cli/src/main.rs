@@ -3391,7 +3391,13 @@ fn render_extract_sva_text(report: &mununu_core::adapter::slang::translate::Tran
         let shadows: Vec<String> = report
             .required_shadows
             .iter()
-            .map(|s| format!("{}({})", s.base, s.width))
+            .map(|s| {
+                if s.depth > 1 {
+                    format!("{}({}) x{} deep", s.base, s.width, s.depth)
+                } else {
+                    format!("{}({})", s.base, s.width)
+                }
+            })
             .collect();
         println!("  required __past shadow registers: {}", shadows.join(", "));
     }
@@ -3424,7 +3430,7 @@ fn render_extract_sva_json(report: &mununu_core::adapter::slang::translate::Tran
     let required_shadows: Vec<serde_json::Value> = report
         .required_shadows
         .iter()
-        .map(|s| serde_json::json!({ "base": s.base, "width": s.width }))
+        .map(|s| serde_json::json!({ "base": s.base, "width": s.width, "depth": s.depth }))
         .collect();
     let out = serde_json::json!({
         "translated": translated,

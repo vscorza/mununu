@@ -33,6 +33,12 @@ n+1   next  <sort> n <b>
 n+2   init  <sort> n <v>        ; v = b's own init (state base) or zero (input base)
 ```
 
+`$past(b, k)` (k ≥ 2) gains a **k-stage shift chain** instead — `b__past ← b`,
+`b__past2 ← b__past`, … `b__past{k}` — so `b__past{j}` holds b's value j cycles
+ago. Each stage is init'd the same way as the 1-stage case (below). Everything
+that follows is written for one stage; each stage of a chain is an independent
+history variable and the argument composes over them.
+
 `b` is either a BTOR2 state cell or a primary input;
 [`resolve_shadow_source`](../../crates/mununu-core/src/adapter/btor2/shadow.rs)
 tries a unique exact state symbol, then an exact input symbol, then the
@@ -103,6 +109,16 @@ Pinned by `only_a_same_cycle_past_reads_the_invented_history` in
 [`tests/past_shadow_input_e2e.rs`](../../crates/mununu-core/tests/past_shadow_input_e2e.rs),
 so a future change to the lift that moved the atom out from under `[]` would fail
 a test rather than silently widen the approximation.
+
+**Depth k generalises the window, not the argument.** A depth-1 shadow is invented
+only at cycle 0, so the single `[]` of `|=>` hides it completely. A depth-k chain
+takes k cycles to fill, so `$past(input, k)` reads the invented zero for the first
+k-1 post-reset cycles *even under a `[]`* — the approximation is bounded to those
+cycles rather than eliminated. For a **register** base this is not an approximation
+at all: those cycles read the source's reset value, which is exactly the SVA
+"before the first k clock edges" convention. So k-deep `$past` of a *register* is
+exact everywhere; k-deep `$past` of an *input* carries a k-1-cycle post-reset
+window where a definite verdict may not transfer (depth 1 = the cycle-0 case above).
 
 ## 4. Why the input shadow is pinned rather than left free
 
