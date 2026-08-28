@@ -33,6 +33,12 @@ n+1   next  <sort> n <b>
 n+2   init  <sort> n <v>        ; v = b's own init (state base) or zero (input base)
 ```
 
+`$past(b, k)` (k ≥ 2) gains a **k-stage shift chain** instead — `b__past ← b`,
+`b__past2 ← b__past`, … `b__past{k}` — so `b__past{j}` holds b's value j cycles
+ago. Each stage is init'd the same way as the 1-stage case (below). Everything
+that follows is written for one stage; each stage of a chain is an independent
+history variable and the argument composes over them.
+
 `b` is either a BTOR2 state cell or a primary input;
 [`resolve_shadow_source`](../../crates/mununu-core/src/adapter/btor2/shadow.rs)
 tries a unique exact state symbol, then an exact input symbol, then the
@@ -104,6 +110,16 @@ Pinned by `only_a_same_cycle_past_reads_the_invented_history` in
 so a future change to the lift that moved the atom out from under `[]` would fail
 a test rather than silently widen the approximation.
 
+**Depth k generalises the window, not the argument.** A depth-1 shadow is invented
+only at cycle 0, so the single `[]` of `|=>` hides it completely. A depth-k chain
+takes k cycles to fill, so `$past(input, k)` reads the invented zero for the first
+k-1 post-reset cycles *even under a `[]`* — the approximation is bounded to those
+cycles rather than eliminated. For a **register** base this is not an approximation
+at all: those cycles read the source's reset value, which is exactly the SVA
+"before the first k clock edges" convention. So k-deep `$past` of a *register* is
+exact everywhere; k-deep `$past` of an *input* carries a k-1-cycle post-reset
+window where a definite verdict may not transfer (depth 1 = the cycle-0 case above).
+
 ## 4. Why the input shadow is pinned rather than left free
 
 Leaving it free is the more faithful reading of SVA, where `$past` is undefined
@@ -156,6 +172,45 @@ possibly satisfy φ* — which holds given `φ.must ⊑ φ.may` **if and only if
 about it; §6 is what happens when it is not met.
 
 ## 6. Two defects this surfaced
+
+> **Update (2026-08-28) — fixed at the lift.** The root cause below (a must-edge
+> created without enforcing `R_must ⊆ R_may`) is now closed in
+> [`kmts_lift.rs`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs) by three
+> composing changes: (A) the `SmtAllPairs` standard-must arm restricts the ∀∃
+> must-image to the emitted `may_edges` (`must_edges_over`) instead of the full
+> grid, so a vacuous must out of an empty src — which the ∃-witness may-check never
+> emits — can no longer be promoted; (B) `apply_sampled_must_inference` proves each
+> candidate source cube feasible (`smt_source_cube_proven_feasible`, `∃ s. ⋀ src_i`)
+> and drops must-promotion out of the proven-empty ones, closing the sampling path
+> where the canonical representative fabricates a may-edge for an unsatisfiable cube;
+> (C) `assert_must_subset_may` runs once per lift (release included) and returns an
+> `IrConsistencyError` if any `MustHyperOnly` target is not a may-successor, rather
+> than letting an inconsistent KMTS reach `TritBdd::from_parts`. Unit-tested in
+> `kmts_lift.rs` (`must_subset_may_no_vacuous_must_from_unsat_cube_{all_pairs,sampling}`,
+> `assert_must_subset_may_{rejects,accepts}_*`). The `from_parts` `debug_assert!`
+> stays as the debug tripwire (§5); the release guarantee is now (C).
+>
+> **Update (2026-08-28, part 2) — the symbolic engine had a SEPARATE path.**
+> (A)–(C) fix the cube / `kmts_lift` must-edge inference (the explicit + cube
+> engines). The `symbolic` engine builds its **own** may/must abstraction in
+> [`symbolic_bitblast.rs`](../../crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs)
+> (`AbstractRelation`), which (A)–(C) do not touch — and an **e2e run in the
+> `mununu-sva` image caught it still panicking** on a `$past` data-integrity
+> property (`push |=> stored == $past(din)`). Root cause: an **input predicate**
+> (`push`) makes the abstraction depend on an input var, which is both a present
+> *observable* and the transition *nondeterminism* — the same conflation the exact
+> ROBDD engine refuses an input atom over. It left `R_must`'s BDD support dirty, so
+> `box.must ⊄ box.may`. Fix (D): `AbstractRelation::build` now detects an
+> input-predicate abstraction (quantifying inputs changes feasibility) and falls
+> back to **may-only** (`r_must = None`) — sound (definite HOLDS transfers;
+> refutation → ⊥), no panic, no wrong verdict. `feasible_present` also now
+> quantifies inputs (`xi_cube`), a no-op for register-only predicates.
+>
+> The table below is the **pre-fix** measurement. The `$past` e2e was run in the
+> `mununu-sva` image (that is what caught (D)); a register-`$past` / `##k` design
+> now decides cleanly (see the XL.4/XL.5 e2e). A `push |=> stored == $past(din)`
+> input-antecedent property is may-only (⊥ under abstraction, or decided by the
+> reach portfolio) — sound, never a spurious `Violated`/panic.
 
 Both are **pre-existing** and reproduce identically on a *register*-sourced
 `$past`, so neither comes from input support. A property with no `$past` is
@@ -211,8 +266,8 @@ step-collapsing optimisation must exclude models carrying `__past` shadows, or
 | reach portfolio (btormc / pono / Boolector) | **Exact.** Consumes the BTOR2 directly; the shadow is a real flop. Requires the `init` value's NID to precede the state's — see §4. |
 | exact-symbolic (ROBDD, 2-valued) | **Exact** on the augmented model. Independently refuses any property whose atom names a primary input (`push \|=> …`), because it leaves inputs free and a formula pinning one would decouple antecedent from consequent. It says so and skips rather than guessing. |
 | explicit / symbolic cube, `must_edge_inference: Off` | **Sound for HOLDS** (may over-approximation + safety). Cannot refute a data-dependent violation; reports ⊥. |
-| explicit / symbolic cube, must-edge inference on | **Unsound today** — §6. |
-| `symbolic_engine: true` | **Panics** on any `$past` model in debug; inconsistent `TritBdd` in release — §6. |
+| explicit / symbolic cube, must-edge inference on | **Sound at the lift (2026-08-28, §6 update box, A–C)** — the vacuous must out of an empty cube that caused the false `Violated` is no longer created, and `assert_must_subset_may` gates any residual. Was **unsound** pre-fix — §6. |
+| `symbolic` engine (`symbolic_bitblast::AbstractRelation`) | **Sound (2026-08-28, §6 update box, D)** — an input-predicate abstraction now falls back to may-only (`r_must = None`) instead of building a support-dirty `R_must`; definite HOLDS transfers, refutation → ⊥. e2e-confirmed in `mununu-sva` (this is the path that still panicked after A–C). Was **panic (debug) / wrong verdict (release)** pre-fix — §6. |
 
 ## 9. What is argued vs verified vs gap
 
@@ -222,10 +277,16 @@ step-collapsing optimisation must exclude models carrying `__past` shadows, or
   model are pinned by tests in `tests/past_shadow_input_e2e.rs`, run against live
   slang + yosys in the `mununu-sva` image.
 - **Measured** (§6): the two defects, and the ⊥ ceiling for refutation, reproduced
-  across four engine postures and two data widths.
-- **Gap**: `R_must ⊆ R_may` is not enforced where must-edges are created. Fixing that
-  is what would turn the ⊥ in §6 into a definite VIOLATED, and is the single change
-  that would most improve `$past` coverage.
+  across four engine postures and two data widths (pre-fix).
+- **Gap — CLOSED at the lift (2026-08-28, §6 update box).** `R_must ⊆ R_may` is now
+  enforced where must-edges are created: the ∀∃ must is restricted to the emitted
+  may-relation (Fix A), proven-empty source cubes are excluded from must-promotion
+  (Fix B), and a per-lift `assert_must_subset_may` rejects any residual containment
+  violation before the evaluator (Fix C). Mechanism-level unit tests pass; the
+  remaining confirmation is the e2e `$past` reproduction in the `mununu-sva` image
+  (host runs cannot exercise slang), which should show the §6 `Violated`/`panic`
+  entries turn into a sound `holds`/`violated`, and a genuine data-dependent
+  violation reach a definite `VIOLATED` rather than ⊥.
 
 ## 10. References
 

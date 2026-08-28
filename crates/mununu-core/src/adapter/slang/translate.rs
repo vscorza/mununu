@@ -12,6 +12,8 @@
 //! | `assert property (b)` | `nu X. (b && [] X)` (AG b) |
 //! | `a \|-> b` | `nu X. ((!a \|\| b) && [] X)` (AG(a→b)) |
 //! | `a \|=> b` | `nu X. ((!a \|\| [] b) && [] X)` (AG(a→AX b)) |
+//! | `a \|-> ##k b` (XL.4) | `nu X. ((!a \|\| []…[] b) && [] X)` — k boxes (AG(a→AXᵏ b)) |
+//! | `a \|-> ##[m:n] b` (XL.4) | `nu X. ((!a \|\| []ᵐ(b\|\|[](b\|\|…\|\|[]b))) && [] X)` — b within [m,n] |
 //! | `cover property (b)` | `mu X. (b \|\| <> X)` (EF b) |
 //! | `cover property (b)` **recoverability lens** (XL.2) | `nu Y. ((mu X. (b \|\| <> X)) && [] Y)` (AG EF b) |
 //! | `disable iff (r) P` | gate the body: `(r \|\| body)` (vacuous while disabled) |
@@ -49,9 +51,12 @@
 //! `x ∈ {0,1,2,4,…}` / `x ∈ {1,2,4,…}` (one `Or`-of-`Cmp` atom). Anything still
 //! outside the fragment — bit-arithmetic, bit-select indexing (`sig[i]`),
 //! reduction-or/xor (`|x`, `^x`), system calls (`$isunknown`, `$countones`),
-//! sequences (`##`, `[*n]`), etc. — is **rejected with a reason, never silently
-//! dropped** (claims-integrity), and every emitted formula is validated through the
-//! mu-calculus parser as a safety net.
+//! unbounded `##[m:$]` / `[*n:$]`, goto `[->n]` / non-consecutive `[=n]`
+//! repetition, and sequence *antecedents* (`a ##1 c |-> …`), etc. — is **rejected
+//! with a reason, never silently dropped** (claims-integrity), and every emitted
+//! formula is validated through the mu-calculus parser as a safety net. (Bounded
+//! sequence *consequents* — `##k`/`##[m:n]` delays, fixed `[*n]` repetition, and
+//! multi-element `##` chains of booleans — ARE supported: XL.4, `consequent_expr`.)
 //!
 //! [XL.0]: ../../../../.claude/plans/measurements/XL-0-sva-parser-spike-2026-06-26.md
 
@@ -100,13 +105,19 @@ pub struct UnsupportedAssertion {
 
 /// XL.3 (Tier-2): a base signal whose previous-cycle value a translated
 /// assertion needs. The BTOR2 model-augmentation step (XL.3b) must synthesise a
-/// 1-step shadow flop named `<base>__past` of this width — `next(<base>__past)
-/// = <base>` — so the `<base>__past` atoms the translator emits actually bind.
+/// `depth`-stage shadow shift chain for it — `next(<base>__past) = <base>`,
+/// `next(<base>__past2) = <base>__past`, … up to `<base>__past{depth}` — so the
+/// shadow atoms the translator emits (`past_shadow_name(base, k)` for every
+/// `k <= depth`) actually bind. `depth` is the DEEPEST history any assertion
+/// reads for this base; the chain covers every shallower `$past(base, j)` too.
 /// Reported only for *successfully* translated assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowSignal {
     pub base: String,
     pub width: u32,
+    /// Deepest `$past` depth read for `base` (1 for `$stable`/`$rose`/… and
+    /// bare `$past(base)`; `k` for `$past(base, k)`).
+    pub depth: u32,
 }
 
 /// A reset signal recognized in a `disable iff (...)` guard: the input to pin
@@ -346,18 +357,31 @@ fn resolve_enum_refs(node: &Value, enums: &std::collections::HashMap<String, i64
 fn collect_shadow_signals(node: &Value, out: &mut Vec<ShadowSignal>) {
     match node {
         Value::Object(map) => {
+            let sub = map.get("subroutine").and_then(Value::as_str);
             if map.get("kind").and_then(Value::as_str) == Some("Call")
                 && matches!(
-                    map.get("subroutine").and_then(Value::as_str),
+                    sub,
                     Some("$past" | "$stable" | "$changed" | "$rose" | "$fell")
                 )
-                && let Ok((base, width)) = call_arg_signal(node)
-                && !out.iter().any(|s| s.base == base)
             {
-                out.push(ShadowSignal {
-                    base: base.to_string(),
-                    width,
-                });
+                // `$past` carries a depth; the others are depth-1. Record the
+                // DEEPEST depth per base (the shift chain covers all shallower).
+                let resolved = if sub == Some("$past") {
+                    past_call_arg(node).ok()
+                } else {
+                    call_arg_signal(node).ok().map(|(b, w)| (b, w, 1))
+                };
+                if let Some((base, width, depth)) = resolved {
+                    if let Some(existing) = out.iter_mut().find(|s| s.base == base) {
+                        existing.depth = existing.depth.max(depth);
+                    } else {
+                        out.push(ShadowSignal {
+                            base: base.to_string(),
+                            width,
+                            depth,
+                        });
+                    }
+                }
             }
             for v in map.values() {
                 collect_shadow_signals(v, out);
@@ -496,28 +520,302 @@ fn property_body(
             let cond = bool_expr(cond_node)?;
             Ok(format!("({cond} || {inner})"))
         }
-        // `a |-> b` / `a |=> b` — left/right are boolean (Tier-1 `Simple`).
+        // `a |-> <conseq>` / `a |=> <conseq>` — a boolean antecedent (Tier-1
+        // `Simple`) implies a boolean OR a bounded cycle-delay consequent
+        // (`##k b` / `##[m:n] b`, XL.4). The antecedent stays boolean; a sequence
+        // antecedent is out of fragment (Tier-3).
         "Binary" => {
             let op = spec.get("op").and_then(Value::as_str).unwrap_or("?");
-            let l = simple_bool(child(spec, "left")?)?;
-            let r = simple_bool(child(spec, "right")?)?;
-            match op {
-                "OverlappedImplication" => Ok(format!("(!({l}) || {r})")),
-                "NonOverlappedImplication" => Ok(format!("(!({l}) || [] {r})")),
-                other => Err(format!("unsupported property operator: {other}")),
-            }
+            let conseq = consequent_expr(child(spec, "right")?)?;
+            // The consequent aligns to the antecedent's match end; `|=>` delays it
+            // one further cycle. `|->` evaluates it there directly.
+            let conseq = match op {
+                "OverlappedImplication" => conseq,
+                "NonOverlappedImplication" => format!("[] {conseq}"),
+                other => return Err(format!("unsupported property operator: {other}")),
+            };
+            antecedent_implies(child(spec, "left")?, &conseq)
         }
         "Simple" => bool_expr(child(spec, "expr")?),
         other => Err(format!("unsupported property kind: {other}")),
     }
 }
 
-/// An `AssertionExpr` expected to be a boolean leaf (`Simple`) — Tier-1.
-fn simple_bool(spec: &Value) -> Result<String, String> {
+/// The maximum cycle any bounded-sequence unroll may reach — each cycle is a
+/// modality, so a runaway `##[m:$]` / `[*n:$]` (slang encodes `$` as a string
+/// `max`, caught earlier) or an absurd fixed count is rejected rather than
+/// exploding the formula.
+const MAX_SEQ_UNROLL: u64 = 64;
+
+/// XL.4 — an implication *consequent*: a boolean leaf (`Simple`), a bounded
+/// cycle-delay (`##k b` / `##[m:n] b`), a bounded consecutive repetition
+/// (`b[*n]`), or a bounded multi-element `##` chain of length-1 boolean elements
+/// (`b ##1 c ##2 d`). slang serialises these as a `Simple` (optionally with a
+/// `repetition` field) or a `SequenceConcat` (`elements: [{sequence, min, max}]`,
+/// cumulative gap delays — verified against slang 11.0.0 `--ast-json`).
+///
+/// Lowering (all sound: `[]φ = ∀ may-successors`, so a definite verdict transfers,
+/// Bruns–Godefroid — the boxes only lengthen the still-step-exact window):
+/// - fixed `##k b` → `[]…[] b` (k boxes); range `##[m:n] b` → `[]^m(b||[](b||…))`;
+/// - `b[*n]` → `(b && [](b && … && [] b))` (n consecutive);
+/// - `b ##δ₁ c ##δ₂ d` → `b && []^δ₁(c && []^δ₂ d)` (each element length-1).
+///
+/// Out of fragment (Tier-3b — rejected with a reason, never dropped): unbounded
+/// `##[m:$]` / `[*n:$]` (needs a sequence automaton), goto `[->n]` / non-
+/// consecutive `[=n]` repetition, a repetition or nested sub-sequence *inside* a
+/// multi-element chain (would need length composition), and sequence
+/// *antecedents* (`a ##1 b |-> …` — handled in the `Binary` arm, still boolean).
+fn consequent_expr(spec: &Value) -> Result<String, String> {
     match spec.get("kind").and_then(Value::as_str) {
-        Some("Simple") => bool_expr(child(spec, "expr")?),
+        // A boolean leaf, possibly with a consecutive repetition (`b[*n]`).
+        Some("Simple") => seq_leaf(spec),
+        Some("SequenceConcat") => {
+            let elements = spec
+                .get("elements")
+                .and_then(Value::as_array)
+                .ok_or("SequenceConcat without an `elements` array")?;
+            if elements.is_empty() {
+                return Err("empty SequenceConcat".into());
+            }
+            if elements.len() == 1 {
+                // `##k <seq>` / `##[m:n] <seq>` — a single delayed sub-sequence
+                // (a boolean, or a consecutive repetition of one).
+                let el = &elements[0];
+                let seq = el
+                    .get("sequence")
+                    .ok_or("sequence element without a `sequence`")?;
+                let leaf = seq_leaf(seq)?;
+                let (min, max) = elem_delay(el)?;
+                Ok(delayed(&leaf, min, max))
+            } else {
+                // A multi-element `##` chain. To keep every element's cycle offset
+                // unambiguous, each element must be a length-1 boolean (no
+                // repetition / nested sub-sequence — those compose lengths, Tier-3b).
+                let mut leaves: Vec<String> = Vec::with_capacity(elements.len());
+                let mut delays: Vec<(u32, u32)> = Vec::with_capacity(elements.len());
+                for el in elements {
+                    let seq = el
+                        .get("sequence")
+                        .ok_or("sequence element without a `sequence`")?;
+                    if seq.get("kind").and_then(Value::as_str) != Some("Simple")
+                        || seq.get("repetition").is_some()
+                    {
+                        return Err("a multi-element `##` chain element must be a length-1 \
+                             boolean (a repetition or nested sub-sequence inside a chain \
+                             needs length composition — Tier-3b)"
+                            .into());
+                    }
+                    leaves.push(bool_expr(child(seq, "expr")?)?);
+                    delays.push(elem_delay(el)?);
+                }
+                // Fold from the last element: S(i) = leafᵢ && delayed(S(i+1), gapᵢ₊₁),
+                // then prefix the first element's own gap.
+                let n = leaves.len();
+                let mut s = leaves[n - 1].clone();
+                for i in (1..n).rev() {
+                    let (min, max) = delays[i];
+                    s = format!("({} && {})", leaves[i - 1], delayed(&s, min, max));
+                }
+                let (min0, max0) = delays[0];
+                Ok(delayed(&s, min0, max0))
+            }
+        }
         other => Err(format!(
-            "unsupported operand (Tier-1 expects a boolean, got {other:?})"
+            "unsupported implication consequent (expected a boolean, a `##k`/`##[m:n]` \
+             delayed boolean, a `b[*n]` repetition, or a `##` chain of booleans, got {other:?})"
+        )),
+    }
+}
+
+/// A single sequence leaf: a `Simple` boolean, optionally with a **consecutive**
+/// repetition (`b[*n]` → n consecutive cycles). Returns a "matches starting here"
+/// formula. Rejects goto / non-consecutive / range / unbounded repetition (Tier-3b).
+fn seq_leaf(seq: &Value) -> Result<String, String> {
+    if seq.get("kind").and_then(Value::as_str) != Some("Simple") {
+        return Err(format!(
+            "nested sequence element (expected a boolean leaf, got {:?}) — Tier-3b",
+            seq.get("kind").and_then(Value::as_str)
+        ));
+    }
+    let b = bool_expr(child(seq, "expr")?)?;
+    match seq.get("repetition") {
+        None => Ok(b),
+        Some(rep) => lower_repetition(&b, rep),
+    }
+}
+
+/// The fixed consecutive count `n` of a `[*n]` repetition. Only fixed consecutive
+/// (`min == max == n`, n ≥ 1) is in fragment; a range `[*m:n]`, unbounded `[*n:$]`
+/// (slang `max` is the string `"$"` → not a `u64`), goto `[->n]`, or non-
+/// consecutive `[=n]` need a sequence automaton (Tier-3b) and are rejected.
+fn fixed_consecutive_count(rep: &Value) -> Result<u32, String> {
+    let kind = rep.get("kind").and_then(Value::as_str).unwrap_or("?");
+    if kind != "Consecutive" {
+        return Err(format!(
+            "`{kind}` repetition (goto `[->n]` / non-consecutive `[=n]`) needs a \
+             sequence automaton — Tier-3b"
+        ));
+    }
+    let (Some(min), Some(max)) = (
+        rep.get("min").and_then(Value::as_u64),
+        rep.get("max").and_then(Value::as_u64),
+    ) else {
+        return Err("unbounded repetition `[*n:$]` needs a sequence automaton — Tier-3b".into());
+    };
+    if min != max {
+        return Err(format!(
+            "range repetition `[*{min}:{max}]` needs a sequence automaton — Tier-3b; \
+             a fixed `[*n]` is supported"
+        ));
+    }
+    if min == 0 {
+        return Err("empty repetition `[*0]` is out of fragment".into());
+    }
+    if max > MAX_SEQ_UNROLL {
+        return Err(format!(
+            "repetition count {max} exceeds the unroll cap {MAX_SEQ_UNROLL}"
+        ));
+    }
+    Ok(min as u32)
+}
+
+/// Lower a consecutive repetition `b[*n]` → `(b && [](b && … && [] b))` — b held n
+/// consecutive cycles (a "matches starting here" formula).
+fn lower_repetition(b: &str, rep: &Value) -> Result<String, String> {
+    let n = fixed_consecutive_count(rep)?;
+    let mut out = b.to_string();
+    for _ in 1..n {
+        out = format!("({b} && [] {out})");
+    }
+    Ok(out)
+}
+
+/// The `(min, max)` cycle-delay of a `SequenceConcat` element, validated against
+/// the unroll cap and the `max ≥ min` invariant. An unbounded `$` (a string `max`)
+/// is not a `u64` and is rejected as Tier-3b.
+fn elem_delay(el: &Value) -> Result<(u32, u32), String> {
+    let (Some(min), Some(max)) = (
+        el.get("min").and_then(Value::as_u64),
+        el.get("max").and_then(Value::as_u64),
+    ) else {
+        return Err("unbounded `##[m:$]` delay needs a sequence automaton — Tier-3b".into());
+    };
+    if max < min {
+        return Err(format!("sequence delay range max {max} < min {min}"));
+    }
+    if max > MAX_SEQ_UNROLL {
+        return Err(format!(
+            "sequence delay {max} exceeds the bounded-unroll cap {MAX_SEQ_UNROLL}"
+        ));
+    }
+    Ok((min as u32, max as u32))
+}
+
+/// Lower `##[min:max] f` (a delayed sub-formula `f`) to nested `[]` modalities.
+/// Fixed (`min == max == k`) → `[]…[] f` (k boxes). Range → `[]^min ( f || [](f ||
+/// … || [] f) )` — "f matches at some cycle in [min,max]". SOUNDNESS: over the
+/// may-relation `[]φ = ∀ may-succ φ`, so a definite verdict transfers
+/// (Bruns–Godefroid), exactly as the shipped `|=>` single-`[]` case. `f` may be a
+/// compound sub-sequence formula (already parenthesised).
+fn delayed(f: &str, min: u32, max: u32) -> String {
+    let mut out = f.to_string();
+    for _ in 0..(max - min) {
+        out = format!("({f} || [] {out})");
+    }
+    for _ in 0..min {
+        out = format!("[] {out}");
+    }
+    out
+}
+
+/// Prefix `n` box modalities: `[] [] … f`.
+fn nest_boxes(n: u32, f: &str) -> String {
+    let mut out = f.to_string();
+    for _ in 0..n {
+        out = format!("[] {out}");
+    }
+    out
+}
+
+/// XL.5 — an implication whose *antecedent* may be a bounded sequence:
+/// `<antecedent> |-> <conseq>`, where `conseq` is the already-lowered consequent
+/// (aligned to the antecedent's match end; the caller adds the `|=>` extra `[]`).
+/// A boolean antecedent gives the shipped `(!a || conseq)`; a fixed-delay `##`
+/// chain / fixed `[*n]` gives the nested implication
+/// `!e₀ || []^δ₁(!e₁ || []^δ₂(… || conseq))` — "whenever the antecedent matches,
+/// the consequent holds at the match end". SOUNDNESS: the antecedent atoms sit in
+/// negative position under boxes evaluated ∀-may; the whole is an ordinary
+/// mu-calculus formula the KMTS evaluator decides soundly (definite verdicts
+/// transfer). A RANGE delay / range repetition in an antecedent creates multiple
+/// match ends (Tier-3b) and is rejected in [`antecedent_elements`].
+fn antecedent_implies(left: &Value, conseq: &str) -> Result<String, String> {
+    let elems = antecedent_elements(left)?;
+    let n = elems.len();
+    // Innermost: the last antecedent element implies the consequent at its cycle.
+    let mut acc = format!("(!({}) || {conseq})", elems[n - 1].0);
+    // Walk back, prefixing each preceding element's gap-to-the-next.
+    for i in (1..n).rev() {
+        let (b, _) = &elems[i - 1];
+        let gap = elems[i].1;
+        acc = format!("(!({b}) || {})", nest_boxes(gap, &acc));
+    }
+    // The first element's own leading gap (usually 0).
+    Ok(nest_boxes(elems[0].1, &acc))
+}
+
+/// Flatten a bounded FIXED-delay antecedent into `(boolean, gap-before)` length-1
+/// elements: a boolean → one element; a fixed `a[*n]` → n elements (gaps
+/// `0,1,…,1`); a fixed `##` chain of booleans → one element per link. Rejects
+/// range delays / range repetition (multiple match ends — Tier-3b), goto/non-
+/// consecutive/unbounded repetition, and nested sub-sequences.
+fn antecedent_elements(left: &Value) -> Result<Vec<(String, u32)>, String> {
+    match left.get("kind").and_then(Value::as_str) {
+        Some("Simple") => {
+            let b = bool_expr(child(left, "expr")?)?;
+            match left.get("repetition") {
+                None => Ok(vec![(b, 0)]),
+                Some(rep) => {
+                    let n = fixed_consecutive_count(rep)?;
+                    Ok((0..n)
+                        .map(|i| (b.clone(), if i == 0 { 0 } else { 1 }))
+                        .collect())
+                }
+            }
+        }
+        Some("SequenceConcat") => {
+            let elements = left
+                .get("elements")
+                .and_then(Value::as_array)
+                .ok_or("SequenceConcat without an `elements` array")?;
+            let mut v = Vec::with_capacity(elements.len());
+            for el in elements {
+                let seq = el
+                    .get("sequence")
+                    .ok_or("sequence element without a `sequence`")?;
+                if seq.get("kind").and_then(Value::as_str) != Some("Simple")
+                    || seq.get("repetition").is_some()
+                {
+                    return Err("a sequence-antecedent element must be a length-1 boolean \
+                         (a repetition or nested sub-sequence in an antecedent is Tier-3b)"
+                        .into());
+                }
+                let (min, max) = elem_delay(el)?;
+                if min != max {
+                    return Err(format!(
+                        "a range delay `##[{min}:{max}]` in an ANTECEDENT creates multiple \
+                         match ends — Tier-3b; a fixed `##k` antecedent is supported"
+                    ));
+                }
+                v.push((bool_expr(child(seq, "expr")?)?, min));
+            }
+            if v.is_empty() {
+                return Err("empty SequenceConcat antecedent".into());
+            }
+            Ok(v)
+        }
+        other => Err(format!(
+            "unsupported implication antecedent (expected a boolean or a fixed `##` chain \
+             / `[*n]`, got {other:?})"
         )),
     }
 }
@@ -606,7 +904,7 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
             match sub {
                 "$stable" | "$changed" => {
                     let (sig, _w) = call_arg_signal(expr)?;
-                    let shadow = past_shadow_name(sig);
+                    let shadow = past_shadow_name(sig, 1);
                     let cmp = if sub == "$stable" { "==" } else { "!=" };
                     Ok(format!("({sig} {cmp} {shadow})"))
                 }
@@ -618,17 +916,18 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                              {sub} on 1-bit signals only"
                         ));
                     }
-                    let shadow = past_shadow_name(sig);
+                    let shadow = past_shadow_name(sig, 1);
                     Ok(if sub == "$rose" {
                         format!("({sig} && (!({shadow})))") // 1 now, 0 last cycle
                     } else {
                         format!("((!({sig})) && {shadow})") // 0 now, 1 last cycle
                     })
                 }
-                // `$past(x)` is a value; in boolean position a vector → `!= 0`.
+                // `$past(x[, k])` is a value; in boolean position a vector → `!= 0`.
+                // `k` (default 1) selects the depth-`k` shadow along the shift chain.
                 "$past" => {
-                    let (sig, w) = call_arg_signal(expr)?;
-                    let shadow = past_shadow_name(sig);
+                    let (sig, w, depth) = past_call_arg(expr)?;
+                    let shadow = past_shadow_name(sig, depth);
                     Ok(if w > 1 {
                         format!("({shadow} != 0)")
                     } else {
@@ -881,11 +1180,21 @@ fn reduction_to_cmp(operand: &Value, op: &str, need_all_ones: bool) -> Result<St
     Ok(format!("({sig} {op} {rhs})"))
 }
 
-/// The `__past` shadow-register name for a base signal — the XL.3 naming
-/// contract shared with the BTOR2 model-augmentation step (XL.3b synthesises a
-/// 1-step flop with `next(<base>__past) = <base>` so the atom binds).
-fn past_shadow_name(base: &str) -> String {
-    format!("{base}__past")
+/// The `__past` shadow-register name for a base signal at history `depth` — the
+/// XL.3 naming contract shared with the BTOR2 model-augmentation step (XL.3b
+/// synthesises a `depth`-stage shift chain `next(<base>__past) = <base>`,
+/// `next(<base>__past2) = <base>__past`, … so the atom binds).
+///
+/// Depth 1 keeps the historical bare `<base>__past` (backward compatible with
+/// `$past`/`$stable`/`$rose`/`$fell` and every existing model); depth `k ≥ 2`
+/// (from `$past(x, k)`) is `<base>__past{k}`. `shadow::shadow_stage_name` MUST
+/// mirror this exactly — the two are the two halves of one naming contract.
+fn past_shadow_name(base: &str, depth: u32) -> String {
+    if depth <= 1 {
+        format!("{base}__past")
+    } else {
+        format!("{base}__past{depth}")
+    }
 }
 
 /// True if `expr` (modulo `Conversion` peeling) is a `$past(...)` call.
@@ -896,13 +1205,13 @@ fn is_past_call(expr: &Value) -> bool {
 }
 
 /// A comparison operand that resolves to a mu-calc atom name: a plain signal, or
-/// `$past(signal)` → its `__past` shadow. `None` for anything else.
+/// `$past(signal[, k])` → its depth-`k` `__past` shadow. `None` for anything else.
 fn cmp_signal_atom(expr: &Value) -> Option<String> {
     let expr = unwrap(expr);
     if is_past_call(expr) {
-        return call_arg_signal(expr)
+        return past_call_arg(expr)
             .ok()
-            .map(|(sig, _)| past_shadow_name(sig));
+            .map(|(sig, _, depth)| past_shadow_name(sig, depth));
     }
     signal_name(expr).ok().map(|s| s.to_string())
 }
@@ -934,9 +1243,11 @@ fn add_signal_literal(expr: &Value) -> Option<(String, u64)> {
     None
 }
 
-/// A Tier-2 history call (`$past`/`$stable`/`$changed`/`$rose`/`$fell`) takes
-/// exactly one signal argument; return its `(name, width)`. Rejects depth>1
-/// `$past` (≥2 args), multi-arg forms, and non-signal arguments.
+/// A single-signal Tier-2 call (`$stable`/`$changed`/`$rose`/`$fell`, and the
+/// one-hot `$onehot`/`$onehot0`) takes exactly one signal argument; return its
+/// `(name, width)`. These are inherently previous-cycle / current-cycle forms, so
+/// a second (depth) argument is rejected here. `$past` — the only depth-carrying
+/// history call — goes through [`past_call_arg`] instead.
 fn call_arg_signal(call: &Value) -> Result<(&str, u32), String> {
     let sub = call
         .get("subroutine")
@@ -948,13 +1259,53 @@ fn call_arg_signal(call: &Value) -> Result<(&str, u32), String> {
         .ok_or_else(|| format!("{sub} without an argument list"))?;
     if args.len() != 1 {
         return Err(format!(
-            "{sub} with {} arguments; Tier-2 supports single-signal depth-1 history only",
+            "{sub} with {} arguments; this Tier-2 call takes a single signal \
+             (only `$past` carries a depth argument)",
             args.len()
         ));
     }
     let arg = unwrap(&args[0]);
     let sig = signal_name(arg).map_err(|_| format!("{sub} argument is not a plain signal"))?;
     Ok((sig, signal_width(arg)))
+}
+
+/// `$past(signal[, depth])` — Tier-2 history with an optional constant depth `k`
+/// (default 1). Returns `(name, width, depth)`. A second argument is the history
+/// depth: a constant integer literal ≥ 1 (`$past(x, 3)` = "x, three cycles ago").
+/// The XL.3b augmentation builds a `depth`-stage shift chain so the shadow atom
+/// [`past_shadow_name`]`(name, depth)` binds. Rejects depth 0 / negative, a
+/// non-literal depth, more than two arguments, and a non-signal first argument.
+fn past_call_arg(call: &Value) -> Result<(&str, u32, u32), String> {
+    let sub = call
+        .get("subroutine")
+        .and_then(Value::as_str)
+        .unwrap_or("$past");
+    let args = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{sub} without an argument list"))?;
+    if args.is_empty() || args.len() > 2 {
+        return Err(format!(
+            "{sub} with {} arguments; expected `$past(signal[, depth])`",
+            args.len()
+        ));
+    }
+    let arg = unwrap(&args[0]);
+    let sig =
+        signal_name(arg).map_err(|_| format!("{sub} first argument is not a plain signal"))?;
+    let depth = if args.len() == 2 {
+        let d = sv_integer(unwrap(&args[1]))
+            .ok_or_else(|| format!("{sub} depth argument must be a constant integer literal"))?;
+        if d < 1 {
+            return Err(format!(
+                "{sub} depth {d} is not >= 1 (a $past depth is a positive number of cycles)"
+            ));
+        }
+        d as u32
+    } else {
+        1
+    };
+    Ok((sig, signal_width(arg), depth))
 }
 
 /// `~x` in boolean position: logical-not on a 1-bit operand; a vector `~x` is a
@@ -1171,6 +1522,212 @@ mod tests {
         .expect("translates");
         assert!(f.contains("[] b"), "|=> must put b under a next ([]): {f}");
         crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl4_fixed_cycle_delay_consequent() {
+        // a |-> ##2 b  →  b two cycles later ([] [] b). slang shape: right =
+        // SequenceConcat { elements: [{ sequence: Simple(b), min:2, max:2 }] }
+        // (captured from real slang 11.0.0 --ast-json).
+        let spec = serde_json::json!({
+            "kind": "Binary",
+            "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}},
+                 "min": 2, "max": 2}
+            ]}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(f.contains("(!(a) || [] [] b)"), "##2 → two boxes: {f}");
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl4_bounded_range_delay_consequent() {
+        // a |=> ##[1:3] b  →  b somewhere in the window, plus one [] from |=>.
+        let spec = serde_json::json!({
+            "kind": "Binary",
+            "op": "NonOverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}},
+                 "min": 1, "max": 3}
+            ]}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("[] [] (b || [] (b || [] b))"),
+            "range [1:3] under |=>: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl5_multi_element_chain_consequent() {
+        // a |-> b ##1 c ##2 d  →  b now, c at +1, d at +3 (cumulative gaps).
+        // slang shape: elements [{b,0,0},{c,1,1},{d,2,2}] (captured from slang 11.0.0).
+        let spec = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}, "min":0, "max":0},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "3 c"}}, "min":1, "max":1},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "4 d"}}, "min":2, "max":2}
+            ]}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("(b && [] (c && [] [] d))"),
+            "multi-element chain: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl5_consecutive_repetition_consequent() {
+        // a |-> c[*3]  →  c held 3 consecutive cycles. slang shape: Simple(c) with
+        // repetition {Consecutive, min:3, max:3} (captured from slang 11.0.0).
+        let spec = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+            "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 c"},
+                      "repetition": {"kind": "Consecutive", "min": 3, "max": 3}}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("(c && [] (c && [] c))"),
+            "c[*3] consecutive: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl5_out_of_fragment_sequences_rejected() {
+        let mk = |right: serde_json::Value| {
+            serde_json::json!({
+                "kind": "Binary", "op": "OverlappedImplication",
+                "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
+                "right": right
+            })
+        };
+        // Unbounded repetition `c[*1:$]` — slang encodes `$` as a string max.
+        let unb = mk(serde_json::json!({
+            "kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 c"},
+            "repetition": {"kind": "Consecutive", "min": 1, "max": "$"}
+        }));
+        let err = property_body(&unb, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("unbounded must reject");
+        assert!(err.contains("Tier-3b"), "got: {err}");
+        // Range repetition `c[*1:3]` — Tier-3b.
+        let rng = mk(serde_json::json!({
+            "kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 c"},
+            "repetition": {"kind": "Consecutive", "min": 1, "max": 3}
+        }));
+        let err = property_body(&rng, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("range repetition must reject");
+        assert!(err.contains("Tier-3b"), "got: {err}");
+        // A repetition INSIDE a multi-element chain — length composition, Tier-3b.
+        let chain_rep = mk(serde_json::json!({
+            "kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"},
+                              "repetition": {"kind": "Consecutive", "min": 2, "max": 2}}, "min":0, "max":0},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "3 c"}}, "min":1, "max":1}
+            ]
+        }));
+        let err = property_body(&chain_rep, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("repetition in a chain must reject");
+        assert!(err.contains("Tier-3b"), "got: {err}");
+    }
+
+    #[test]
+    fn xl5_sequence_antecedent() {
+        // (a ##1 b) |-> c  →  a → X(b → c)  →  (!(a) || [] (!(b) || c)).
+        // slang shape: left = SequenceConcat[{a,0,0},{b,1,1}] (captured from slang).
+        let spec = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}}, "min":0, "max":0},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}, "min":1, "max":1}
+            ]},
+            "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "3 c"}}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("(!(a) || [] (!(b) || c))"),
+            "seq antecedent: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl5_repetition_antecedent_and_nonoverlap() {
+        // a[*3] |=> c  →  (a∧Xa∧XXa) → XXX c  →  nested with the |=> extra [].
+        let spec = serde_json::json!({
+            "kind": "Binary", "op": "NonOverlappedImplication",
+            "left": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"},
+                     "repetition": {"kind": "Consecutive", "min": 3, "max": 3}},
+            "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 c"}}
+        });
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
+        assert!(
+            f.contains("(!(a) || [] (!(a) || [] (!(a) || [] c)))"),
+            "a[*3] |=> c: {f}"
+        );
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl5_range_antecedent_rejected() {
+        // (a ##[1:2] b) |-> c — a range delay in an ANTECEDENT has multiple match
+        // ends (Tier-3b), rejected.
+        let spec = serde_json::json!({
+            "kind": "Binary", "op": "OverlappedImplication",
+            "left": {"kind": "SequenceConcat", "elements": [
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}}, "min":0, "max":0},
+                {"sequence": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}, "min":1, "max":2}
+            ]},
+            "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "3 c"}}
+        });
+        let err = property_body(&spec, &TranslateOptions::default(), &mut Vec::new())
+            .expect_err("range antecedent must reject");
+        assert!(err.contains("Tier-3b"), "got: {err}");
     }
 
     #[test]
@@ -1649,17 +2206,46 @@ mod tests {
     }
 
     #[test]
-    fn xl3_past_depth_gt_1_is_rejected() {
-        // `$past(x, 2)` — two arguments → out of Tier-2 (depth-1 only).
-        let call = serde_json::json!({
+    fn xl3_past_depth_k_lowers_to_the_suffixed_shadow() {
+        // `$past(x, 2)` — depth 2 now lowers to the stage-2 shadow `x__past2`
+        // (Tier-1 k-deep history). Bare `$past(x)` / depth 1 stays `x__past`.
+        let two = serde_json::json!({
             "kind": "Call", "subroutine": "$past",
             "arguments": [
                 {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
                 {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
             ]
         });
-        let err = bool_expr(&call).expect_err("depth>1 must reject");
-        assert!(err.contains("depth-1"), "got: {err}");
+        assert_eq!(bool_expr(&two).expect("depth 2 accepted"), "x__past2");
+        let one = serde_json::json!({
+            "kind": "Call", "subroutine": "$past",
+            "arguments": [{"kind": "NamedValue", "symbol": "1 x", "type": "logic"}]
+        });
+        assert_eq!(bool_expr(&one).expect("depth 1 accepted"), "x__past");
+    }
+
+    #[test]
+    fn xl3_past_depth_zero_and_stable_with_depth_are_rejected() {
+        // `$past(x, 0)` — a depth must be a positive number of cycles.
+        let zero = serde_json::json!({
+            "kind": "Call", "subroutine": "$past",
+            "arguments": [
+                {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
+                {"kind": "IntegerLiteral", "value": "0", "constant": "0"}
+            ]
+        });
+        let err = bool_expr(&zero).expect_err("depth 0 must reject");
+        assert!(err.contains(">= 1"), "got: {err}");
+        // `$stable(x, 2)` — only `$past` carries a depth argument.
+        let stable2 = serde_json::json!({
+            "kind": "Call", "subroutine": "$stable",
+            "arguments": [
+                {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
+                {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
+            ]
+        });
+        let err = bool_expr(&stable2).expect_err("$stable depth must reject");
+        assert!(err.contains("single signal"), "got: {err}");
     }
 
     #[test]
@@ -1789,14 +2375,16 @@ mod tests {
             vec![
                 ShadowSignal {
                     base: "state_q".into(),
-                    width: 6
+                    width: 6,
+                    depth: 1
                 },
                 ShadowSignal {
                     base: "v".into(),
-                    width: 1
+                    width: 1,
+                    depth: 1
                 },
             ],
-            "required_shadows must dedup by base + carry width"
+            "required_shadows must dedup by base + carry width + depth"
         );
     }
 

@@ -1913,11 +1913,11 @@ pub(crate) fn prepare_model(
         e.message = format!("verify_auto: parse lifted BTOR2: {}", e.message);
         e
     })?;
-    let shadow_bases: Vec<&str> = extraction
+    let shadow_bases: Vec<(&str, u32)> = extraction
         .required_shadows
         .iter()
-        .map(|s| s.base.as_str())
-        .filter(|b| crate::adapter::btor2::can_shadow(&pre_file, b))
+        .filter(|s| crate::adapter::btor2::can_shadow(&pre_file, &s.base))
+        .map(|s| (s.base.as_str(), s.depth))
         .collect();
     let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
 

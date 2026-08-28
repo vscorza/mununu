@@ -175,6 +175,17 @@ pub struct TritBdd {
 
 impl TritBdd {
     /// `(must, may)` directly (debug-asserts `must ⊑ may`).
+    ///
+    /// SOUNDNESS (must ⊆ may fix, Tier 0) — this check stays a `debug_assert!`
+    /// because it runs on the hot modal path (once per node per fixpoint
+    /// iteration) and a per-node BDD `and` in release would cost real time. The
+    /// **release** guarantee of the underlying invariant now comes one layer up,
+    /// once per lift, from `adapter::btor2::kmts_lift::assert_must_subset_may`,
+    /// which rejects a KMTS whose `R_must ⊄ R_may` with an `IrConsistencyError`
+    /// before it ever reaches this constructor. Given a well-formed KMTS the
+    /// operators preserve `must ⊑ may` (see §5 of docs/design/past-shadow-
+    /// soundness.md), so this assert should never fire; it remains as the debug
+    /// tripwire that a future operator change did not break preservation.
     pub fn from_parts(must: BDDFunction, may: BDDFunction) -> Self {
         debug_assert!(
             must.and(&may).unwrap() == must,

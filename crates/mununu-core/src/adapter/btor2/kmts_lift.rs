@@ -1068,6 +1068,7 @@ fn apply_sampled_must_inference(
     // passes route through the STS-IR seam (AR-S2).
     use crate::adapter::btor2::smt_must_edge::{
         SmtMustVerdict, build_register_nid_map, smt_per_target_must_check,
+        smt_source_cube_proven_feasible,
     };
     let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
     // R.6.6 gate — skip all post-passes under controllability-aware mode.
@@ -1079,6 +1080,48 @@ fn apply_sampled_must_inference(
         };
     }
     let approx = crate::adapter::WarningKind::ApproximateTranslation;
+
+    // SOUNDNESS (must ⊆ may fix, Tier 0) — a source cube whose predicate
+    // conjunction is UNSATISFIABLE has no concrete state, yet every must-check
+    // below fabricates a vacuous `Must` out of it (an empty `src` makes
+    // `src ∧ trans ∧ ¬tgt` trivially UNSAT). That `Sharp` edge breaks the KMTS
+    // invariant `R_must ⊆ R_may` and is the root of the false-`Violated` /
+    // `TritBdd` panic on `$past` models (past-shadow-soundness.md §6) — a cube
+    // like `din == V ∧ din__past == V'` with contradictory dimensions on one
+    // register is empty yet promotes a must-edge. Prove each candidate source
+    // cube feasible ONCE (one shared encode + z3 scope) and drop must-promotion
+    // for the proven-empty ones. `Off` promotes nothing, so it needs no check.
+    let infeasible_sources: std::collections::HashSet<usize> =
+        if matches!(must_edge_inference, MustEdgeInference::Off) {
+            std::collections::HashSet::new()
+        } else {
+            let cfg = z3::Config::new();
+            z3::with_z3_config(&cfg, || -> std::collections::HashSet<usize> {
+                let Ok(view) = encode_design_for_lift(file) else {
+                    // Encoder failure — cannot prove any cube empty. The must-checks
+                    // below re-encode and likewise promote nothing on failure, so an
+                    // empty exclusion set is consistent (nothing to gate).
+                    return std::collections::HashSet::new();
+                };
+                let nid_map = build_register_nid_map(&view);
+                sampled_targets_per_source
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, targets)| !targets.is_empty())
+                    .filter(|(src, _)| {
+                        !smt_source_cube_proven_feasible(
+                            &view,
+                            *src as u64,
+                            predicates,
+                            &nid_map,
+                            5_000,
+                        )
+                    })
+                    .map(|(src, _)| src)
+                    .collect()
+            })
+        };
+
     match must_edge_inference {
         MustEdgeInference::Off => MustInferenceOutcome {
             sharp_promoted: 0,
@@ -1097,6 +1140,10 @@ fn apply_sampled_must_inference(
                 let mut promoted = 0usize;
                 for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
                     if targets.is_empty() {
+                        continue;
+                    }
+                    // Fix B — no vacuous must-edge out of a proven-empty cube.
+                    if infeasible_sources.contains(&src_idx) {
                         continue;
                     }
                     let src_id = state_ids[src_idx];
@@ -1153,6 +1200,8 @@ fn apply_sampled_must_inference(
             let candidates: Vec<(usize, usize)> = sampled_targets_per_source
                 .iter()
                 .enumerate()
+                // Fix B — exclude proven-empty source cubes (vacuous ∀∃ must).
+                .filter(|(src, _)| !infeasible_sources.contains(src))
                 .flat_map(|(src, targets)| targets.iter().map(move |&t| (src, t)))
                 .collect();
             let must = BtorSts::new(file).must_edges_over(predicates, &candidates, 5_000);
@@ -1199,6 +1248,8 @@ fn apply_sampled_must_inference(
             let singleton_candidates: Vec<(usize, usize)> = sampled_targets_per_source
                 .iter()
                 .enumerate()
+                // Fix B — exclude proven-empty source cubes (vacuous ∀∃ must).
+                .filter(|(src, _)| !infeasible_sources.contains(src))
                 .flat_map(|(src, targets)| targets.iter().map(move |&t| (src, t)))
                 .collect();
             let singleton_musts = sts.must_edges_over(predicates, &singleton_candidates, 5_000);
@@ -1220,7 +1271,12 @@ fn apply_sampled_must_inference(
             let hyper_may: Vec<(usize, usize)> = sampled_targets_per_source
                 .iter()
                 .enumerate()
-                .filter(|(src, targets)| !promoted_srcs.contains(src) && targets.len() > 1)
+                .filter(|(src, targets)| {
+                    !promoted_srcs.contains(src)
+                        && targets.len() > 1
+                        // Fix B — exclude proven-empty source cubes (vacuous hyper-must).
+                        && !infeasible_sources.contains(src)
+                })
                 .flat_map(|(src, targets)| targets.iter().map(move |&t| (src, t)))
                 .collect();
             let hyper_edges = sts.hyper_must_edges(predicates, &hyper_may, 5_000);
@@ -1252,6 +1308,57 @@ fn apply_sampled_must_inference(
             }
         }
     }
+}
+
+/// SOUNDNESS (must ⊆ may fix, Tier 0) — validate the KMTS invariant
+/// `R_must ⊆ R_may` on a freshly-lifted CLTS, ALWAYS (release included), not only
+/// under the debug-`assert!` in [`crate::mu_calculus::symbolic::TritBdd::from_parts`].
+///
+/// The 3-valued modal operators are sound only when every must-edge is also a
+/// may-edge (Bruns–Godefroid; see `symbolic.rs` §5 and past-shadow-soundness.md
+/// §5). Both evaluators build `R_may` from EVERY outgoing edge and `R_must` from
+/// `Sharp` ∪ `MustHyperOnly` edges (`symbolic.rs:357-377`, `evaluator.rs:20-56`),
+/// so a `Sharp` edge is trivially a may-edge and cannot break containment on its
+/// own. The one relation-level obligation that can fail is a
+/// `MustHyperOnly(src → T)` whose target set `T` is not covered by `src`'s
+/// may-successors — a hyper-must built over a candidate set that is not a subset
+/// of the emitted may-relation. Left unchecked it panics `TritBdd::from_parts` in
+/// debug and silently computes a wrong verdict in release. This runs once per lift
+/// (O(edges), SMT-free) and turns that into an honest `IrConsistencyError`.
+fn assert_must_subset_may(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+) -> Result<(), AdapterError> {
+    use crate::clts::TransitionModality;
+    for sid in clts.states() {
+        // R_may successors of `sid` = the targets of ALL its outgoing edges
+        // (every edge contributes to R_may in both evaluators).
+        let may_succ: std::collections::HashSet<usize> = clts
+            .outgoing(sid)
+            .iter()
+            .map(|t| t.target().index())
+            .collect();
+        for t in clts.outgoing(sid) {
+            if let TransitionModality::MustHyperOnly(targets) = t.modality() {
+                for tgt in targets.iter() {
+                    if !may_succ.contains(&tgt.index()) {
+                        return Err(AdapterError {
+                            kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                            location: None,
+                            message: format!(
+                                "adapter/btor2/kmts_lift: KMTS invariant R_must ⊆ R_may violated — \
+                                 the MustHyperOnly edge from state {} names hyper-target {} which is \
+                                 not a may-successor of it. A hyper-must target set must be a subset \
+                                 of the emitted may-relation (docs/design/past-shadow-soundness.md §6).",
+                                sid.index(),
+                                tgt.index()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn materialize_clts_from_lazy(
@@ -1358,6 +1465,9 @@ pub fn materialize_clts_from_lazy(
         location: None,
         message: format!("adapter/btor2/materialize_clts_from_lazy: builder.build failed: {e}"),
     })?;
+
+    // Fix C — enforce R_must ⊆ R_may before the KMTS reaches any evaluator.
+    assert_must_subset_may(&clts)?;
 
     Ok(PredicateCubeLiftResult {
         clts,
@@ -2251,7 +2361,21 @@ pub fn predicate_cube_lift(
                 }
                 _ => {
                     // P1 #3 — canonical ∀∃ standard per-target must → Sharp.
-                    let must_edges = sts.must_edges(&cube_preds, 5_000);
+                    //
+                    // SOUNDNESS (must ⊆ may fix, Tier 0) — restrict the must-image to
+                    // the `may_edges` already emitted above (`must_edges_over`) instead
+                    // of the full `2^|P|×2^|P|` grid (`must_edges`). The ∀∃ must is
+                    // vacuously true out of an UNSATISFIABLE source cube (∀ over ∅), so
+                    // the all-pairs form fabricates a `Sharp` edge to a target that has
+                    // NO may-edge (the ∃-witness may-check correctly excludes an empty
+                    // src) — breaking the KMTS invariant `R_must ⊆ R_may`, which trips
+                    // `TritBdd::from_parts` (symbolic engine) and yields a spurious
+                    // `Violated` in the explicit engine (past-shadow-soundness.md §6).
+                    // `may_edges` is the emitted may-relation, so every promoted edge is
+                    // a may-edge BY CONSTRUCTION (candidates ⊆ may), and an empty src —
+                    // absent from `may_edges` — is never a candidate. Genuine ∀∃ musts
+                    // out of a satisfiable src are unaffected (∀∃ ⟹ ∃ ⟹ may).
+                    let must_edges = sts.must_edges_over(&cube_preds, &may_edges, 5_000);
                     let promoted = must_edges.len();
                     for (i, j) in must_edges {
                         builder.transition_ids_with_modality(
@@ -2266,7 +2390,7 @@ pub fn predicate_cube_lift(
                         warnings.push(crate::adapter::AdapterWarning {
                             kind: crate::adapter::WarningKind::ApproximateTranslation,
                             message: format!(
-                                "[P1 #3 may+must] predicate_cube_lift: SmtAllPairs may + SMT must composition promoted {promoted} edge(s) MayOnly → Sharp via the canonical ∀∃ must-relation (Z3-proved; sound under-approximation). The resulting KMTS carries both may (over-approx) and must (under-approx) edges, enabling sound DEFINITE 3-valued verdicts."
+                                "[P1 #3 may+must] predicate_cube_lift: SmtAllPairs may + SMT must composition promoted {promoted} edge(s) MayOnly → Sharp via the canonical ∀∃ must-relation restricted to the emitted may-edges (Z3-proved; sound under-approximation, R_must ⊆ R_may by construction). The resulting KMTS carries both may (over-approx) and must (under-approx) edges, enabling sound DEFINITE 3-valued verdicts."
                             ),
                             location: None,
                         });
@@ -2492,6 +2616,9 @@ pub fn predicate_cube_lift(
         location: None,
         message: format!("adapter/btor2/predicate_cube_lift: builder.build failed: {e}"),
     })?;
+
+    // Fix C — enforce R_must ⊆ R_may before the KMTS reaches any evaluator.
+    assert_must_subset_may(&clts)?;
 
     let elapsed = start.elapsed();
 
@@ -5757,5 +5884,192 @@ mod tests {
                 "a memory-free design must have no array cells"
             );
         });
+    }
+
+    // ---- must ⊆ may soundness fix (Tier 0) ------------------------------------
+
+    // A 2-bit counter `s` (s' = s + 1) with two predicates on the SAME register:
+    // p0 = (s == 0), p1 = (s == 1). Cube 3 (0b11) asserts `s == 0 ∧ s == 1`, which
+    // is UNSATISFIABLE — no concrete state inhabits it. Every must-check fabricates
+    // a vacuous `Must` out of such an empty cube (`src ∧ trans ∧ ¬tgt` is trivially
+    // UNSAT when `src` is UNSAT), which broke `R_must ⊆ R_may` and produced the
+    // false-`Violated` / `TritBdd` panic on `$past` models
+    // (docs/design/past-shadow-soundness.md §6). The fix drops must-promotion out of
+    // proven-empty cubes while keeping it for the feasible ones.
+    const UNSAT_CUBE_COUNTER: &str = "\
+1 sort bitvec 2
+2 state 1 s
+3 one 1
+4 add 1 2 3
+5 zero 1
+6 init 1 2 5
+7 next 1 2 4
+";
+
+    fn unsat_cube_preds() -> Vec<PredicateSpec> {
+        vec![
+            PredicateSpec {
+                name: "p0".into(),
+                register: "s".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "p1".into(),
+                register: "s".into(),
+                value: 1,
+            },
+        ]
+    }
+
+    fn must_edge_sources(r: &PredicateCubeLiftResult) -> std::collections::BTreeSet<usize> {
+        use crate::clts::{StateId, TransitionModality};
+        let mut set = std::collections::BTreeSet::new();
+        for i in 0..r.cube_count {
+            let sid = StateId::<DefaultStateIdx>::from_index(i).expect("state id");
+            for t in r.clts.outgoing(sid) {
+                if matches!(
+                    t.modality(),
+                    TransitionModality::Sharp | TransitionModality::MustHyperOnly(_)
+                ) {
+                    set.insert(i);
+                }
+            }
+        }
+        set
+    }
+
+    fn has_sharp_edge(r: &PredicateCubeLiftResult, from: usize, to: usize) -> bool {
+        use crate::clts::{StateId, TransitionModality};
+        let sid = StateId::<DefaultStateIdx>::from_index(from).expect("state id");
+        r.clts
+            .outgoing(sid)
+            .iter()
+            .any(|t| matches!(t.modality(), TransitionModality::Sharp) && t.target().index() == to)
+    }
+
+    #[test]
+    fn must_subset_may_no_vacuous_must_from_unsat_cube_all_pairs() {
+        // Fix A — SmtAllPairs may + the ∀∃ must restricted to the emitted may-edges.
+        let opts = PredicateCubeLiftOptions {
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
+            ..Default::default()
+        };
+        let r = predicate_cube_lift(
+            unsat_cube_preds(),
+            UNSAT_CUBE_COUNTER,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("lift Ok (assert_must_subset_may passed)");
+        assert_eq!(r.cube_count, 4);
+        // The unsat cube 3 sources NO must-edge (it has no may-edge to restrict to).
+        assert!(
+            !must_edge_sources(&r).contains(&3),
+            "unsat cube 3 must not source a must-edge"
+        );
+        // A feasible, deterministic cube keeps its must-edge (no over-restriction):
+        // cube 1 (s==0) → cube 2 (s==1) is the single successor.
+        assert!(
+            has_sharp_edge(&r, 1, 2),
+            "feasible cube 1 (s==0) must keep its Sharp edge to cube 2 (s==1)"
+        );
+    }
+
+    #[test]
+    fn must_subset_may_no_vacuous_must_from_unsat_cube_sampling() {
+        // Fix B — the sampling may path (default) under each SMT must mode. The
+        // canonical-representative sampler emits spurious may-edges out of the unsat
+        // cube, so the must post-pass gates on a PROVEN-feasible source rather than
+        // on the mere presence of a sampled edge.
+        for must in [
+            MustEdgeInference::SmtPerTarget,
+            MustEdgeInference::SmtPerTargetStandard,
+            MustEdgeInference::SmtHyperMust,
+        ] {
+            let opts = PredicateCubeLiftOptions {
+                may_edge_inference: MayEdgeInference::Off, // sampling
+                must_edge_inference: must,
+                ..Default::default()
+            };
+            let r = predicate_cube_lift(
+                unsat_cube_preds(),
+                UNSAT_CUBE_COUNTER,
+                &AdapterOptions::default(),
+                &opts,
+            )
+            .unwrap_or_else(|e| panic!("lift Ok for {must:?}: {}", e.message));
+            assert_eq!(r.cube_count, 4);
+            assert!(
+                !must_edge_sources(&r).contains(&3),
+                "{must:?}: unsat cube 3 must not source a must-edge"
+            );
+            assert!(
+                has_sharp_edge(&r, 1, 2),
+                "{must:?}: feasible cube 1 (s==0) must keep its Sharp edge to cube 2 (s==1)"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_must_subset_may_rejects_hyper_target_outside_may() {
+        use crate::clts::TransitionModality;
+        // s0 --MustHyperOnly({s1, s2})--> primary s1 is s0's ONLY edge, so
+        // may_succ(s0) = {s1}. s2 is reachable only via s1 (s1 --MayOnly--> s2), so
+        // it is NOT a may-successor of s0 → the hyper-must breaks R_must ⊆ R_may.
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        for i in 0..3 {
+            b.state(format!("s{i}"));
+        }
+        b.initial("s0");
+        let step = b.labels().intern(["step"]).unwrap();
+        let ids: Vec<_> = (0..3)
+            .map(|i| b.state_id_or_insert(format!("s{i}")).unwrap())
+            .collect();
+        b.transition_ids_with_modality(ids[1], &[step], ids[2], TransitionModality::MayOnly);
+        let hyper: smallvec::SmallVec<[_; 4]> = smallvec::smallvec![ids[1], ids[2]];
+        b.transition_ids_with_modality(
+            ids[0],
+            &[step],
+            ids[1],
+            TransitionModality::must_hyper(hyper),
+        );
+        let clts = b.build().expect("builds");
+        let err =
+            assert_must_subset_may(&clts).expect_err("must reject the uncovered hyper target");
+        assert_eq!(
+            err.kind,
+            crate::adapter::AdapterErrorKind::IrConsistencyError
+        );
+        assert!(err.message.contains("R_must ⊆ R_may"));
+    }
+
+    #[test]
+    fn assert_must_subset_may_accepts_covered_hyper() {
+        use crate::clts::TransitionModality;
+        // Same shape, but a MayOnly s0 → s2 makes both hyper targets may-successors
+        // of s0 (the primary s1 via the hyper edge itself, s2 via the may-edge).
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        for i in 0..3 {
+            b.state(format!("s{i}"));
+        }
+        b.initial("s0");
+        let step = b.labels().intern(["step"]).unwrap();
+        let ids: Vec<_> = (0..3)
+            .map(|i| b.state_id_or_insert(format!("s{i}")).unwrap())
+            .collect();
+        b.transition_ids_with_modality(ids[0], &[step], ids[2], TransitionModality::MayOnly);
+        let hyper: smallvec::SmallVec<[_; 4]> = smallvec::smallvec![ids[1], ids[2]];
+        b.transition_ids_with_modality(
+            ids[0],
+            &[step],
+            ids[1],
+            TransitionModality::must_hyper(hyper),
+        );
+        let clts = b.build().expect("builds");
+        assert!(
+            assert_must_subset_may(&clts).is_ok(),
+            "a hyper-must whose targets are all may-successors is well-formed"
+        );
     }
 }

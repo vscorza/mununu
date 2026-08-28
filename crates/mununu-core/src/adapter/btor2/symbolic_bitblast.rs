@@ -1029,43 +1029,69 @@ impl BddBitBlaster {
             .unwrap();
 
         // The FEASIBLE present cubes `∃x. A(x,p)` — the cubes some concrete
-        // register state inhabits. Used to restrict `R_must` (below) and to
-        // scope the verdict tally (R-F5.4.2) to materialisable abstract states.
+        // register state inhabits. Used to restrict `R_must` (below) and to scope
+        // the verdict tally (R-F5.4.2) to materialisable abstract states. Kept as
+        // `reg_cube` (unchanged) — the two-player GAME relation depends on this
+        // exact value; the input-predicate hazard is handled by disabling `R_must`
+        // on the standard path (below), not by re-scoping `feasible_present`.
         let feasible_present = a.exists(&reg_cube).unwrap();
 
-        // R_must, when requested. `A → φ` is `¬A ∨ φ`.
+        // SOUNDNESS (must ⊆ may fix, symbolic engine) — must-edges are DISABLED
+        // (may-only, `r_must = None`) when a predicate is over an INPUT.
         //
-        // A vacuously-empty (unsatisfiable) source cube yields `¬A ≡ ⊤` there,
-        // so the ∀ would make it a must-edge to *every* cube — breaking the KMTS
-        // invariant `R_must ⊆ R_may` (an empty cube has no may-edge). We
-        // intersect with `feasible_present`: must-edges only leave inhabited
-        // abstract states (the lift never materialises an infeasible cube), so
-        // `R_must ⊆ R_may` holds globally over the whole `2^k` cube space —
-        // which the R-F5.4.1 evaluator relies on (`box.must ⊆ box.may`).
-        let r_must = must.map(|sem| {
-            let raw = match sem {
-                MustSemantics::ForallExists => {
-                    // ∀x. ( A(x,p) → ∃i. A'(x,i,p') )
-                    let exists_i = a_prime.exists(&input_cube).unwrap();
-                    a.not()
-                        .unwrap()
-                        .or(&exists_i)
-                        .unwrap()
-                        .forall(&reg_cube)
-                        .unwrap()
-                }
-                MustSemantics::ForallForall => {
-                    // ∀(x ∪ i). ( A(x,p) → A'(x,i,p') )
-                    a.not()
-                        .unwrap()
-                        .or(&a_prime)
-                        .unwrap()
-                        .forall(&xi_cube)
-                        .unwrap()
-                }
-            };
-            raw.and(&feasible_present).unwrap()
-        });
+        // An input is both a present *observable* (the predicate reads it) and the
+        // transition *nondeterminism* (the ∃-input in the ∀∃ must-edge) — the same
+        // conflation that makes the exact ROBDD engine refuse an input atom. Here
+        // it leaves the constructed `raw` must-relation with input vars in its
+        // support, so `R_must ⊄ R_may` and `box.must ⊄ box.may` trips
+        // `TritBdd::from_parts` (a debug panic; a wrong verdict in release). Rather
+        // than fabricate a must-edge whose semantics are ill-defined, fall back to
+        // the may-only KMTS: definite HOLDS still transfers (may over-approximation
+        // + safety), and a refutation lands on ⊥ — the honest "abstraction can't
+        // decide", never a spurious VIOLATED. `A` depends on an input iff
+        // quantifying inputs changes feasibility.
+        //
+        // This applies ONLY to the standard (`Control::All`) relation, where inputs
+        // are demonic transition nondeterminism and box_pre trips on the dirty
+        // support. The TWO-PLAYER GAME relation (`controllable.is_some()`) models
+        // inputs explicitly as env/ctrl moves and *requires* `r_must` for the
+        // controllable predecessor (`AbstractRelation::evaluate`); it does not go
+        // through the box_pre panic, so it keeps its must-relation unchanged.
+        let inputs_in_predicates = feasible_present != a.exists(&xi_cube).unwrap();
+        let r_must = if inputs_in_predicates && controllable.is_none() {
+            None
+        } else {
+            must.map(|sem| {
+                let raw = match sem {
+                    MustSemantics::ForallExists => {
+                        // ∀x. ( A(x,p) → ∃i. A'(x,i,p') )
+                        let exists_i = a_prime.exists(&input_cube).unwrap();
+                        a.not()
+                            .unwrap()
+                            .or(&exists_i)
+                            .unwrap()
+                            .forall(&reg_cube)
+                            .unwrap()
+                    }
+                    MustSemantics::ForallForall => {
+                        // ∀(x ∪ i). ( A(x,p) → A'(x,i,p') )
+                        a.not()
+                            .unwrap()
+                            .or(&a_prime)
+                            .unwrap()
+                            .forall(&xi_cube)
+                            .unwrap()
+                    }
+                };
+                // A vacuously-empty (unsatisfiable) source cube yields `¬A ≡ ⊤`
+                // there, so the ∀ would make it a must-edge to *every* cube —
+                // breaking `R_must ⊆ R_may` (an empty cube has no may-edge).
+                // Intersecting with `feasible_present` keeps must-edges leaving
+                // only inhabited cubes, so `R_must ⊆ R_may` holds globally over
+                // the `2^k` cube space (the R-F5.4.1 evaluator relies on it).
+                raw.and(&feasible_present).unwrap()
+            })
+        };
 
         // P2.5-F — retain the concrete game pieces when a controllable partition was requested.
         let game = controllable.map(|_| GamePieces {

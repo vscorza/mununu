@@ -237,6 +237,63 @@ where
     }
 }
 
+/// Is the source cube's predicate conjunction PROVEN satisfiable: `∃ s. ⋀_i src_i`?
+///
+/// Returns `true` only when Z3 finds a concrete state satisfying every source
+/// predicate of the cube (`SatResult::Sat`). An **infeasible** (empty) cube
+/// (`Unsat`) corresponds to no concrete state, and the concrete transition
+/// relation is total — so the must-checks ([`smt_per_target_must_check`] and the
+/// STS-IR seam's ∀∃ / hyper forms) all fabricate a vacuous `Must` out of it
+/// (`src ∧ trans ∧ ¬tgt` is trivially UNSAT when `src` is UNSAT). That vacuous
+/// `Sharp` edge is the root of the R.2.5b false-`Violated` / `TritBdd` panic on
+/// `$past` models (`docs/design/past-shadow-soundness.md` §6): a cube like
+/// `din == V ∧ din__past == V'` with contradictory dimensions on one register is
+/// empty, yet promotes a must-edge. Callers gate must-promotion on this check so
+/// no must-edge is created out of a proven-empty cube.
+///
+/// SOUNDNESS — the conservative direction is **not** to promote. `Unsat` (proven
+/// empty) and `Unknown` / an unresolved predicate register (cannot prove feasible)
+/// both return `false`: dropping a must-edge is always sound (must is an
+/// under-approximation used by diamonds and refutation; fewer must-edges can only
+/// weaken a definite verdict to ⊥, never flip it). Cube feasibility is a small
+/// quantifier-free BV/AUFBV query, so `Unknown` is vanishingly rare in practice.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub fn smt_source_cube_proven_feasible<P>(
+    view: &Btor2SmtView,
+    src_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> bool
+where
+    P: PredicateLike,
+{
+    let mut src_constraints: Vec<z3::ast::Bool> = Vec::new();
+    for (i, pred) in predicates.iter().enumerate() {
+        let polarity = (src_bits >> i) & 1 == 1;
+        // An unresolved register — cannot prove feasible; conservatively drop
+        // (the must-check itself already returns Unknown for the same reason).
+        let Some(c) = build_pred_constraint(view, nid_map, pred, false, polarity) else {
+            return false;
+        };
+        src_constraints.push(c);
+    }
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl);
+    }
+    solver.set_params(&params);
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    // Only a definite SAT proves the cube non-empty; Unsat / Unknown → drop.
+    matches!(solver.check(), z3::SatResult::Sat)
+}
+
 /// Tiny trait surface so the must-edge check can consume either
 /// `PredicateSpec` (from `kmts_lift`) or test-local predicate types
 /// without taking on a kmts_lift dependency here.

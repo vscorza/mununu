@@ -1464,6 +1464,7 @@ fn sv_extract_sva_handler_impl(
             .map(|s| ShadowSignalView {
                 base: s.base.clone(),
                 width: s.width,
+                depth: s.depth,
             })
             .collect(),
     };
