@@ -3522,16 +3522,33 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
         MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
     };
-    // H.J.b — parse `SIGNAL=VALUE` config concretization entries; malformed
-    // entries are skipped (the pipeline only pins actual inputs).
+    // H.J.b — parse `SIGNAL=VALUE` config concretization entries. mununu#459: a
+    // malformed entry is a HARD error here (mirrors `--param` above), never a
+    // silent drop; a value that is not a decimal u64 (e.g. hex `0x1`) is rejected
+    // with a message naming the value. An unknown / non-input SIGNAL is caught
+    // downstream in `verify_auto` against the model's real primary inputs.
     let config_values: std::collections::HashMap<String, u64> = args
         .config_value
         .iter()
-        .filter_map(|e| {
-            let (name, val) = e.split_once('=')?;
-            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        .map(|e| {
+            let (name, val) = e
+                .split_once('=')
+                .ok_or_else(|| format!("malformed --config-value '{e}': expected SIGNAL=VALUE"))?;
+            let (name, val) = (name.trim(), val.trim());
+            if name.is_empty() {
+                return Err(format!(
+                    "malformed --config-value '{e}': SIGNAL must be non-empty"
+                ));
+            }
+            let value = val.parse::<u64>().map_err(|_| {
+                format!(
+                    "malformed --config-value '{e}': VALUE must be a decimal u64 \
+                     (got '{val}'); hex/0x, signed, and non-numeric values are not accepted"
+                )
+            })?;
+            Ok((name.to_string(), value))
         })
-        .collect();
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
     // H.H — parse `SIGNAL<=VALUE` (or `SIGNAL=VALUE`) counter-bound entries; both
     // spellings mean the inclusive upper bound `SIGNAL <= VALUE`.
     let counter_bounds: std::collections::HashMap<String, u64> = args

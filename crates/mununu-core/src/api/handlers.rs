@@ -1536,16 +1536,36 @@ fn sv_verify_auto_handler_impl(
         Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
         _ => MustEdgeInference::Off,
     };
-    // H.J.b — parse `"signal=value"` config concretization entries; malformed
-    // entries are skipped (the pipeline only pins actual inputs anyway).
+    // H.J.b — parse `"signal=value"` config concretization entries. mununu#459: a
+    // malformed entry is a 400 (mirrors `params` above), never a silent drop; a
+    // value that is not a decimal u64 (e.g. hex `0x1`) is rejected by name. An
+    // unknown / non-input signal is caught downstream in `verify_auto` against the
+    // model's real primary inputs.
     let config_values: std::collections::HashMap<String, u64> = request
         .config_values
         .iter()
-        .filter_map(|e| {
-            let (name, val) = e.split_once('=')?;
-            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        .map(|e| {
+            let (name, val) = e.split_once('=').ok_or_else(|| ApiError::BadRequest {
+                message: format!("malformed config_values entry '{e}'"),
+                details: Some("expected \"SIGNAL=VALUE\"".into()),
+            })?;
+            let (name, val) = (name.trim(), val.trim());
+            if name.is_empty() {
+                return Err(ApiError::BadRequest {
+                    message: format!("malformed config_values entry '{e}'"),
+                    details: Some("SIGNAL must be non-empty".into()),
+                });
+            }
+            let value = val.parse::<u64>().map_err(|_| ApiError::BadRequest {
+                message: format!("malformed config_values entry '{e}'"),
+                details: Some(format!(
+                    "VALUE must be a decimal u64 (got '{val}'); hex/0x, signed, \
+                     and non-numeric values are not accepted"
+                )),
+            })?;
+            Ok((name.to_string(), value))
         })
-        .collect();
+        .collect::<Result<std::collections::HashMap<_, _>, ApiError>>()?;
     // H.H — parse `"signal<=value"` (or `"signal=value"`) counter-bound entries;
     // both spellings mean the inclusive upper bound `signal <= value`.
     let counter_bounds: std::collections::HashMap<String, u64> = request
@@ -4447,6 +4467,30 @@ members = ["x"]
             .await
             .expect_err("malformed config_values must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    /// mununu#459 — a `sv verify-auto` `config_values` entry whose VALUE is not a decimal u64
+    /// (e.g. hex `0x1`) is a 400 that names the value, returned BEFORE the (heavy) lift — never a
+    /// silent drop that verifies a different question than the one asked. (Unknown / non-input
+    /// SIGNAL names are caught downstream against the model's real inputs; see
+    /// `verify_auto::tests::config_pins_partition_applied_vs_unusable`.)
+    #[test]
+    fn sv_verify_auto_handler_rejects_hex_config_value() {
+        use crate::api::models::SvVerifyAutoRequest;
+        let request: SvVerifyAutoRequest = serde_json::from_value(serde_json::json!({
+            "source": "module m(input logic clk, input logic rst); endmodule\n",
+            "config_values": ["rst=0x1"],
+        }))
+        .expect("request deserializes");
+        let err = sv_verify_auto_handler_impl(request)
+            .expect_err("a hex config_values value must be rejected, not silently dropped");
+        match err {
+            ApiError::BadRequest { details, .. } => assert!(
+                details.as_deref().is_some_and(|d| d.contains("decimal")),
+                "the 400 must explain the value is not a decimal u64: {details:?}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     /// cegar-extraction Stage 2 — the SV-direct CEGAR endpoint rejects an

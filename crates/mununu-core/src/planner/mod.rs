@@ -358,7 +358,18 @@ fn skip_over_cap_notes(report: &AutoVerifyReport, design_btor2: &str) -> Vec<Ver
     let facts = ModelFacts::new(&file);
     let mut notes = Vec::new();
     for prop in &report.properties {
-        if !matches!(prop.outcome, VerifyOutcome::Skipped { .. }) {
+        let VerifyOutcome::Skipped { reason } = &prop.outcome else {
+            continue;
+        };
+        // mununu#462 — a bit-blast that ABSTAINED (BDD arena exhausted) mid-evaluation, rather
+        // than at admission: name the cone's state-bit width and the width lever (`--param`).
+        // This is the state-bit-count analogue of the skip-diameter-bound note. Matches both the
+        // cube-path oom() string and the exact-build string (both contain "arena exhausted").
+        if reason.contains("arena exhausted") {
+            let cone_bits = crate::mu_calculus::parser::parse(&prop.formula)
+                .map(|f| facts.cone_vs_cap(&formula_seed_atoms(&f)).0)
+                .unwrap_or(0);
+            notes.push(bitblast_oom_skip_note(&prop.name, cone_bits));
             continue;
         }
         let Ok(formula) = crate::mu_calculus::parser::parse(&prop.formula) else {
@@ -457,6 +468,40 @@ fn diameter_bound_skip_note(name: &str, counter_log2: u32) -> VerificationNote {
                  escalation / the recoverability rescue), not register reduction or input \
                  concretization — and if the descent is not well-founded toward the target, the \
                  property is a genuine diameter wall (an honest ⊥)."
+            .into(),
+        items: Vec::new(),
+    }
+}
+
+/// mununu#462 — the bit-blast OOM Skip note: a property whose BDD bit-blast exhausted its node
+/// arena mid-evaluation (not at admission), so the engine ABSTAINED (Skipped) rather than
+/// `.unwrap()`-panicking / SIGABRT-ing and taking the WHOLE run — and every OTHER property still
+/// reports. Names the cone's state-bit width and points at the width lever (`--param`, which
+/// re-elaborates with a smaller parameterised counter/register so its bits fit) and the fallback
+/// (`--engine explicit`). The state-bit-count analogue of `diameter_bound_skip_note`. Advisory
+/// only (a note, never a verdict change).
+fn bitblast_oom_skip_note(name: &str, cone_bits: u32) -> VerificationNote {
+    let cone = if cone_bits > 0 {
+        format!("~{cone_bits}-bit state cone")
+    } else {
+        "wide state cone".to_string()
+    };
+    VerificationNote {
+        kind: "skip-bitblast-oom".into(),
+        level: NoteLevel::ScopeCaveat,
+        summary: format!(
+            "`{name}`: Skipped — the BDD bit-blast exhausted its node arena on a {cone} (a SIZE \
+             threshold, not a malformed input); the engine abstained on this property so every \
+             other property in the run still reports."
+        ),
+        detail: "The symbolic engine bit-blasts a property's cone-of-influence into a BDD; a wide \
+                 counter/register cone (e.g. several 32-bit counters, each doubled by its `$past` \
+                 shadow) can outgrow the node budget mid-fixpoint. This is a size threshold — \
+                 shrink the state and it decides. The direct lever is `--param NAME=VALUE`, which \
+                 re-elaborates the design with a smaller width parameter (e.g. `--param \
+                 BW_WIDTH=4`) so the counter bits fit the arena; the verdict is then scoped to that \
+                 parameter value. The engine-level fallback is `--engine explicit`. Only this \
+                 property abstained — the rest of the run is unaffected."
             .into(),
         items: Vec::new(),
     }
@@ -818,6 +863,88 @@ mod tests {
             n.detail.contains("--config-value") && n.detail.contains("INPUT-inflated"),
             "detail must point at --config-value on an input-inflated cone: {}",
             n.detail
+        );
+    }
+
+    // ---- mununu#462: the bit-blast OOM Skip note ---------------------------------------------
+
+    #[test]
+    fn bitblast_oom_skip_emits_size_note_and_spares_other_properties() {
+        // A report where ONE property abstained with an "arena exhausted" reason (the bit-blast
+        // OOM), alongside a DECIDED property. The classifier emits exactly one `skip-bitblast-oom`
+        // note — naming the cone size + `--param` — for the abstained property, and NONE for the
+        // decided one: the whole point of mununu#462 is that one over-budget property no longer
+        // taints (or crashes) the rest of the run.
+        use crate::adapter::slang::translate::SvaKind;
+        use crate::adapter::slang::verify_auto::PropertyVerdict;
+        // A 300-bit self-incrementing register → a measurable wide cone for `big == 0`.
+        let btor2 = "\
+1 sort bitvec 300
+2 sort bitvec 1
+3 state 1 big
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+";
+        let report = AutoVerifyReport {
+            properties: vec![
+                PropertyVerdict {
+                    name: "p_wide".into(),
+                    kind: SvaKind::Assert,
+                    formula: "mu X.(big == 0 || <> X)".into(),
+                    outcome: VerifyOutcome::Skipped {
+                        reason: "CEGAR error: symbolic bit-blaster: BDD arena exhausted \
+                                 (OxiDD OutOfMemory) — the cone does not compress to a tractable \
+                                 BDD; use `--engine explicit`"
+                            .into(),
+                    },
+                    seeded_predicates: Vec::new(),
+                    counterexample: None,
+                },
+                PropertyVerdict {
+                    name: "p_ok".into(),
+                    kind: SvaKind::Assert,
+                    formula: "big == 0".into(),
+                    outcome: VerifyOutcome::Holds,
+                    seeded_predicates: Vec::new(),
+                    counterexample: None,
+                },
+            ],
+            unsupported: Vec::new(),
+            diagnostics: Default::default(),
+            notes: Vec::new(),
+        };
+        let notes = skip_over_cap_notes(&report, btor2);
+        let oom: Vec<_> = notes
+            .iter()
+            .filter(|n| n.kind == "skip-bitblast-oom")
+            .collect();
+        assert_eq!(
+            oom.len(),
+            1,
+            "exactly one bit-blast-OOM note — for the abstained property only, not the decided one"
+        );
+        let n = oom[0];
+        assert!(
+            n.summary.contains("p_wide"),
+            "note names the abstained property: {}",
+            n.summary
+        );
+        assert!(
+            n.summary.contains("bit") && n.summary.contains("300"),
+            "summary names the state-bit size: {}",
+            n.summary
+        );
+        assert!(
+            n.detail.contains("--param"),
+            "detail points at the --param width lever: {}",
+            n.detail
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|nn| nn.kind == "skip-bitblast-oom" && nn.summary.contains("p_ok")),
+            "a decided property must not receive a bit-blast-OOM note",
         );
     }
 
