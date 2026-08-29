@@ -557,35 +557,59 @@ impl BddBitBlaster {
 
     // ---- Boolean gadgets (each mirrors a concrete `eval_op` arm) ----
 
-    fn xor(&self, a: &BDDFunction, b: &BDDFunction) -> BDDFunction {
+    fn xor(&self, a: &BDDFunction, b: &BDDFunction) -> Result<BDDFunction, String> {
         // (a ∧ ¬b) ∨ (¬a ∧ b) — kept crate-portable (oxidd exposes `.and/.or/.not`).
-        let lhs = a.and(&b.not().unwrap()).unwrap();
-        let rhs = a.not().unwrap().and(b).unwrap();
-        lhs.or(&rhs).unwrap()
+        // Every apply is `oom(...)?` so an arena-exhausting op ABSTAINS (Err) rather
+        // than `.unwrap()`-panicking / SIGABRT-ing on the exhausted-manager drop.
+        let lhs = oom(a.and(&oom(b.not())?))?;
+        let rhs = oom(oom(a.not())?.and(b))?;
+        oom(lhs.or(&rhs))
+    }
+
+    /// Build a `width`-bit result one bit at a time, checking the node budget after
+    /// each bit so a wide per-bit op (bitwise AND/OR/…) ABSTAINS at the budget with
+    /// arena headroom intact (mununu#462) instead of growing the shared BDD arena to
+    /// exhaustion mid-collect — where the exhausted-manager drop would SIGABRT.
+    fn map_bits_checked(
+        &self,
+        width: u32,
+        mut f: impl FnMut(usize) -> Result<BDDFunction, String>,
+    ) -> Result<BitVec, String> {
+        let mut out = BitVec::with_capacity(width as usize);
+        for i in 0..width as usize {
+            out.push(f(i)?);
+            self.check_node_budget()?;
+        }
+        Ok(out)
     }
 
     /// Ripple-carry adder over `width` bits: returns `(sum, carry_out)`.
-    /// Missing high bits of either operand read as `0`.
+    /// Missing high bits of either operand read as `0`. Each bit checks the node
+    /// budget (mirrors `Op::Ite`): the whole width builds inside one `eval_op`, so
+    /// the between-op guard cannot fire mid-loop; the per-bit check bounds growth to
+    /// a single adder stage, so a wide add ABSTAINS at the budget with arena
+    /// headroom intact instead of exhausting the manager (mununu#462).
     fn add_bits(
         &self,
         a: &[BDDFunction],
         b: &[BDDFunction],
         cin: BDDFunction,
         width: u32,
-    ) -> (BitVec, BDDFunction) {
+    ) -> Result<(BitVec, BDDFunction), String> {
         let mut carry = cin;
         let mut sum = Vec::with_capacity(width as usize);
         for i in 0..width as usize {
             let ai = a.get(i).cloned().unwrap_or_else(|| self.ff.clone());
             let bi = b.get(i).cloned().unwrap_or_else(|| self.ff.clone());
-            let axb = self.xor(&ai, &bi);
-            let s = self.xor(&axb, &carry);
+            let axb = self.xor(&ai, &bi)?;
+            let s = self.xor(&axb, &carry)?;
             // carry' = (ai ∧ bi) ∨ (carry ∧ (ai ⊕ bi))
-            let c = ai.and(&bi).unwrap().or(&carry.and(&axb).unwrap()).unwrap();
+            let c = oom(oom(ai.and(&bi))?.or(&oom(carry.and(&axb))?))?;
             sum.push(s);
             carry = c;
+            self.check_node_budget()?;
         }
-        (sum, carry)
+        Ok((sum, carry))
     }
 
     /// Barrel shifter: shift `a` by the VARIABLE amount `s` (a `width`-bit BitVec).
@@ -599,7 +623,7 @@ impl BddBitBlaster {
         width: u32,
         left: bool,
         arith: bool,
-    ) -> BitVec {
+    ) -> Result<BitVec, String> {
         let w = width as usize;
         let sign = if arith {
             a.get(w.wrapping_sub(1))
@@ -613,9 +637,9 @@ impl BddBitBlaster {
             .collect();
         for (k, sk) in s.iter().enumerate() {
             let sh = 1usize.checked_shl(k as u32).unwrap_or(usize::MAX); // 2^k, saturating
-            let nsk = sk.not().unwrap();
+            let nsk = oom(sk.not())?;
             cur = (0..w)
-                .map(|j| {
+                .map(|j| -> Result<BDDFunction, String> {
                     // The bit selected when s[k] is set (shift by 2^k this stage).
                     let shifted = if left {
                         // left: result[j] = (j ≥ 2^k) ? cur[j − 2^k] : 0
@@ -633,86 +657,82 @@ impl BddBitBlaster {
                         }
                     };
                     // result[j] = s[k] ? shifted : cur[j]
-                    sk.and(&shifted)
-                        .unwrap()
-                        .or(&nsk.and(&cur[j]).unwrap())
-                        .unwrap()
+                    oom(oom(sk.and(&shifted))?.or(&oom(nsk.and(&cur[j]))?))
                 })
-                .collect();
+                .collect::<Result<BitVec, String>>()?;
+            self.check_node_budget()?;
         }
-        cur
+        Ok(cur)
     }
 
-    /// OR-reduce a bit-vector to a single BDD (`|x`).
-    fn or_reduce(&self, bits: &[BDDFunction]) -> BDDFunction {
+    /// OR-reduce a bit-vector to a single BDD (`|x`). Budget-checked per bit so a
+    /// wide reduction ABSTAINS at the budget rather than exhausting the arena.
+    fn or_reduce(&self, bits: &[BDDFunction]) -> Result<BDDFunction, String> {
         let mut acc = self.ff.clone();
         for b in bits {
-            acc = acc.or(b).unwrap();
+            acc = oom(acc.or(b))?;
+            self.check_node_budget()?;
         }
-        acc
+        Ok(acc)
     }
 
-    /// AND-reduce a bit-vector to a single BDD (`&x`).
-    fn and_reduce(&self, bits: &[BDDFunction]) -> BDDFunction {
+    /// AND-reduce a bit-vector to a single BDD (`&x`). Budget-checked per bit.
+    fn and_reduce(&self, bits: &[BDDFunction]) -> Result<BDDFunction, String> {
         let mut acc = self.tt.clone();
         for b in bits {
-            acc = acc.and(b).unwrap();
+            acc = oom(acc.and(b))?;
+            self.check_node_budget()?;
         }
-        acc
+        Ok(acc)
     }
 
-    /// XOR-reduce a bit-vector to a single BDD (`^x`).
-    fn xor_reduce(&self, bits: &[BDDFunction]) -> BDDFunction {
+    /// XOR-reduce a bit-vector to a single BDD (`^x`). Budget-checked per bit.
+    fn xor_reduce(&self, bits: &[BDDFunction]) -> Result<BDDFunction, String> {
         let mut acc = self.ff.clone();
         for b in bits {
-            acc = self.xor(&acc, b);
+            acc = self.xor(&acc, b)?;
+            self.check_node_budget()?;
         }
-        acc
+        Ok(acc)
     }
 
     /// Structural bit-equality: AND of per-bit XNOR. Returns a 1-bit vector.
-    fn eq_bits(&self, a: &[BDDFunction], b: &[BDDFunction]) -> BitVec {
+    /// Budget-checked per bit (mununu#462): a wide equality over a large state cone
+    /// is the AND-reduction that blows the arena, so it ABSTAINS at the budget with
+    /// arena headroom intact instead of `.unwrap()`-panicking on OxiDD OutOfMemory.
+    fn eq_bits(&self, a: &[BDDFunction], b: &[BDDFunction]) -> Result<BitVec, String> {
         let n = a.len().max(b.len());
         let mut acc = self.tt.clone();
         for i in 0..n {
             let ai = a.get(i).cloned().unwrap_or_else(|| self.ff.clone());
             let bi = b.get(i).cloned().unwrap_or_else(|| self.ff.clone());
-            let xnor = self.xor(&ai, &bi).not().unwrap();
-            acc = acc.and(&xnor).unwrap();
+            let xnor = oom(self.xor(&ai, &bi)?.not())?;
+            acc = oom(acc.and(&xnor))?;
+            self.check_node_budget()?;
         }
-        vec![acc]
+        Ok(vec![acc])
     }
 
     /// Unsigned `a >= b`: the carry-out of `a + ¬b + 1` (borrow-free subtract).
-    fn uge(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> BDDFunction {
+    fn uge(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> Result<BDDFunction, String> {
         let not_b: BitVec = (0..width as usize)
-            .map(|i| {
-                b.get(i)
-                    .cloned()
-                    .unwrap_or_else(|| self.ff.clone())
-                    .not()
-                    .unwrap()
-            })
-            .collect();
-        let (_, cout) = self.add_bits(a, &not_b, self.tt.clone(), width);
-        cout
+            .map(|i| oom(b.get(i).cloned().unwrap_or_else(|| self.ff.clone()).not()))
+            .collect::<Result<BitVec, String>>()?;
+        let (_, cout) = self.add_bits(a, &not_b, self.tt.clone(), width)?;
+        Ok(cout)
     }
 
     /// Signed (two's-complement) `a < b`: if the signs differ, the negative operand (MSB set)
     /// is the smaller; if the signs match, unsigned `<` decides. `slt = (a_msb ⊕ b_msb) ? a_msb
     /// : (a <u b)`, with `a <u b = ¬(a ≥u b)`.
-    fn slt(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> BDDFunction {
+    fn slt(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> Result<BDDFunction, String> {
         let w = width as usize;
         let amsb = a.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
         let bmsb = b.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
-        let signs_differ = self.xor(&amsb, &bmsb);
-        let ult = self.uge(a, b, width).not().unwrap(); // a <u b
+        let signs_differ = self.xor(&amsb, &bmsb)?;
+        let ult = oom(self.uge(a, b, width)?.not())?; // a <u b
         // signs_differ ? amsb : ult
-        signs_differ
-            .and(&amsb)
-            .unwrap()
-            .or(&signs_differ.not().unwrap().and(&ult).unwrap())
-            .unwrap()
+        oom(oom(signs_differ.and(&amsb))?.or(&oom(oom(signs_differ.not())?.and(&ult))?))
     }
 
     // ---- R-F5.3b: predicate BDDs over the register-bit variables ----
@@ -748,15 +768,21 @@ impl BddBitBlaster {
 
     /// An unsigned comparison of two equal-width bit-vectors, as a 1-bit BDD.
     /// Mirrors [`crate::adapter::btor2::predicate_expr`]'s `cmp_apply` (unsigned).
-    fn cmp_bits(&self, a: &[BDDFunction], op: CmpOp, b: &[BDDFunction], width: u32) -> BDDFunction {
-        match op {
-            CmpOp::Eq => self.eq_bits(a, b).swap_remove(0),
-            CmpOp::Ne => self.eq_bits(a, b).swap_remove(0).not().unwrap(),
-            CmpOp::Ge => self.uge(a, b, width),
-            CmpOp::Lt => self.uge(a, b, width).not().unwrap(),
-            CmpOp::Le => self.uge(b, a, width), // a ≤ b ⟺ b ≥ a
-            CmpOp::Gt => self.uge(b, a, width).not().unwrap(), // a > b ⟺ ¬(b ≥ a)
-        }
+    fn cmp_bits(
+        &self,
+        a: &[BDDFunction],
+        op: CmpOp,
+        b: &[BDDFunction],
+        width: u32,
+    ) -> Result<BDDFunction, String> {
+        Ok(match op {
+            CmpOp::Eq => self.eq_bits(a, b)?.swap_remove(0),
+            CmpOp::Ne => oom(self.eq_bits(a, b)?.swap_remove(0).not())?,
+            CmpOp::Ge => self.uge(a, b, width)?,
+            CmpOp::Lt => oom(self.uge(a, b, width)?.not())?,
+            CmpOp::Le => self.uge(b, a, width)?, // a ≤ b ⟺ b ≥ a
+            CmpOp::Gt => oom(self.uge(b, a, width)?.not())?, // a > b ⟺ ¬(b ≥ a)
+        })
     }
 
     /// R-F5.3b — compile a [`PredicateExpr`] into a single BDD over the
@@ -790,7 +816,7 @@ impl BddBitBlaster {
                 let w = reg.len().max(64);
                 let a = self.zero_extend(reg, w);
                 let b = self.const_bits(*value as u128, w);
-                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+                self.cmp_bits(&a, *op, &b, w as u32)
             }
             PredicateExpr::CmpReg { lhs, op, rhs } => {
                 let l = self.signal_bits(lhs).ok_or_else(|| unknown(lhs))?;
@@ -798,7 +824,7 @@ impl BddBitBlaster {
                 let w = l.len().max(r.len());
                 let a = self.zero_extend(l, w);
                 let b = self.zero_extend(r, w);
-                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+                self.cmp_bits(&a, *op, &b, w as u32)
             }
             PredicateExpr::CmpRegAddend {
                 lhs,
@@ -814,19 +840,17 @@ impl BddBitBlaster {
                 // is `eval`'s modulus and equals the rhs register width here).
                 let rw = r.len();
                 let addend_bits = self.const_bits(*addend as u128, rw);
-                let (sum, _) = self.add_bits(r, &addend_bits, self.ff.clone(), rw as u32);
+                let (sum, _) = self.add_bits(r, &addend_bits, self.ff.clone(), rw as u32)?;
                 let w = l.len().max(rw);
                 let a = self.zero_extend(l, w);
                 let b = self.zero_extend(&sum, w);
-                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+                self.cmp_bits(&a, *op, &b, w as u32)
             }
             PredicateExpr::And(a, b) => {
-                Ok(self.predicate_bdd(a)?.and(&self.predicate_bdd(b)?).unwrap())
+                oom(self.predicate_bdd(a)?.and(&self.predicate_bdd(b)?))
             }
-            PredicateExpr::Or(a, b) => {
-                Ok(self.predicate_bdd(a)?.or(&self.predicate_bdd(b)?).unwrap())
-            }
-            PredicateExpr::Not(a) => Ok(self.predicate_bdd(a)?.not().unwrap()),
+            PredicateExpr::Or(a, b) => oom(self.predicate_bdd(a)?.or(&self.predicate_bdd(b)?)),
+            PredicateExpr::Not(a) => oom(self.predicate_bdd(a)?.not()),
             PredicateExpr::Select { .. } => Err(
                 "exact-symbolic ROBDD cannot bit-blast an array-content (Select) predicate — it is \
                  SMT-only (predicate-cube path); the exact engine abstains on it"
@@ -1017,10 +1041,10 @@ impl BddBitBlaster {
                     .unwrap()
             };
             // p_i ⟺ pred  and  p'_i ⟺ pred_next  (via XNOR).
-            let iff_present = self.xor(&present[i], &pred).not().unwrap();
-            let iff_next = self.xor(&next[i], &pred_next).not().unwrap();
-            a = a.and(&iff_present).unwrap();
-            a_prime = a_prime.and(&iff_next).unwrap();
+            let iff_present = oom(self.xor(&present[i], &pred)?.not())?;
+            let iff_next = oom(self.xor(&next[i], &pred_next)?.not())?;
+            a = oom(a.and(&iff_present))?;
+            a_prime = oom(a_prime.and(&iff_next))?;
         }
 
         // R_may = ∃(x ∪ i). A ∧ A'   (fused relational product).
@@ -1720,96 +1744,88 @@ impl BvTermBackend for BddBitBlaster {
             // ---- Bitwise (result + operands all `width` bits) ----
             Op::Not => {
                 let a = read(0)?;
-                (0..width as usize).map(|i| a[i].not().unwrap()).collect()
+                self.map_bits_checked(width, |i| oom(a[i].not()))?
             }
             Op::And => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| a[i].and(&b[i]).unwrap())
-                    .collect()
+                self.map_bits_checked(width, |i| oom(a[i].and(&b[i])))?
             }
             Op::Or => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| a[i].or(&b[i]).unwrap())
-                    .collect()
+                self.map_bits_checked(width, |i| oom(a[i].or(&b[i])))?
             }
             Op::Xor => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| self.xor(&a[i], &b[i]))
-                    .collect()
+                self.map_bits_checked(width, |i| self.xor(&a[i], &b[i]))?
             }
             Op::Nand => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| a[i].and(&b[i]).unwrap().not().unwrap())
-                    .collect()
+                self.map_bits_checked(width, |i| oom(oom(a[i].and(&b[i]))?.not()))?
             }
             Op::Nor => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| a[i].or(&b[i]).unwrap().not().unwrap())
-                    .collect()
+                self.map_bits_checked(width, |i| oom(oom(a[i].or(&b[i]))?.not()))?
             }
             Op::Xnor => {
                 let (a, b) = (read(0)?, read(1)?);
-                (0..width as usize)
-                    .map(|i| self.xor(&a[i], &b[i]).not().unwrap())
-                    .collect()
+                self.map_bits_checked(width, |i| oom(self.xor(&a[i], &b[i])?.not()))?
             }
 
             // ---- Arithmetic (two's-complement, wrap to `width`) ----
             Op::Add => {
                 let (a, b) = (read(0)?, read(1)?);
-                self.add_bits(&a, &b, self.ff.clone(), width).0
+                self.add_bits(&a, &b, self.ff.clone(), width)?.0
             }
             Op::Sub => {
                 // a − b = a + ¬b + 1
                 let (a, b) = (read(0)?, read(1)?);
-                let not_b: BitVec = (0..width as usize).map(|i| b[i].not().unwrap()).collect();
-                self.add_bits(&a, &not_b, self.tt.clone(), width).0
+                let not_b: BitVec = (0..width as usize)
+                    .map(|i| oom(b[i].not()))
+                    .collect::<Result<BitVec, String>>()?;
+                self.add_bits(&a, &not_b, self.tt.clone(), width)?.0
             }
             Op::Inc => {
                 let a = read(0)?;
-                self.add_bits(&a, &[], self.tt.clone(), width).0
+                self.add_bits(&a, &[], self.tt.clone(), width)?.0
             }
             Op::Dec => {
                 // a − 1 = a + (all ones) + 0
                 let a = read(0)?;
                 let ones: BitVec = (0..width as usize).map(|_| self.tt.clone()).collect();
-                self.add_bits(&a, &ones, self.ff.clone(), width).0
+                self.add_bits(&a, &ones, self.ff.clone(), width)?.0
             }
             Op::Neg => {
                 // −a = ¬a + 1
                 let a = read(0)?;
-                let not_a: BitVec = (0..width as usize).map(|i| a[i].not().unwrap()).collect();
-                self.add_bits(&not_a, &[], self.tt.clone(), width).0
+                let not_a: BitVec = (0..width as usize)
+                    .map(|i| oom(a[i].not()))
+                    .collect::<Result<BitVec, String>>()?;
+                self.add_bits(&not_a, &[], self.tt.clone(), width)?.0
             }
             Op::Mul => {
                 // Schoolbook shift-and-add: Σ_i (b[i] ? (a << i) : 0), truncated to `width`.
                 // O(width²) BDD adds — fine at the ≤ MAX_BITBLAST_BITS cone widths. Both
                 // operands + the result are `width` bits; the product wraps mod 2^width.
+                // Each partial + each `add_bits` is budget-checked, so a wide multiply
+                // ABSTAINS at the budget rather than exhausting the arena (mununu#462).
                 let (a, b) = (read(0)?, read(1)?);
                 let w = width as usize;
                 let mut acc: BitVec = vec![self.ff.clone(); w];
                 for i in 0..w {
                     let bi = b.get(i).cloned().unwrap_or_else(|| self.ff.clone());
                     // Partial product: (a << i) masked by b[i]. Bit j = (j ≥ i) ? a[j−i] ∧ b[i] : 0.
-                    let partial: BitVec = (0..w)
-                        .map(|j| {
-                            if j >= i {
-                                a.get(j - i)
-                                    .cloned()
-                                    .unwrap_or_else(|| self.ff.clone())
-                                    .and(&bi)
-                                    .unwrap()
-                            } else {
-                                self.ff.clone()
-                            }
-                        })
-                        .collect();
-                    acc = self.add_bits(&acc, &partial, self.ff.clone(), width).0;
+                    let partial: BitVec = self.map_bits_checked(width, |j| {
+                        if j >= i {
+                            oom(a
+                                .get(j - i)
+                                .cloned()
+                                .unwrap_or_else(|| self.ff.clone())
+                                .and(&bi))
+                        } else {
+                            Ok(self.ff.clone())
+                        }
+                    })?;
+                    acc = self.add_bits(&acc, &partial, self.ff.clone(), width)?.0;
                 }
                 acc
             }
@@ -1817,87 +1833,87 @@ impl BvTermBackend for BddBitBlaster {
             // ---- Variable shifts (barrel shifter, result + operands all `width` bits) ----
             Op::Sll => {
                 let (a, s) = (read(0)?, read(1)?);
-                self.barrel_shift(&a, &s, width, true, false)
+                self.barrel_shift(&a, &s, width, true, false)?
             }
             Op::Srl => {
                 let (a, s) = (read(0)?, read(1)?);
-                self.barrel_shift(&a, &s, width, false, false)
+                self.barrel_shift(&a, &s, width, false, false)?
             }
             Op::Sra => {
                 let (a, s) = (read(0)?, read(1)?);
-                self.barrel_shift(&a, &s, width, false, true)
+                self.barrel_shift(&a, &s, width, false, true)?
             }
 
             // ---- Equality / implication (1-bit result) ----
             Op::Eq | Op::Iff => {
                 let (a, b) = (read(0)?, read(1)?);
-                self.eq_bits(&a, &b)
+                self.eq_bits(&a, &b)?
             }
             Op::Neq => {
                 let (a, b) = (read(0)?, read(1)?);
-                vec![self.eq_bits(&a, &b)[0].not().unwrap()]
+                vec![oom(self.eq_bits(&a, &b)?[0].not())?]
             }
             Op::Implies => {
                 // ¬(|a) ∨ (|b)
                 let (a, b) = (read(0)?, read(1)?);
-                let a_bool = self.or_reduce(&a);
-                let b_bool = self.or_reduce(&b);
-                vec![a_bool.not().unwrap().or(&b_bool).unwrap()]
+                let a_bool = self.or_reduce(&a)?;
+                let b_bool = self.or_reduce(&b)?;
+                vec![oom(oom(a_bool.not())?.or(&b_bool))?]
             }
 
             // ---- Unsigned comparisons (1-bit result) ----
             Op::Ugte => {
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.uge(&a, &b, w)]
+                vec![self.uge(&a, &b, w)?]
             }
             Op::Ult => {
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.uge(&a, &b, w).not().unwrap()]
+                vec![oom(self.uge(&a, &b, w)?.not())?]
             }
             Op::Ugt => {
                 // a > b ⟺ b < a ⟺ ¬(b ≥ a)
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.uge(&b, &a, w).not().unwrap()]
+                vec![oom(self.uge(&b, &a, w)?.not())?]
             }
             Op::Ulte => {
                 // a ≤ b ⟺ b ≥ a
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.uge(&b, &a, w)]
+                vec![self.uge(&b, &a, w)?]
             }
 
             // ---- Signed comparisons (two's-complement, 1-bit result) ----
             Op::Slt => {
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.slt(&a, &b, w)]
+                vec![self.slt(&a, &b, w)?]
             }
             Op::Sgt => {
                 // a > b ⟺ b < a
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.slt(&b, &a, w)]
+                vec![self.slt(&b, &a, w)?]
             }
             Op::Sgte => {
                 // a ≥ b ⟺ ¬(a < b)
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.slt(&a, &b, w).not().unwrap()]
+                vec![oom(self.slt(&a, &b, w)?.not())?]
             }
             Op::Slte => {
                 // a ≤ b ⟺ ¬(b < a)
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
-                vec![self.slt(&b, &a, w).not().unwrap()]
+                vec![oom(self.slt(&b, &a, w)?.not())?]
             }
 
             // ---- Reductions (1-bit result) ----
-            Op::Redor => vec![self.or_reduce(&read(0)?)],
-            Op::Redand => vec![self.and_reduce(&read(0)?)],
-            Op::Redxor => vec![self.xor_reduce(&read(0)?)],
+            Op::Redor => vec![self.or_reduce(&read(0)?)?],
+            Op::Redand => vec![self.and_reduce(&read(0)?)?],
+            Op::Redxor => vec![self.xor_reduce(&read(0)?)?],
 
             // ---- Structural rearrangement ----
             Op::Concat => {
@@ -2186,7 +2202,7 @@ impl BddBitBlaster {
     /// seeing unreachable stuck states: the verdict is checked from the *actual*
     /// modelled reset state, not an over-broad free-init set. `Holds` iff that
     /// initial state satisfies the property.
-    pub fn initial_state_bdd(&self, file: &Btor2File) -> BDDFunction {
+    pub fn initial_state_bdd(&self, file: &Btor2File) -> Result<BDDFunction, String> {
         // State-line nid → the value operand of its `init` line (if any).
         let mut init_value_nid: HashMap<Nid, Nid> = HashMap::new();
         for line in &file.lines {
@@ -2237,11 +2253,12 @@ impl BddBitBlaster {
                 .unwrap_or_else(|| vec![self.ff.clone(); cell.vars.len()]);
             for (var, val) in cell.vars.iter().zip(value_bits.iter()) {
                 // state_bit ⟺ value_bit  =  ¬(state_bit XOR value_bit)
-                let iff = self.xor(var, val).not().unwrap();
-                init = init.and(&iff).unwrap();
+                let iff = oom(self.xor(var, val)?.not())?;
+                init = oom(init.and(&iff))?;
+                self.check_node_budget()?;
             }
         }
-        init
+        Ok(init)
     }
 }
 
@@ -2819,7 +2836,7 @@ pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
     let mut atoms: HashMap<&str, BDDFunction> = HashMap::new();
     atoms.insert("BAD", bad);
     let reach = model.evaluate(&formula, &atoms)?;
-    let init = bb.initial_state_bdd(&file);
+    let init = bb.initial_state_bdd(&file)?;
     let reachable = init.and(&reach).unwrap() != bb.ff;
 
     // A REACHABLE verdict is always sound: the modelled reset (uninitialised
@@ -3128,7 +3145,7 @@ pub fn kmts_two_player_verdict(
         controllable.iter().map(|s| s.to_string()).collect();
     let rel = bb.abstract_game(&exprs, must_semantics, &ctrl)?;
     let verdict = rel.evaluate(formula, &names)?;
-    let init = bb.initial_state_bdd(&file);
+    let init = bb.initial_state_bdd(&file)?;
     Ok(rel.verdict_at_init(&verdict, &init))
 }
 
@@ -3170,7 +3187,7 @@ pub fn kmts_two_player_verdict_cegar(
     let ctrl: std::collections::HashSet<String> =
         controllable.iter().map(|s| s.to_string()).collect();
     let exact = bb.exact_model_partitioned(&ctrl); // the concrete pre-image (WP) operator for refinement
-    let init = bb.initial_state_bdd(&file);
+    let init = bb.initial_state_bdd(&file)?;
 
     // The predicate set: the named formula atoms first (evaluate binds atom name → index by position),
     // then the anonymous CEGAR refinement predicates.
@@ -3415,7 +3432,7 @@ fn exact_symbolic_verdict_with_witness_inner(
         .collect();
 
     let sat = exact.evaluate(formula, &atoms)?;
-    let init = bb.initial_state_bdd(&file);
+    let init = bb.initial_state_bdd(&file)?;
     // Holds iff init ⊆ sat, i.e. no initial state violates φ.
     let violating = init.and(&sat.not().unwrap()).unwrap();
     if violating == *exact.ff() {
@@ -3507,7 +3524,7 @@ pub fn exact_env_strategy(btor2_content: &str, good: &str) -> Result<EnvStrategy
         Ok(b) => b,
         Err(e) => return Ok(EnvStrategyOutcome::Inapplicable(e)),
     };
-    let init = bb.initial_state_bdd(&file);
+    let init = bb.initial_state_bdd(&file)?;
 
     let r = exact.ef_region(&good_bdd);
     let s = exact.env_maintain_region(&r);
@@ -4302,7 +4319,7 @@ impl BddBitBlaster {
         let exact = self.exact_model();
         let stall = self.eg_not_p(&exact, p);
         // A stall state that is also initial ⇒ AF p is violated from reset.
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let bad = init.and(&stall).unwrap();
         if bad == self.ff {
             return None;
@@ -4345,7 +4362,7 @@ impl BddBitBlaster {
             layers.push(next);
         }
         let can_reach = layers.last().unwrap().clone();
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let bad = init.and(&can_reach).unwrap();
         if bad == self.ff {
             return None;
@@ -4418,7 +4435,7 @@ impl BddBitBlaster {
             }
             layers.push(next);
         }
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let bad = init.and(layers.last().unwrap()).unwrap();
         if bad == self.ff {
             return None; // the trap is unreachable ⇒ AG EF p holds
@@ -4485,7 +4502,7 @@ impl BddBitBlaster {
             }
             layers.push(next);
         }
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let reachable = init.and(layers.last().unwrap()).unwrap();
         if reachable == self.ff {
             return None; // good unreachable from init
@@ -4545,7 +4562,7 @@ impl BddBitBlaster {
             layers.push(next);
         }
         let winning = layers.last().unwrap().clone();
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         if init.and(&winning).unwrap() == self.ff {
             return None; // good unreachable from init — no strategy
         }
@@ -4693,7 +4710,7 @@ impl BddBitBlaster {
             }
             layers.push(next);
         }
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let bad = init.and(layers.last().unwrap()).unwrap();
         if bad == self.ff {
             return None; // the env cannot force the play into the stall from reset.
@@ -4805,7 +4822,11 @@ impl BddBitBlaster {
                 .find(|&k| mt.and(&layers[k]).unwrap() != self.ff)
                 .unwrap_or(0) as u32
         };
-        let init = self.initial_state_bdd(file);
+        // An OOM-abstained init (mununu#462) degrades to the empty state set → an
+        // empty ranking → the caller finds no strategy (a sound abstain, not a panic).
+        let init = self
+            .initial_state_bdd(file)
+            .unwrap_or_else(|_| self.ff.clone());
         let mut frontier: Vec<BTreeMap<String, u128>> = Vec::new();
         {
             let mut r = init.clone();
@@ -5017,7 +5038,7 @@ impl BddBitBlaster {
             }
             w = attr;
         }
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         if init.and(&w).unwrap() == self.ff {
             return None; // unrealizable Büchi → the env starvation lasso is the witness, not a strategy
         }
@@ -5089,7 +5110,7 @@ impl BddBitBlaster {
         {
             return None;
         }
-        let init = self.initial_state_bdd(file);
+        let init = self.initial_state_bdd(file).ok()?;
         let realizable = init.and(&winning).unwrap() != self.ff;
         // The winner's region: the controller lives inside the attractor; the environment lives outside it
         // (by determinacy of the reachability game, ¬attractor is the environment's winning region).

@@ -143,6 +143,30 @@ parameter of the design is a hard **error** (it lists the declared parameters),
 never a silent drop; the applied overrides are echoed as a `parameter-override`
 scope note — the verdicts are scoped to those values.
 
+`--param` is also the remedy for a **bit-blast size wall**: several wide counters
+(e.g. six 32-bit counters, each doubled by its `$past` shadow) can push a
+property's state cone past the BDD node budget, so the symbolic engine **abstains**
+on that one property with a `skip-bitblast-oom` note (naming the cone's bit width)
+rather than crashing the run — the other properties still report. Shrink a width
+parameter (`--param BW_WIDTH=4`) so the counters fit, or fall back to
+`--engine explicit`. This is a size threshold, not a malformed input.
+
+> Source of truth: [`bitblast_oom_skip_note`](../crates/mununu-core/src/planner/mod.rs) — surface: (CLI+API+UI)
+
+### Pinning a config input: `--config-value`
+
+> Source of truth: [`partition_config_pins`](../crates/mununu-core/src/adapter/slang/verify_auto.rs) — surface: (CLI+API+UI)
+
+`--config-value SIGNAL=VALUE` (API `config_values: [...]`) pins a primary input to
+a decimal constant and substitutes it into every formula atom, scoping the verdicts
+to that value (a `config-concretization` note lists the applied pins). A pin that
+mununu **cannot apply** is a hard **error**, never a silent drop that would verify a
+different question than the one asked: a non-decimal value (`rst_n=0x1` — decimal
+`u64` only) is rejected at parse; a `SIGNAL` that is not a primary input of the
+lifted model (misspelled, or a state/output/optimized-away name) is rejected against
+the model's real inputs. Every applied pin — including one that coincides with an
+auto-detected reset pin — is echoed in the `config-concretization` note.
+
 ---
 
 ## Driving it from an external agent (e.g. an agent writing RTL)

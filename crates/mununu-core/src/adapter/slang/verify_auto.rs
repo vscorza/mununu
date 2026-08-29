@@ -365,6 +365,42 @@ enum NotePosture {
     Cube,
 }
 
+/// mununu#459 — partition user `--config-value` pins into (applied, unusable).
+///
+/// A pin is **applied** if the config pass pinned it (`pinned_configs`) or reset-gating already
+/// pinned it to the SAME value (`reset_pinned`). It is **unusable** if its name is not a primary
+/// input of the lifted model (misspelled, or a state/output/optimized-away signal), or — a real
+/// input — it was already tied to a DIFFERENT constant (a conflict with reset-gating). An unusable
+/// pin is a caller mistake the caller must see: it is surfaced as a hard error, never silently
+/// dropped to verify a different question than the one asked. Pure (no lift) so it is unit-testable.
+fn partition_config_pins(
+    config_pins: &[(String, u64)],
+    model_input_names: &std::collections::HashSet<String>,
+    pinned_configs: &std::collections::HashSet<String>,
+    reset_pinned: &std::collections::HashSet<String>,
+) -> (Vec<(String, u64)>, Vec<String>) {
+    let mut applied: Vec<(String, u64)> = Vec::new();
+    let mut unusable: Vec<String> = Vec::new();
+    for (name, value) in config_pins {
+        let tag = format!("{name}={value}");
+        if pinned_configs.contains(&tag) || reset_pinned.contains(&tag) {
+            applied.push((name.clone(), *value));
+        } else if !model_input_names.contains(name) {
+            unusable.push(format!(
+                "`{tag}` — `{name}` is not a primary input of the lifted model"
+            ));
+        } else {
+            // A real input, but the config pass could not pin it to `value` — it is already tied
+            // to a different constant (typically by reset-gating).
+            unusable.push(format!(
+                "`{tag}` — `{name}` is a primary input but is already pinned to a different \
+                 constant (e.g. reset-gating); reconcile the two"
+            ));
+        }
+    }
+    (applied, unusable)
+}
+
 fn build_notes(
     report: &AutoVerifyReport,
     must_edge_inference: MustEdgeInference,
@@ -1975,9 +2011,34 @@ pub(crate) fn prepare_model(
         .collect();
     let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
 
+    // mununu#459 — snapshot the model's real primary-input names BEFORE any pinning
+    // rewrites them to constants, so a user `--config-value` can be validated
+    // against them below. A `<nid> input <sid> <symbol>` line names a pinnable
+    // input; a bare `<nid> input <sid>` (no symbol) or a comment cannot be pinned.
+    let model_input_names: std::collections::HashSet<String> = btor2
+        .lines()
+        .filter_map(|l| {
+            let mut t = l.split_whitespace();
+            let _nid = t.next()?;
+            if t.next()? != "input" {
+                return None;
+            }
+            let _sid = t.next()?;
+            match t.next()? {
+                ";" => None,
+                sym => Some(sym.to_string()),
+            }
+        })
+        .collect();
+
     // Pin recognized reset inputs inactive (the model-level half of reset-gating).
     let (btor2, pinned_resets) =
         crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &reset_pins);
+    // A reset pin that coincides (`name=value`) with a user config pin counts as
+    // that config pin being in effect (mununu#459 completeness); capture the set
+    // before `pinned_resets` moves into the diagnostics.
+    let reset_pinned_set: std::collections::HashSet<String> =
+        pinned_resets.iter().cloned().collect();
     report.diagnostics.gated_resets = pinned_resets;
 
     // H.J.b — pin user-supplied config inputs to constants (same mechanism as reset-gating).
@@ -1992,13 +2053,44 @@ pub(crate) fn prepare_model(
     };
     let (btor2, pinned_configs) =
         crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &config_pins);
-    let applied_config_values: Vec<(String, u64)> = pinned_configs
-        .iter()
-        .filter_map(|s| {
-            let (n, val) = s.split_once('=')?;
-            Some((n.to_string(), val.trim().parse::<u64>().ok()?))
-        })
-        .collect();
+    // mununu#459 — a user config pin must name a real primary input AND take effect.
+    // Partition the requested pins into applied (by the config pass, or already
+    // pinned to the SAME value by reset-gating) vs unusable, and error on any
+    // unusable pin rather than silently verifying a different question than asked.
+    let applied_config_set: std::collections::HashSet<String> =
+        pinned_configs.iter().cloned().collect();
+    let (applied_config_values, unusable) = partition_config_pins(
+        &config_pins,
+        &model_input_names,
+        &applied_config_set,
+        &reset_pinned_set,
+    );
+    if !unusable.is_empty() {
+        let mut inputs: Vec<&str> = model_input_names.iter().map(String::as_str).collect();
+        inputs.sort_unstable();
+        let hint = if inputs.is_empty() {
+            "the lifted model has no primary inputs".to_string()
+        } else if inputs.len() > 24 {
+            format!(
+                "{} primary inputs, e.g. {}, …",
+                inputs.len(),
+                inputs[..24].join(", ")
+            )
+        } else {
+            format!("primary inputs: {}", inputs.join(", "))
+        };
+        return Err(AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: format!(
+                "--config-value: {} pin(s) could not be applied — a config pin must name a \
+                 real primary input and take effect, it is never silently dropped (mununu#459). \
+                 {}. ({hint})",
+                unusable.len(),
+                unusable.join("; "),
+            ),
+        });
+    }
 
     Ok(Prepared::Model(Box::new(PreparedModel {
         btor2,
@@ -2965,6 +3057,53 @@ fn liveness_rescue_note(name: &str, verdict: &str, engines: &[&str]) -> Verifica
 
 #[cfg(test)]
 mod tests {
+    /// mununu#459 — `partition_config_pins` classifies user pins into applied vs unusable. A pin
+    /// is applied when the config pass pins it OR reset-gating already pinned it to the same value;
+    /// it is unusable when its name is not a model input (misspelled / non-input) or, being a real
+    /// input, it conflicts with an existing constant. The unusable set becomes a hard error
+    /// upstream — never a silent drop that verifies a different question than the one asked.
+    #[test]
+    fn config_pins_partition_applied_vs_unusable() {
+        use std::collections::HashSet;
+        let inputs: HashSet<String> = ["rst_n", "mode", "clk"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let config_pins = vec![
+            ("mode".to_string(), 3u64),  // applied by the config pass
+            ("rst_n".to_string(), 1u64), // already pinned by reset-gating (same value) → applied
+            ("bogus".to_string(), 0u64), // not a model input → unusable (misspelled / non-input)
+            ("clk".to_string(), 0u64), // real input, but reset pinned it to a DIFFERENT value → conflict
+        ];
+        let pinned_configs: HashSet<String> = ["mode=3"].iter().map(|s| s.to_string()).collect();
+        let reset_pinned: HashSet<String> =
+            ["rst_n=1", "clk=1"].iter().map(|s| s.to_string()).collect();
+        let (applied, unusable) =
+            super::partition_config_pins(&config_pins, &inputs, &pinned_configs, &reset_pinned);
+        assert_eq!(
+            applied,
+            vec![("mode".to_string(), 3), ("rst_n".to_string(), 1)],
+            "mode (config pass) + rst_n (reset pin to the same value) are applied"
+        );
+        assert_eq!(
+            unusable.len(),
+            2,
+            "bogus (non-input) + clk (value conflict) are unusable: {unusable:?}"
+        );
+        assert!(
+            unusable
+                .iter()
+                .any(|u| u.contains("bogus") && u.contains("not a primary input")),
+            "an unknown/misspelled name reports 'not a primary input': {unusable:?}"
+        );
+        assert!(
+            unusable
+                .iter()
+                .any(|u| u.contains("clk") && u.contains("already pinned")),
+            "a real input pinned to a different constant reports a conflict: {unusable:?}"
+        );
+    }
+
     /// A.4 — a `Violated` bare `EF p` (reachability) yields the unreachable-target
     /// witness: no path (`prefix`/`cycle` empty), the target atoms naming what the
     /// design never reaches. A recoverability (`AG EF`) shape is not a bare `EF` and
