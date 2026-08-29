@@ -1491,6 +1491,28 @@ fn sv_verify_auto_handler_impl(
     for f in &request.additional_sources {
         sources.push((f.name.clone(), f.content.clone()));
     }
+    // `"NAME=VALUE"` / `"MODULE.NAME=VALUE"` module-parameter overrides. Unlike
+    // `config_values` (which silently skips malformed entries), a malformed
+    // `params` entry is a 400 (and yosys errors on one it cannot apply) — never a
+    // silent drop.
+    let params: Vec<(String, String)> = request
+        .params
+        .iter()
+        .map(|e| {
+            let (lhs, val) = e.split_once('=').ok_or_else(|| ApiError::BadRequest {
+                message: format!("malformed params entry '{e}'"),
+                details: Some("expected NAME=VALUE or MODULE.NAME=VALUE".into()),
+            })?;
+            let (lhs, val) = (lhs.trim(), val.trim());
+            if lhs.is_empty() || val.is_empty() {
+                return Err(ApiError::BadRequest {
+                    message: format!("malformed params entry '{e}'"),
+                    details: Some("NAME and VALUE must both be non-empty".into()),
+                });
+            }
+            Ok((lhs.to_string(), val.to_string()))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let yopts = YosysOptions {
         top: request.top.clone(),
         additional_sources: request
@@ -1505,6 +1527,7 @@ fn sv_verify_auto_handler_impl(
         } else {
             crate::adapter::yosys::SvFrontend::Auto
         },
+        params,
         ..Default::default()
     };
     let must_edge_inference = match request.must_edge_inference.as_deref() {

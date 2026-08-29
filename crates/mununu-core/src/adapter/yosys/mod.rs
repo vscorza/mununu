@@ -106,6 +106,26 @@ pub struct YosysOptions {
     /// concept — the flat name-staging of `additional_sources` already
     /// resolves cross-file includes on those surfaces).
     pub extra_include_dirs: Vec<PathBuf>,
+    /// Module-parameter overrides applied BEFORE elaboration sizes the design —
+    /// yosys `chparam -set <name> <value> <module>` (before `hierarchy`) on the
+    /// read_verilog frontend, or slang `-G <name>=<value>` (at read time, since
+    /// slang elaborates then) on the slang frontend. Each entry is `(lhs, value)`
+    /// where `lhs` is a bare parameter name
+    /// `NAME` (applied to the top module) or a scoped `MODULE.NAME` (applied to
+    /// that module). This lets a caller shrink a parameterised timing interval so
+    /// the design's counters get smaller — a 20000-cycle power-up wait sizing a
+    /// 15-bit counter becomes a 10-bit counter at `INIT_WAIT=4` — without a wrapper
+    /// module (which would rename the SVA atoms and break binding).
+    ///
+    /// SOUNDNESS / scope: the verdict is scoped to the overridden parameters
+    /// (echoed in the transcript + JSON report). A parameter yosys cannot apply
+    /// (not a parameter of the target module) is an ERROR surfaced from the lift —
+    /// never a silent drop (contrast `--config-value`, mununu#459).
+    ///
+    /// **Default**: empty. Populated from the CLI `--param NAME=VALUE` flag / the
+    /// API `params` field. No `read_slang` analog is needed — `chparam` operates
+    /// on the elaborated netlist regardless of front-end.
+    pub params: Vec<(String, String)>,
     /// Skip the Verific-taint check (for testing).
     pub skip_verific_check: bool,
     /// Optional original path of the primary SV source. Used only to
@@ -519,6 +539,7 @@ fn run_sv_flatten_btor2_concrete(
         &yopts.cutpoint_signals,
         slang_plugin.is_some(),
         &yopts.extra_include_dirs,
+        &yopts.params,
     );
 
     let mut yosys_cmd = Command::new(&yosys);
@@ -965,7 +986,12 @@ fn translate_sv_per_module_impl(
     // Pass 1 — discovery. Use `hierarchy -auto-top` when the caller did
     // not provide one (matches the legacy build_script).
     let hier_json_path = tmp.path().join("hier.json");
-    let discovery_script = build_discovery_script(&sources, yopts.top.as_deref(), &hier_json_path);
+    let discovery_script = build_discovery_script(
+        &sources,
+        yopts.top.as_deref(),
+        &hier_json_path,
+        &yopts.params,
+    );
     run_yosys(&yosys, &discovery_script, PER_MODULE_YOSYS_TIMEOUT)?;
 
     let hier_body = std::fs::read_to_string(&hier_json_path).map_err(|e| AdapterError {
@@ -1024,6 +1050,7 @@ fn translate_sv_per_module_impl(
             yopts.setundef_anyseq,
             yopts.setundef_anyconst,
             &yopts.init_policy_overrides,
+            &yopts.params,
         );
         run_yosys(&yosys, &script, PER_MODULE_YOSYS_TIMEOUT)?;
 
@@ -1075,18 +1102,63 @@ fn translate_sv_per_module_impl(
     Ok((outputs, hier_body))
 }
 
+/// Build the `chparam -set <name> <value> <module>` passes for the requested
+/// parameter overrides, to run immediately BEFORE `hierarchy` (so overrides size
+/// the design before elaboration). Each `(lhs, value)` is a bare `NAME` (→ the
+/// `top` module) or a scoped `MODULE.NAME` (→ that module). Integer values pass
+/// through; anything else is emitted as a quoted string literal. Returns the
+/// passes joined with `; ` plus a trailing `; ` (so it prefixes the hierarchy
+/// pass), or "" when there are no params.
+///
+/// A bare `NAME` with no `top` (auto-top) emits `chparam -set NAME VALUE` with no
+/// module selection — yosys applies it to whichever module carries the parameter,
+/// and ERRORS ("Can't find object for defparam") if none does. That error
+/// propagates out of the lift (never a silent drop). Naming a `MODULE.NAME` or
+/// passing `--top` makes the target explicit.
+fn build_chparam_passes(params: &[(String, String)], top: Option<&str>) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let passes: Vec<String> = params
+        .iter()
+        .map(|(lhs, value)| {
+            let (module, name) = match lhs.split_once('.') {
+                Some((m, n)) => (Some(m), n),
+                None => (top, lhs.as_str()),
+            };
+            // Integer values pass through; anything else is a quoted string literal.
+            let val = if value.parse::<i64>().is_ok() {
+                value.clone()
+            } else {
+                format!("\"{}\"", value.replace('"', "\\\""))
+            };
+            match module {
+                Some(m) => format!("chparam -set {name} {val} {m}"),
+                None => format!("chparam -set {name} {val}"),
+            }
+        })
+        .collect();
+    format!("{}; ", passes.join("; "))
+}
+
 /// Yosys discovery-pass script: read sources, set up hierarchy,
 /// elaborate processes, dump hierarchy snapshot. Stops before
 /// `flatten` / `async2sync` because the per-module emission pass
 /// repeats those steps with a different top.
-fn build_discovery_script(sources: &[PathBuf], top: Option<&str>, hier_json_out: &Path) -> String {
+fn build_discovery_script(
+    sources: &[PathBuf],
+    top: Option<&str>,
+    hier_json_out: &Path,
+    params: &[(String, String)],
+) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
         .map(|p| format!("read_verilog -formal -sv {}", p.display()))
         .collect();
+    let chparam = build_chparam_passes(params, top);
     let hier = match top {
-        Some(t) => format!("hierarchy -check -top {t}"),
-        None => "hierarchy -check -auto-top".to_string(),
+        Some(t) => format!("{chparam}hierarchy -check -top {t}"),
+        None => format!("{chparam}hierarchy -check -auto-top"),
     };
     format!(
         "{}; {hier}; proc; write_json {}",
@@ -1114,6 +1186,7 @@ fn build_per_module_script(
     setundef_anyseq: bool,
     setundef_anyconst: bool,
     init_policy_overrides: &InitPolicyOverrides,
+    params: &[(String, String)],
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
@@ -1121,6 +1194,9 @@ fn build_per_module_script(
         .collect();
     let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
     let per_signal = emit_init_policy_setattrs(init_policy_overrides);
+    // Parameter overrides apply to this submodule's own top (`module`) before its
+    // `hierarchy` sizes it.
+    let chparam = build_chparam_passes(params, Some(module));
     format!(
         // `memory_collect` normalizes memory read/write accesses into `$mem` cells
         // (fixing an internal yosys assert on some fifo styles when a raw `$mem`
@@ -1129,7 +1205,7 @@ fn build_per_module_script(
         // explosion). Unlike `memory`/`memory -nomap`, it runs NO internal `opt_clean`,
         // so it does not drop dead registers (which would change memory-free lifts).
         // No-op when the design has no memories.
-        "{}; hierarchy -check -top {module}; {per_signal}proc; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; {chparam}hierarchy -check -top {module}; {per_signal}proc; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         btor_out.display()
     )
@@ -1977,6 +2053,7 @@ fn build_script(
     cutpoint_signals: &[String],
     use_slang: bool,
     extra_include_dirs: &[PathBuf],
+    params: &[(String, String)],
 ) -> String {
     // Caller-supplied include-search dirs, as attached `-I<dir>` flags (the
     // form yosys `read_verilog`/`read_slang` and sv2v all accept). Lets
@@ -2013,8 +2090,21 @@ fn build_script(
             .and_then(|p| p.parent())
             .map(|d| format!(" -I{}", d.display()))
             .unwrap_or_default();
+        // Parameter overrides — slang (read_slang) fully ELABORATES at read time, so
+        // a post-read `chparam` finds nothing ("not parametric"). The Verilog-style
+        // `-G NAME=VALUE` override at read time is the right mechanism here; it is
+        // top-scoped, so a `MODULE.NAME` override applies by its bare name. (An
+        // unknown name is validated upstream against the slang AST — read_slang
+        // itself would silently ignore it.)
+        let param_g: String = params
+            .iter()
+            .map(|(lhs, val)| {
+                let name = lhs.rsplit('.').next().unwrap_or(lhs);
+                format!(" -G {name}={val}")
+            })
+            .collect();
         vec![format!(
-            "read_slang --ignore-assertions --ignore-timing{top_arg}{inc}{extra_inc} {files}"
+            "read_slang --ignore-assertions --ignore-timing{top_arg}{param_g}{inc}{extra_inc} {files}"
         )]
     } else {
         sources
@@ -2022,9 +2112,17 @@ fn build_script(
             .map(|p| format!("read_verilog -formal -sv{extra_inc} {}", p.display()))
             .collect()
     };
+    // chparam is the read_verilog path's parameter-override mechanism (params stay
+    // unresolved until `hierarchy`, so a pre-`hierarchy` chparam applies and errors
+    // on an unknown name). The slang path uses `-G` at read time instead (above).
+    let chparam = if use_slang {
+        String::new()
+    } else {
+        build_chparam_passes(params, top)
+    };
     let hier = match top {
-        Some(t) => format!("hierarchy -top {t}"),
-        None => "hierarchy -auto-top".to_string(),
+        Some(t) => format!("{chparam}hierarchy -top {t}"),
+        None => format!("{chparam}hierarchy -auto-top"),
     };
     // `cutpoint -blackbox` between the hierarchy snapshot and `flatten`
     // replaces every output of every `(* blackbox *)` cell with an
@@ -2637,24 +2735,24 @@ endmodule
         let no_overrides: InitPolicyOverrides = Vec::new();
 
         let zero_script =
-            build_per_module_script(&sources, "top", &btor, false, false, &no_overrides);
+            build_per_module_script(&sources, "top", &btor, false, false, &no_overrides, &[]);
         assert!(zero_script.contains("setundef -zero"));
         assert!(!zero_script.contains("setundef -anyconst"));
         assert!(!zero_script.contains("setundef -anyseq"));
 
         let anyconst_script =
-            build_per_module_script(&sources, "top", &btor, false, true, &no_overrides);
+            build_per_module_script(&sources, "top", &btor, false, true, &no_overrides, &[]);
         assert!(anyconst_script.contains("setundef -anyconst"));
         assert!(!anyconst_script.contains("setundef -zero"));
 
         let anyseq_script =
-            build_per_module_script(&sources, "top", &btor, true, false, &no_overrides);
+            build_per_module_script(&sources, "top", &btor, true, false, &no_overrides, &[]);
         assert!(anyseq_script.contains("setundef -anyseq"));
         assert!(!anyseq_script.contains("setundef -anyconst"));
 
         // Precedence: both flags set → anyseq wins
         let both_script =
-            build_per_module_script(&sources, "top", &btor, true, true, &no_overrides);
+            build_per_module_script(&sources, "top", &btor, true, true, &no_overrides, &[]);
         assert!(both_script.contains("setundef -anyseq"));
         assert!(!both_script.contains("setundef -anyconst"));
     }
@@ -2699,7 +2797,7 @@ endmodule
             vec![("boot_fsm_ns".to_string(), InitPolicy::Anyconst)];
         // Global policy stays default (-zero); per-signal anyconst
         // applies only to boot_fsm_ns.
-        let script = build_per_module_script(&sources, "top", &btor, false, false, &overrides);
+        let script = build_per_module_script(&sources, "top", &btor, false, false, &overrides, &[]);
         assert!(
             script.contains("setattr -set anyconst 1 w:boot_fsm_ns"),
             "per-signal setattr missing from script: {script}"
@@ -2775,6 +2873,7 @@ endmodule
             &cuts,
             false,
             &[],
+            &[],
         );
         assert!(
             script.contains("cutpoint w:must_refresh w:precharge_done"),
@@ -2811,6 +2910,7 @@ endmodule
             &[],
             false,
             &[],
+            &[],
         );
         // The blackbox cut is always present; there must be no explicit `cutpoint w:` pass.
         assert!(script.contains("cutpoint -blackbox"));
@@ -2839,6 +2939,7 @@ endmodule
             &overrides,
             &[],
             true, // use_slang
+            &[],
             &[],
         );
         assert!(
@@ -2896,11 +2997,109 @@ endmodule
             &[],
             false,
             &inc,
+            &[],
         );
         assert!(
             script.contains("read_verilog -formal -sv -I/design/include -I/design/rtl /tmp/top.v"),
             "include dirs not forwarded to read_verilog: {script}"
         );
+    }
+
+    #[test]
+    fn chparam_passes_scope_and_quote_correctly() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/dut.sv")];
+        let btor = PathBuf::from("/tmp/o.btor");
+        let hier = PathBuf::from("/tmp/h.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        // bare NAME → the top module; MODULE.NAME → that module; a non-integer
+        // value is quoted; integers pass through.
+        let params = vec![
+            ("INIT_WAIT".to_string(), "4".to_string()),
+            ("u_sub.DEPTH".to_string(), "8".to_string()),
+            ("MODE".to_string(), "fast".to_string()),
+        ];
+        let script = build_script(
+            &sources,
+            Some("dut"),
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            false,
+            &[],
+            &params,
+        );
+        assert!(
+            script.contains("chparam -set INIT_WAIT 4 dut"),
+            "bare NAME → top module: {script}"
+        );
+        assert!(
+            script.contains("chparam -set DEPTH 8 u_sub"),
+            "MODULE.NAME → that module: {script}"
+        );
+        assert!(
+            script.contains("chparam -set MODE \"fast\" dut"),
+            "non-integer value must be quoted: {script}"
+        );
+        // chparam runs BEFORE hierarchy (so it sizes the design before elaboration).
+        let cp = script.find("chparam").expect("chparam present");
+        let hi = script.find("hierarchy").expect("hierarchy present");
+        assert!(cp < hi, "chparam must precede hierarchy: {script}");
+    }
+
+    #[test]
+    fn slang_frontend_uses_param_g_not_chparam() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/dut.sv")];
+        let btor = PathBuf::from("/tmp/o.btor");
+        let hier = PathBuf::from("/tmp/h.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let params = vec![
+            ("INIT_WAIT".to_string(), "4".to_string()),
+            ("u_sub.DEPTH".to_string(), "8".to_string()),
+        ];
+        let script = build_script(
+            &sources,
+            Some("dut"),
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            true, // use_slang
+            &[],
+            &params,
+        );
+        // slang elaborates at read time, so it takes `-G NAME=VALUE` overrides —
+        // chparam (which the read_verilog path uses) would be too late.
+        assert!(script.contains("read_slang"), "{script}");
+        assert!(
+            script.contains("-G INIT_WAIT=4"),
+            "bare NAME → -G: {script}"
+        );
+        assert!(
+            script.contains("-G DEPTH=8"),
+            "MODULE.NAME → -G on the bare name: {script}"
+        );
+        assert!(
+            !script.contains("chparam"),
+            "slang path must NOT emit chparam: {script}"
+        );
+    }
+
+    #[test]
+    fn chparam_bare_name_without_top_has_no_module_selection() {
+        // Auto-top: a bare NAME gets no module selection — yosys applies it where
+        // the parameter exists (and errors if nowhere).
+        assert_eq!(
+            build_chparam_passes(&[("K".to_string(), "2".to_string())], None),
+            "chparam -set K 2; "
+        );
+        assert_eq!(build_chparam_passes(&[], Some("top")), "");
     }
 
     #[test]
@@ -2920,6 +3119,7 @@ endmodule
             &overrides,
             &[],
             false,
+            &[],
             &[],
         );
         // Empty extra include dirs → no `-I` on the read command (historical form).
@@ -2954,6 +3154,7 @@ endmodule
             &[],
             true,
             &inc,
+            &[],
         );
         assert!(
             script.contains(

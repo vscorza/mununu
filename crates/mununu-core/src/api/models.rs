@@ -1446,6 +1446,15 @@ pub struct SvVerifyAutoRequest {
     /// plugin. Default `false`.
     #[serde(default)]
     pub use_slang: bool,
+    /// Module-parameter overrides applied via yosys `chparam -set` before the lift
+    /// (mirrors the CLI `--param`). Each entry is `"NAME=VALUE"` (applied to the
+    /// top module) or `"MODULE.NAME=VALUE"` (scoped to `MODULE`). Shrinks a
+    /// parameterised timing interval so its counters get smaller — without a
+    /// wrapper module (which would rename the SVA atoms). A parameter yosys cannot
+    /// apply is an ERROR (never silently dropped); the verdicts are scoped to the
+    /// applied values (surfaced as a `parameter-override` note). Default empty.
+    #[serde(default)]
+    pub params: Vec<String>,
     /// Max CEGAR iterations per property (default 16).
     #[serde(default)]
     pub max_iterations: Option<usize>,

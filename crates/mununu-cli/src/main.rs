@@ -1695,6 +1695,21 @@ struct SvVerifyAutoArgs {
     /// yosys-slang plugin (present in the mununu-sva image).
     #[arg(long = "frontend", value_enum, default_value_t = SvFrontendArg::Auto)]
     frontend: SvFrontendArg,
+    /// Override a module parameter before the SV → BTOR2 lift — so it sizes the
+    /// design before elaboration (yosys `chparam -set` on the read_verilog
+    /// frontend; slang `-G` on the slang frontend, which elaborates at read time).
+    /// Format `NAME=VALUE` (applied to the top module) or `MODULE.NAME=VALUE`
+    /// (scoped to `MODULE`; slang applies it top-level by bare name). Repeatable.
+    /// Shrinks a
+    /// parameterised timing interval so its counters get smaller —
+    /// `--param INIT_WAIT=4` turns a 20000-cycle wait's 15-bit counter into a
+    /// ~3-bit one — without a wrapper module (which would rename the SVA atoms).
+    /// VALUE is a decimal integer, or any other token (emitted as a quoted string
+    /// literal). A parameter yosys cannot apply is an ERROR (never silently
+    /// dropped); the applied parameters are echoed in the report as a scope note —
+    /// the verdicts are scoped to them.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    params: Vec<String>,
     /// Max CEGAR iterations per property.
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
@@ -3469,6 +3484,27 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         additional.push((name.to_string(), body));
     }
 
+    // `--param NAME=VALUE` / `MODULE.NAME=VALUE` — parse into (lhs, value).
+    // Unlike `--config-value` (which silently skips malformed / unusable pins,
+    // mununu#459), a malformed `--param` is a HARD error here, and yosys errors
+    // downstream on one it cannot apply — never a silent drop.
+    let params: Vec<(String, String)> = args
+        .params
+        .iter()
+        .map(|e| {
+            let (lhs, val) = e.split_once('=').ok_or_else(|| {
+                format!("malformed --param '{e}': expected NAME=VALUE or MODULE.NAME=VALUE")
+            })?;
+            let (lhs, val) = (lhs.trim(), val.trim());
+            if lhs.is_empty() || val.is_empty() {
+                return Err(format!(
+                    "malformed --param '{e}': NAME and VALUE must both be non-empty"
+                ));
+            }
+            Ok((lhs.to_string(), val.to_string()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     let yopts = mununu_core::adapter::yosys::YosysOptions {
         top: args.top.clone(),
         additional_sources: additional,
@@ -3477,6 +3513,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         cutpoint_signals: args.cutpoint.clone(),
         extra_include_dirs: args.include_dirs.clone(),
         frontend: args.frontend.into(),
+        params: params.clone(),
         ..Default::default()
     };
     let must_edge_inference = match args.must_edge_inference {
