@@ -3388,6 +3388,30 @@ fn exact_symbolic_verdict_with_witness_inner(
         ));
     }
 
+    // monono#partsel — the same soundness posture for an atom that binds to a SPLIT
+    // register (without being a bare input itself). The yosys-slang lift of a
+    // partial register assignment (`q[hi:lo] <= d`, or `q[idx] <= d` on a packed
+    // 2-D reg) splits `q` and aliases its name to a `concat` over anonymous cells:
+    // free inputs for the unwritten bits (havoc), and/or anonymous split
+    // sub-registers the symbol-keyed cone-of-influence freezes at 0. `q == 0` then
+    // reads those, and the fixpoint mis-decides (a spurious `Holds` on a register
+    // that is reachably non-zero). Refuse rather than emit an unsound verdict — the
+    // verify-auto driver skips such a property up front, and this guards the exact
+    // engine's other callers (the differential oracle, `btor2 verify`). A faithful
+    // state cell of that name (read_verilog / sv2v lift) is never flagged.
+    if let Some(bad) = seed_regs
+        .iter()
+        .find(|r| crate::adapter::btor2::parser::signal_reaches_anonymous_leaf(&file, r))
+    {
+        return Err(format!(
+            "exact MC: atom `{bad}` binds to a register the RTL front-end SPLIT while lifting \
+             a partial assignment (`{bad}[…] <= …`) — its bits become anonymous cells \
+             (undriven free inputs and/or split sub-registers the model cannot faithfully \
+             track). A state predicate over it would be unsound, so it is refused. Re-lift \
+             with the read_verilog / sv2v front-end, which models `{bad}` faithfully."
+        ));
+    }
+
     // P2.5-F — validate the two-player partition. Every declared controllable input must be a real
     // primary input of the design. A name matching nothing would otherwise fall back SILENTLY to the
     // environment (a sound but pessimistic all-environment reading, and not the partition the caller
@@ -6814,6 +6838,173 @@ mod tests {
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_UEXT_ALIAS, &agaf).expect("verdict"),
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_STATE, &agaf).expect("verdict"),
             "AG AF must also decide identically for named vs uext-aliased state"
+        );
+    }
+
+    /// monono#partsel — the yosys-slang lift of a PARTIAL register assignment
+    /// (`a_q[11:8] <= val`) as it actually reaches the engine. slang models only
+    /// the *written* slice as a `state` cell (nid 19, 4-bit), turns the register's
+    /// *unwritten* bits into ANONYMOUS free `input`s (nid 17, 8-bit; nid 21, 4-bit),
+    /// and aliases the register name `a_q` (`uext … 0 a_q`) to the 16-bit `concat`
+    /// that mixes them. A predicate over `a_q` therefore reads free inputs and the
+    /// exact fixpoint used to answer a spurious `Holds` for `AG (a_q == 0)` (and
+    /// `!o_partsel`) even though `a_q` is reachably non-zero — the exact soundness
+    /// bug monono's planted-bug canary caught. `b_q`, written in full, lifts to one
+    /// faithful state cell and decides correctly.
+    ///
+    /// This is the post-reset-init + reset-pinned BTOR2 (the shape verify-auto hands
+    /// the exact engine), captured verbatim from the `mununu-sva` slang lift so the
+    /// regression runs in `make ci` without slang. Expected: `a_q` REFUSED (Err) —
+    /// no silent verdict — while `b_q` decides `Violated`.
+    const SLANG_PARTSEL_PARTIAL_WRITE: &str = r#"1 sort bitvec 1
+2 input 1 clk
+3 one 1 rst_n
+4 sort bitvec 4
+5 input 4 val
+6 sort bitvec 16
+7 const 6 0000000000000000
+8 state 6
+9 ite 6 3 8 7
+10 redor 1 9
+11 output 10 o_concat
+12 state 6
+13 ite 6 3 12 7
+14 redor 1 13
+15 output 14 o_lowconcat
+16 sort bitvec 8
+17 input 16
+18 const 4 0000
+19 state 4
+20 ite 4 3 19 18
+21 input 4
+22 sort bitvec 12
+23 concat 22 20 17
+24 concat 6 21 23
+25 redor 1 24
+26 output 25 o_partsel
+27 state 6
+28 ite 6 3 27 7
+29 redor 1 28
+30 output 29 o_plain
+31 uext 6 24 0 a_q
+32 uext 6 9 0 b_q
+33 uext 6 13 0 c_q
+34 uext 6 28 0 d_q
+35 slice 16 9 7 0
+36 concat 22 5 35
+37 slice 4 9 15 12
+38 concat 6 37 36
+39 ite 6 3 38 7
+40 next 6 8 39
+41 const 22 000000000000
+42 concat 6 41 5
+43 ite 6 3 42 7
+44 next 6 12 43
+45 ite 4 3 5 18
+46 next 4 19 45
+47 ite 6 3 42 7
+48 next 6 27 47
+49 constd 6 0
+50 init 6 8 49
+51 constd 6 0
+52 init 6 12 51
+53 constd 4 0
+54 init 4 19 53
+55 constd 6 0
+56 init 6 27 55
+"#;
+
+    #[test]
+    fn exact_refuses_partsel_register_over_undriven_inputs() {
+        let file = parser::parse(SLANG_PARTSEL_PARTIAL_WRITE).expect("parse");
+
+        // The soundness guard's discriminator: `a_q`'s bound signal reaches an
+        // anonymous (undriven-register-bit) input; `b_q` (a faithful state cell)
+        // does not. The combinational output `o_partsel` (a function of `a_q`) is
+        // caught too; `o_concat` (a function of the faithful `b_q`) is not.
+        assert!(
+            parser::signal_reaches_anonymous_leaf(&file, "a_q"),
+            "a_q binds to a concat mixing undriven free inputs"
+        );
+        assert!(
+            !parser::signal_reaches_anonymous_leaf(&file, "b_q"),
+            "b_q is a faithful state cell — never flagged"
+        );
+        assert!(parser::signal_reaches_anonymous_leaf(&file, "o_partsel"));
+        assert!(!parser::signal_reaches_anonymous_leaf(&file, "o_concat"));
+
+        // The exact engine REFUSES `a_q` (Err) rather than emit the pre-fix spurious
+        // `Holds`; it still decides the faithful `b_q` as `Violated` (b_q takes `val`
+        // into its middle bits, so it is reachably non-zero).
+        let ag_a = crate::mu_calculus::parser::parse("nu X. ((a_q == 0) and [] X)").unwrap();
+        let ag_b = crate::mu_calculus::parser::parse("nu X. ((b_q == 0) and [] X)").unwrap();
+        assert!(
+            exact_symbolic_verdict(SLANG_PARTSEL_PARTIAL_WRITE, &ag_a).is_err(),
+            "AG(a_q==0) must be REFUSED, not a silent Holds — the register's bits are \
+             partly undriven free inputs in the slang lift"
+        );
+        assert_eq!(
+            exact_symbolic_verdict(SLANG_PARTSEL_PARTIAL_WRITE, &ag_b),
+            Ok(ExactVerdict::Violated),
+            "AG(b_q==0) is a faithful register that reaches non-zero ⇒ Violated"
+        );
+    }
+
+    /// monono#partsel, second freeze mechanism — a PACKED 2-D partial write
+    /// (`p[idx] <= d`) splits the register into ANONYMOUS `state` sub-cells with NO
+    /// free inputs (`p` aliases a width-2 `concat` of two width-1 anonymous states,
+    /// so the width filter drops the name off both). The symbol-keyed
+    /// cone-of-influence cannot keep an un-named cell, so it pins the sub-cells to
+    /// their init 0 → `p` is frozen at 0 → the engine used to answer a spurious
+    /// `Holds` for `AG (p == 0)` even though `p[0] <= d` makes it reachably non-zero.
+    /// The guard flags the anonymous split sub-registers (no input needed) and the
+    /// exact engine REFUSES. `q` (a faithful named register) still decides.
+    #[test]
+    fn exact_refuses_packed_split_register_frozen_by_coi() {
+        // p = concat(anon-state-5, anon-state-6); alias `uext 4 7 0 p` is width 2,
+        // states are width 1 → width filter drops `p` off them → both anonymous.
+        // p[0] (state 5) <= d (a named input), p[1] (state 6) <= 0; both init 0.
+        // `q` (state 8) is a faithful named 1-bit register that toggles.
+        const PACKED_SPLIT: &str = "1 sort bitvec 1
+2 one 1 rst_n
+3 input 1 d
+4 sort bitvec 2
+5 state 1
+6 state 1
+7 concat 4 5 6
+8 uext 4 7 0 p
+9 zero 1
+10 next 1 5 3
+11 next 1 6 9
+12 init 1 5 9
+13 init 1 6 9
+14 state 1 q
+15 not 1 14
+16 next 1 14 15
+17 init 1 14 9
+";
+        let file = parser::parse(PACKED_SPLIT).expect("parse");
+        // `p` reaches anonymous split sub-registers (no input in the cone).
+        assert!(
+            parser::signal_reaches_anonymous_leaf(&file, "p"),
+            "p reconstructs from anonymous split sub-registers"
+        );
+        assert!(
+            !parser::signal_reaches_anonymous_leaf(&file, "q"),
+            "q is a faithful named register"
+        );
+        // Exact REFUSES `AG(p==0)` (would be a spurious frozen-Holds); still decides
+        // the faithful `q` (`EF(q==1)` is reachable — q toggles from 0).
+        let ag_p = crate::mu_calculus::parser::parse("nu X. ((p == 0) and [] X)").unwrap();
+        let ef_q = crate::mu_calculus::parser::parse("mu Y. ((q == 1) or <> Y)").unwrap();
+        assert!(
+            exact_symbolic_verdict(PACKED_SPLIT, &ag_p).is_err(),
+            "AG(p==0) must be REFUSED, not a silent frozen Holds"
+        );
+        assert_eq!(
+            exact_symbolic_verdict(PACKED_SPLIT, &ef_q),
+            Ok(ExactVerdict::Holds),
+            "EF(q==1) on the faithful named register still decides"
         );
     }
 
