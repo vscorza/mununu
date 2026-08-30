@@ -3388,27 +3388,28 @@ fn exact_symbolic_verdict_with_witness_inner(
         ));
     }
 
-    // monono#partsel — the same soundness posture for an atom that binds to a SPLIT
-    // register (without being a bare input itself). The yosys-slang lift of a
-    // partial register assignment (`q[hi:lo] <= d`, or `q[idx] <= d` on a packed
-    // 2-D reg) splits `q` and aliases its name to a `concat` over anonymous cells:
-    // free inputs for the unwritten bits (havoc), and/or anonymous split
-    // sub-registers the symbol-keyed cone-of-influence freezes at 0. `q == 0` then
-    // reads those, and the fixpoint mis-decides (a spurious `Holds` on a register
+    // monono#partsel — the same soundness posture for an atom that binds to a
+    // signal reaching an anonymous free INPUT (without being a bare input itself).
+    // The yosys-slang lift of a plain-vector partial register assignment
+    // (`q[hi:lo] <= d`) models `q`'s unwritten bits as free inputs (havoc) and
+    // aliases its name to the `concat` that mixes them; `q == 0` then reads those
+    // free inputs and the fixpoint mis-decides (a spurious `Holds` on a register
     // that is reachably non-zero). Refuse rather than emit an unsound verdict — the
     // verify-auto driver skips such a property up front, and this guards the exact
     // engine's other callers (the differential oracle, `btor2 verify`). A faithful
-    // state cell of that name (read_verilog / sv2v lift) is never flagged.
+    // state cell (read_verilog / sv2v) and an anonymous split sub-register the
+    // NID-indexed COI keeps (packed-2-D `q[idx] <= d`) are both NOT flagged — the
+    // latter now decides.
     if let Some(bad) = seed_regs
         .iter()
-        .find(|r| crate::adapter::btor2::parser::signal_reaches_anonymous_leaf(&file, r))
+        .find(|r| crate::adapter::btor2::parser::signal_reaches_anonymous_input(&file, r))
     {
         return Err(format!(
-            "exact MC: atom `{bad}` binds to a register the RTL front-end SPLIT while lifting \
-             a partial assignment (`{bad}[…] <= …`) — its bits become anonymous cells \
-             (undriven free inputs and/or split sub-registers the model cannot faithfully \
-             track). A state predicate over it would be unsound, so it is refused. Re-lift \
-             with the read_verilog / sv2v front-end, which models `{bad}` faithfully."
+            "exact MC: atom `{bad}` binds to a signal whose unwritten bits the RTL front-end \
+             left undriven (modelled as free inputs) — the yosys-slang lift of a plain-vector \
+             partial assignment (`{bad}[hi:lo] <= …`). A state predicate over it reads those \
+             havoc inputs and would be unsound, so it is refused. Re-lift with the \
+             read_verilog / sv2v front-end, which models `{bad}` faithfully."
         ));
     }
 
@@ -6923,15 +6924,15 @@ mod tests {
         // does not. The combinational output `o_partsel` (a function of `a_q`) is
         // caught too; `o_concat` (a function of the faithful `b_q`) is not.
         assert!(
-            parser::signal_reaches_anonymous_leaf(&file, "a_q"),
+            parser::signal_reaches_anonymous_input(&file, "a_q"),
             "a_q binds to a concat mixing undriven free inputs"
         );
         assert!(
-            !parser::signal_reaches_anonymous_leaf(&file, "b_q"),
+            !parser::signal_reaches_anonymous_input(&file, "b_q"),
             "b_q is a faithful state cell — never flagged"
         );
-        assert!(parser::signal_reaches_anonymous_leaf(&file, "o_partsel"));
-        assert!(!parser::signal_reaches_anonymous_leaf(&file, "o_concat"));
+        assert!(parser::signal_reaches_anonymous_input(&file, "o_partsel"));
+        assert!(!parser::signal_reaches_anonymous_input(&file, "o_concat"));
 
         // The exact engine REFUSES `a_q` (Err) rather than emit the pre-fix spurious
         // `Holds`; it still decides the faithful `b_q` as `Violated` (b_q takes `val`
@@ -6950,21 +6951,22 @@ mod tests {
         );
     }
 
-    /// monono#partsel, second freeze mechanism — a PACKED 2-D partial write
-    /// (`p[idx] <= d`) splits the register into ANONYMOUS `state` sub-cells with NO
-    /// free inputs (`p` aliases a width-2 `concat` of two width-1 anonymous states,
-    /// so the width filter drops the name off both). The symbol-keyed
-    /// cone-of-influence cannot keep an un-named cell, so it pins the sub-cells to
-    /// their init 0 → `p` is frozen at 0 → the engine used to answer a spurious
-    /// `Holds` for `AG (p == 0)` even though `p[0] <= d` makes it reachably non-zero.
-    /// The guard flags the anonymous split sub-registers (no input needed) and the
-    /// exact engine REFUSES. `q` (a faithful named register) still decides.
+    /// monono#partsel COI fix — a PACKED 2-D partial write (`p[idx] <= d`) splits
+    /// the register into ANONYMOUS `state` sub-cells with NO free inputs (`p`
+    /// aliases a width-2 `concat` of two width-1 anonymous states, so the width
+    /// filter drops the name off both). The OLD symbol-keyed cone-of-influence
+    /// could not keep an un-named cell, so it pinned the sub-cells to their init 0
+    /// → `p` frozen at 0 → a spurious `Holds` for `AG (p == 0)`. The NID-indexed
+    /// COY ([`crate::adapter::btor2::dep_graph::cone_leaf_nids`]) now KEEPS the
+    /// anonymous sub-cells, so `AG (p == 0)` DECIDES `Violated` (`p[0] <= d` makes
+    /// it reachably non-zero) — no free input, so the guard does not refuse it.
+    /// `q` (a faithful named register) also decides.
     #[test]
-    fn exact_refuses_packed_split_register_frozen_by_coi() {
+    fn exact_decides_packed_split_register_via_nid_cone() {
         // p = concat(anon-state-5, anon-state-6); alias `uext 4 7 0 p` is width 2,
         // states are width 1 → width filter drops `p` off them → both anonymous.
         // p[0] (state 5) <= d (a named input), p[1] (state 6) <= 0; both init 0.
-        // `q` (state 8) is a faithful named 1-bit register that toggles.
+        // `q` (state 14) is a faithful named 1-bit register that toggles.
         const PACKED_SPLIT: &str = "1 sort bitvec 1
 2 one 1 rst_n
 3 input 1 d
@@ -6984,27 +6986,27 @@ mod tests {
 17 init 1 14 9
 ";
         let file = parser::parse(PACKED_SPLIT).expect("parse");
-        // `p` reaches anonymous split sub-registers (no input in the cone).
+        // `p` reaches anonymous split sub-registers but NO free input — the
+        // input-only guard does not fire, so the property is DECIDED, not refused.
         assert!(
-            parser::signal_reaches_anonymous_leaf(&file, "p"),
-            "p reconstructs from anonymous split sub-registers"
+            !parser::signal_reaches_anonymous_input(&file, "p"),
+            "an anonymous-state split (no free input) is kept by the COI, not refused"
         );
-        assert!(
-            !parser::signal_reaches_anonymous_leaf(&file, "q"),
-            "q is a faithful named register"
-        );
-        // Exact REFUSES `AG(p==0)` (would be a spurious frozen-Holds); still decides
-        // the faithful `q` (`EF(q==1)` is reachable — q toggles from 0).
+        assert!(!parser::signal_reaches_anonymous_input(&file, "q"));
+        // Exact DECIDES `AG(p==0)` = Violated: the NID cone keeps the anonymous
+        // sub-cells, so `p[0] <= d` (d free) reaches a non-zero `p`.
         let ag_p = crate::mu_calculus::parser::parse("nu X. ((p == 0) and [] X)").unwrap();
         let ef_q = crate::mu_calculus::parser::parse("mu Y. ((q == 1) or <> Y)").unwrap();
-        assert!(
-            exact_symbolic_verdict(PACKED_SPLIT, &ag_p).is_err(),
-            "AG(p==0) must be REFUSED, not a silent frozen Holds"
+        assert_eq!(
+            exact_symbolic_verdict(PACKED_SPLIT, &ag_p),
+            Ok(ExactVerdict::Violated),
+            "AG(p==0) must now DECIDE Violated — the NID cone keeps the anonymous \
+             split sub-cells instead of freezing them"
         );
         assert_eq!(
             exact_symbolic_verdict(PACKED_SPLIT, &ef_q),
             Ok(ExactVerdict::Holds),
-            "EF(q==1) on the faithful named register still decides"
+            "EF(q==1) on the faithful named register also decides"
         );
     }
 

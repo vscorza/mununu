@@ -211,16 +211,11 @@ pub fn resolve_atom_to_terminals(file: &Btor2File, atom: &str) -> Option<HashSet
 /// the reduction into an unsound over-approximation. This mirrors the
 /// closure in [`super::bit_blast`]'s `cone_slice`.
 pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
-    let (cone, symbols) = cone_symbols(file, atoms);
-    // Map cone state symbols back to their state-line NIDs.
+    // The state subset of the cone's leaves (NID-indexed — keeps anonymous cells).
+    let leaves = cone_reachable_leaves(file, atoms);
     file.states()
-        .filter(|l| {
-            symbols
-                .get(&l.nid)
-                .map(|sym| cone.contains(sym))
-                .unwrap_or(false)
-        })
         .map(|l| l.nid)
+        .filter(|nid| leaves.contains(nid))
         .collect()
 }
 
@@ -233,85 +228,91 @@ pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
 /// influence any atom, so pinning it to a constant is sound (same COI argument as
 /// [`state_cone_nids`], extended to the input frame).
 pub fn cone_leaf_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
-    let (cone, symbols) = cone_symbols(file, atoms);
-    file.lines
-        .iter()
-        .filter(|l| matches!(l.node, Node::State { .. } | Node::Input { .. }))
-        .filter(|l| {
-            symbols
-                .get(&l.nid)
-                .map(|sym| cone.contains(sym))
-                .unwrap_or(false)
-        })
-        .map(|l| l.nid)
-        .collect()
+    cone_reachable_leaves(file, atoms)
 }
 
-/// Shared core of [`state_cone_nids`] / [`cone_leaf_nids`]: the full cone-of-influence SYMBOL
-/// set (state + input) of `atoms`, closed under the data-flow dependency relation AND
-/// `constraint` / `fair` / `justice` co-occurrence. Returns the cone plus the `collect_symbols`
-/// map (reused by the callers to map symbols back to NIDs). See [`state_cone_nids`]'s SOUNDNESS
-/// note — with the constraint/fairness closure this is an EXACT reduction (not an approximation).
-fn cone_symbols(file: &Btor2File, atoms: &[String]) -> (HashSet<String>, HashMap<Nid, String>) {
-    use crate::adapter::partition::coi::cone_of_influence;
-
+/// Shared core of [`state_cone_nids`] / [`cone_leaf_nids`]: the cone-of-influence
+/// **leaf NIDs** (every `state` + `input` cell reached) of `atoms`, closed under
+/// the data-flow dependency relation AND `constraint` / `fair` / `justice`
+/// co-occurrence.
+///
+/// # Why NID-indexed, not symbol-indexed (monono#partsel COI fix)
+///
+/// The reachability runs directly over the BTOR2 operand DAG (node NIDs), NOT
+/// over a symbol dep graph. The previous symbol-keyed pipeline
+/// ([`DepGraphBuilder::build`] + `cone_of_influence`) recorded only cells that
+/// [`parser::collect_symbols`] could NAME, and dropped every **anonymous** cell
+/// (a `state`/`input` line with no symbol — line 86's `if let Some(sym)`
+/// filter). The yosys-slang lift of a partial register assignment (`q[idx] <= d`
+/// on a packed 2-D reg) splits `q` into anonymous `state` sub-cells; the
+/// symbol-keyed cone could not keep them, so the bit-blaster pinned them to their
+/// init value and **froze the register** (a spurious `Holds`). Working over NIDs
+/// keeps anonymous cells — every node has a NID — so a split sub-register is now
+/// modelled and its property decides.
+///
+/// # SOUNDNESS
+///
+/// BTOR2 operand edges are precise (each edge is a real dependency), so backward
+/// reachability yields the EXACT influence cone: it never drops a cell that
+/// influences an atom, so pinning every out-of-cone leaf to a constant is
+/// verdict-preserving for the full mu-calculus over `atoms` (CLAUDE.md
+/// §Soundness — the COI "exact / free / sound" abstraction). Closure has two
+/// halves, both walked, both load-bearing:
+/// - **temporal**: for every `state` reached, its `next` function's cone (an
+///   out-of-cone leaf feeding a kept register's `next` would otherwise be pinned
+///   wrongly). `init` is (near-always) a constant and is left unfollowed,
+///   matching the previous Next-only closure.
+/// - **assume/fairness**: a `constraint`/`fair`/`justice` whose COMBINATIONAL
+///   cone touches the current cone restricts the reachable state space, so its
+///   signals join the cone (the selective pullback below). Omitting it would
+///   silently drop an assumption and turn the reduction unsound.
+///
+/// Time O(N + E) integer reachability (a dense `seen`/`leaves` over line NIDs),
+/// no per-symbol `String` hashing / dep-graph allocation.
+fn cone_reachable_leaves(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
     let symbols = parser::collect_symbols(file);
-    let deps = file.build();
 
-    // Seed the cone with each atom's terminal symbols. An atom the BTOR2
-    // doesn't name (no `output`/`state`/`input`/`op` symbol matches)
-    // falls back to seeding with the bare atom string — matching the
-    // cluster-COI seed-resolution convention (R4W-3.5b).
-    let mut seeds: HashSet<String> = HashSet::new();
-    for atom in atoms {
-        match resolve_atom_to_terminals(file, atom) {
-            Some(terminals) => seeds.extend(terminals),
-            None => {
-                seeds.insert(atom.clone());
-            }
+    // state NID -> its `next` value operand (one pass). `init` is intentionally
+    // NOT followed (near-always constant; matches the old Next-only closure).
+    let mut next_val: HashMap<Nid, Nid> = HashMap::new();
+    for line in &file.lines {
+        if let Node::Next { state, value, .. } = &line.node {
+            next_val.insert(*state, value.nid());
         }
     }
 
-    let mut cone = cone_of_influence(&seeds, &deps);
+    // Seed from each atom's BINDING node(s) — the node the atom actually reads.
+    // Reaching the anonymous split sub-cells requires seeding from the register-
+    // name alias / reconstruction, not from pre-resolved (nameable) terminals.
+    let mut work: Vec<Nid> = Vec::new();
+    for atom in atoms {
+        seed_binding_nids(file, &symbols, atom, &mut work);
+    }
 
-    // Constraint / fairness pullback (R46-6a) — close the cone over
-    // assumption + fairness coupling, mirroring `cone_slice`. Any
-    // `constraint` / `fair` / `justice` line whose terminal symbols touch
-    // the current cone pulls all of its terminals into the seed set;
-    // recompute and iterate to a fixpoint. `seeds` grows monotonically and
-    // is bounded by the symbol count, so this terminates.
+    let mut seen: HashSet<Nid> = HashSet::new();
+    let mut leaves: HashSet<Nid> = HashSet::new();
+    drain_cone(file, &next_val, &mut work, &mut seen, &mut leaves);
+
+    // Selective constraint / fair / justice pullback (R46-6a): a constraint whose
+    // COMBINATIONAL cone shares a leaf with the current cone joins it; iterate to
+    // a fixpoint (`pulled` grows monotonically, bounded by the constraint count).
+    let mut pulled: HashSet<Nid> = HashSet::new();
     loop {
         let mut grew = false;
         for line in &file.lines {
-            let mut terminals: HashSet<String> = HashSet::new();
-            let mut visited = HashSet::new();
-            match &line.node {
-                Node::Constraint { signal } | Node::Fair { signal } => {
-                    collect_operand_terminals(
-                        file,
-                        signal.nid(),
-                        &symbols,
-                        &mut terminals,
-                        &mut visited,
-                    );
-                }
-                Node::Justice { signals } => {
-                    for sig in signals {
-                        collect_operand_terminals(
-                            file,
-                            sig.nid(),
-                            &symbols,
-                            &mut terminals,
-                            &mut visited,
-                        );
-                    }
-                }
+            let sigs: Vec<Nid> = match &line.node {
+                Node::Constraint { signal } | Node::Fair { signal } => vec![signal.nid()],
+                Node::Justice { signals } => signals.iter().map(|s| s.nid()).collect(),
                 _ => continue,
-            }
-            if terminals.iter().any(|t| cone.contains(t)) {
-                let before = seeds.len();
-                seeds.extend(terminals);
-                if seeds.len() != before {
+            };
+            for sig in sigs {
+                if pulled.contains(&sig) {
+                    continue;
+                }
+                let comb = cone_combinational_leaf_nids(file, sig);
+                if comb.iter().any(|n| leaves.contains(n)) {
+                    pulled.insert(sig);
+                    work.push(sig);
                     grew = true;
                 }
             }
@@ -319,10 +320,116 @@ fn cone_symbols(file: &Btor2File, atoms: &[String]) -> (HashSet<String>, HashMap
         if !grew {
             break;
         }
-        cone = cone_of_influence(&seeds, &deps);
+        drain_cone(file, &next_val, &mut work, &mut seen, &mut leaves);
     }
 
-    (cone, symbols)
+    leaves
+}
+
+/// Drain `work`, closing the cone under combinational fan-in AND the temporal
+/// `state -> next` edge. Collects every `State`/`Input` NID reached — NAMED OR
+/// ANONYMOUS. Cf. [`cone_reachable_leaves`].
+fn drain_cone(
+    file: &Btor2File,
+    next_val: &HashMap<Nid, Nid>,
+    work: &mut Vec<Nid>,
+    seen: &mut HashSet<Nid>,
+    leaves: &mut HashSet<Nid>,
+) {
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::State { .. } => {
+                leaves.insert(nid);
+                if let Some(&v) = next_val.get(&nid) {
+                    work.push(v);
+                }
+            }
+            Node::Input { .. } => {
+                leaves.insert(nid);
+            }
+            Node::Op { args, .. } => work.extend(args.iter().map(|a| a.nid())),
+            Node::Init { value, .. } | Node::Next { value, .. } => work.push(value.nid()),
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => work.push(signal.nid()),
+            Node::Justice { signals } => work.extend(signals.iter().map(|s| s.nid())),
+            Node::Const { .. } | Node::Sort { .. } => {}
+        }
+    }
+}
+
+/// The **combinational** fan-in leaves of `start`: follow `Op` args (and value /
+/// signal edges) but STOP at each `state`/`input` cell — do NOT follow a state's
+/// `next`. The NID counterpart of [`collect_operand_terminals`] that keeps
+/// anonymous cells; used by [`cone_reachable_leaves`]'s constraint pullback to
+/// decide whether a constraint's cone touches the current cone.
+fn cone_combinational_leaf_nids(file: &Btor2File, start: Nid) -> HashSet<Nid> {
+    let mut seen: HashSet<Nid> = HashSet::new();
+    let mut leaves: HashSet<Nid> = HashSet::new();
+    let mut work: Vec<Nid> = vec![start];
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::State { .. } | Node::Input { .. } => {
+                leaves.insert(nid);
+            }
+            Node::Op { args, .. } => work.extend(args.iter().map(|a| a.nid())),
+            Node::Init { value, .. } | Node::Next { value, .. } => work.push(value.nid()),
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => work.push(signal.nid()),
+            Node::Justice { signals } => work.extend(signals.iter().map(|s| s.nid())),
+            Node::Const { .. } | Node::Sort { .. } => {}
+        }
+    }
+    leaves
+}
+
+/// Resolve a formula atom `name` to the BTOR2 node(s) it BINDS to, pushing their
+/// NIDs onto `work` as cone seeds — mirroring how the bit-blaster's `signal_bits`
+/// resolves a name: a `state`/`input` cell carrying that symbol (directly or via
+/// a [`parser::collect_symbols`] alias), an `Op` whose own symbol is `name` (the
+/// `uext … 0 NAME` register-name alias), or a named `output`'s signal. Seeding
+/// from the binding node — not from pre-resolved terminal symbols — is what lets
+/// the cone reach the ANONYMOUS split sub-cells a register-name reconstruction is
+/// built from. A name the BTOR2 doesn't carry adds no seed (a degenerate empty
+/// cone, as before — such atoms are refused / unbindable elsewhere).
+fn seed_binding_nids(
+    file: &Btor2File,
+    symbols: &HashMap<Nid, String>,
+    name: &str,
+    work: &mut Vec<Nid>,
+) {
+    for line in &file.lines {
+        match &line.node {
+            Node::State { .. } | Node::Input { .. }
+                if symbols.get(&line.nid).map(String::as_str) == Some(name) =>
+            {
+                work.push(line.nid);
+            }
+            Node::Op {
+                symbol: Some(s), ..
+            } if s == name => work.push(line.nid),
+            Node::Output {
+                symbol: Some(s),
+                signal,
+            } if s == name => work.push(signal.nid()),
+            _ => {}
+        }
+    }
 }
 
 /// Collect the COI seed set for a BTOR2 file from its intrinsic

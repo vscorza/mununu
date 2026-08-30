@@ -851,19 +851,20 @@ struct Seeded {
 }
 
 /// monono#partsel soundness guard — the first register/signal name a formula's
-/// predicate atoms reference that binds to a signal reaching an ANONYMOUS leaf (an
-/// undriven-register-bit free input, or an anonymous split sub-register the
-/// cone-of-influence freezes), or `None` when the formula is sound to decide.
+/// predicate atoms reference that binds to a signal reaching an ANONYMOUS
+/// (undriven-register-bit) free input, or `None` when the formula is sound to
+/// decide.
 ///
-/// The yosys-slang lift of a partial register assignment (`q[hi:lo] <= d`, or
-/// `q[idx] <= d` on a packed 2-D reg) splits the register: the register name `q`
-/// aliases a `concat` over anonymous cells — free `input`s for its unwritten bits
-/// and/or anonymous split sub-`state`s (see
-/// [`parser::signal_reaches_anonymous_leaf`]). A predicate atom over `q` — a
-/// register atom (`q == 0`) or a combinational output of it (`o = (q != 0)`) — is
-/// then not a sound state predicate and every engine mis-decides it (a spurious
-/// `HOLDS` on a reachably-non-zero register). Callers refuse (skip) the property
-/// rather than emit that verdict.
+/// The yosys-slang lift of a plain-vector partial register assignment
+/// (`q[hi:lo] <= d`) models the register's *unwritten* bits as free `input`s and
+/// aliases the register name `q` to the `concat` that mixes them (see
+/// [`parser::signal_reaches_anonymous_input`]). A predicate atom over `q` — a
+/// register atom (`q == 0`) or a combinational output of it (`o = (q != 0)`) —
+/// then reads those free inputs (havoc) and mis-decides (a spurious `HOLDS` on a
+/// reachably-non-zero register). Callers refuse (skip) rather than emit that
+/// verdict. The packed-2-D `q[idx] <= d` split (anonymous sub-*registers*, no
+/// free inputs) is NOT flagged here — the NID-indexed cone-of-influence keeps
+/// those cells, so that case now DECIDES.
 ///
 /// Bare atoms are admitted (`parse_predicate_atom_bool` reads `o_partsel` as
 /// `o_partsel != 0`), so a combinational-output property is caught as well as a
@@ -887,7 +888,7 @@ fn formula_atom_over_undriven_register(
     names.sort();
     names
         .into_iter()
-        .find(|n| crate::adapter::btor2::parser::signal_reaches_anonymous_leaf(file, n))
+        .find(|n| crate::adapter::btor2::parser::signal_reaches_anonymous_input(file, n))
 }
 
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
@@ -2373,19 +2374,19 @@ pub(crate) fn verify_auto_impl(
 
         // monono#partsel soundness guard (all engines). Refuse — rather than
         // silently mis-decide — a property whose atom binds to a signal reaching an
-        // ANONYMOUS leaf. The yosys-slang lift of a partial register assignment
-        // (`q[hi:lo] <= d`, or `q[idx] <= d` on a packed 2-D reg) SPLITS the
-        // register and aliases the register name `q` to a `concat` over anonymous
-        // cells — free `input`s for its unwritten bits (havoc), and/or anonymous
-        // split sub-`state`s the symbol-keyed cone-of-influence freezes at 0. A
-        // state predicate over `q` (or over a combinational output of it, e.g.
-        // `q != 0`) is then NOT sound and every engine returns a spurious definite
-        // verdict (the reported `HOLDS` on a reachable-non-zero register — monono's
-        // planted-bug canary). Refusing is honest and recoverable (a downstream gate
-        // fails on `skipped`, never on a false HOLDS); the read_verilog / sv2v
-        // front-end (`--frontend verilog --preprocess-sv2v`) models the register
-        // faithfully and decides it. Runs BEFORE any engine so the cube, exact,
-        // symbolic and explicit paths are all covered uniformly.
+        // ANONYMOUS free `input`. The yosys-slang lift of a plain-vector partial
+        // register assignment (`q[hi:lo] <= d`) models the register's unwritten bits
+        // as free inputs (havoc) and aliases the register name `q` to the `concat`
+        // that mixes them; a state predicate over `q` (or a combinational output of
+        // it, `q != 0`) then reads those free inputs and every engine returns a
+        // spurious definite verdict (the reported `HOLDS` on a reachable-non-zero
+        // register — monono's planted-bug canary). Refusing is honest and
+        // recoverable (a downstream gate fails on `skipped`, never on a false HOLDS);
+        // the read_verilog / sv2v front-end models the register faithfully and
+        // decides it. Runs BEFORE any engine so cube, exact, symbolic and explicit
+        // are covered uniformly. (The packed-2-D `q[idx] <= d` split — anonymous
+        // sub-*registers*, no free inputs — is NOT refused: the NID-indexed
+        // cone-of-influence keeps those cells, so that case now decides.)
         if let Some(reg) = formula_atom_over_undriven_register(&formula, &file) {
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
@@ -2393,12 +2394,11 @@ pub(crate) fn verify_auto_impl(
                 formula: formula_str.clone(),
                 outcome: VerifyOutcome::Skipped {
                     reason: format!(
-                        "property references `{reg}`, which the RTL front-end SPLIT while \
-                         lifting a partial register assignment (`{reg}[…] <= …`) — its bits \
-                         become anonymous cells (undriven free inputs and/or split \
-                         sub-registers the model cannot faithfully track), so a verdict over \
-                         it would be unsound and it is refused rather than silently decided. \
-                         Re-lift with the read_verilog / sv2v front-end \
+                        "property references `{reg}`, whose unwritten bits the RTL front-end \
+                         left undriven (modelled as free inputs) while lifting a partial \
+                         register assignment (`{reg}[hi:lo] <= …`) — a verdict over it would \
+                         read those havoc inputs and be unsound, so it is refused rather than \
+                         silently decided. Re-lift with the read_verilog / sv2v front-end \
                          (`--frontend verilog --preprocess-sv2v`), which models `{reg}` \
                          faithfully."
                     ),
@@ -7209,19 +7209,23 @@ endmodule
     }
 
     /// monono#partsel — the partial-register-assignment soundness fix, end-to-end
-    /// through `verify_auto`. Four 16-bit registers, each reachably non-zero, each
-    /// written a different way; `a_q[11:8] <= val` is the partial write.
+    /// through `verify_auto`. Five registers, each reachably non-zero, each written
+    /// a different way.
     ///
-    /// Under the **slang** front-end, `a_q`'s unwritten bits become free inputs (see
-    /// [`crate::adapter::btor2::parser::signal_reaches_anonymous_input`]), so a
-    /// verdict over `a_q` would be unsound — verify_auto must now **Skip** it rather
-    /// than emit the reported spurious `HOLDS`. `b_q` / `c_q` / `d_q` are faithful
-    /// registers and are decided `Violated`.
+    /// Under the **slang** front-end, the two partial-write shapes lift differently:
+    /// - `a_q[11:8] <= val` (plain vector) — the unwritten bits become anonymous
+    ///   free `input`s (havoc); a verdict would read them, so verify_auto **Skips**
+    ///   it (never the reported spurious `HOLDS`).
+    /// - `p_q[idx] <= val` (packed 2-D) — the register splits into anonymous
+    ///   `state` sub-cells with NO free inputs; the NID-indexed cone-of-influence
+    ///   now KEEPS them, so this **decides `Violated`** (the COI fix — previously it
+    ///   was frozen/Skipped). `b_q` / `c_q` / `d_q` are faithful ⇒ `Violated`.
     ///
-    /// Under the **read_verilog + sv2v** front-end, `a_q` lifts to one faithful
-    /// state cell, so ALL FOUR are decided `Violated` — the correct outcome, and the
-    /// guard does not over-refuse the faithful lift. Together these pin both the fix
-    /// (no silent HOLDS) and its precision (the good path still decides).
+    /// Under the **read_verilog + sv2v** front-end, every register lifts to one
+    /// faithful state cell, so ALL FIVE are decided `Violated` — the guard does not
+    /// over-refuse the faithful lift. Together these pin the fix (no silent HOLDS),
+    /// its precision (the good path still decides), and the COI fix (packed-2-D now
+    /// decides on slang instead of being frozen).
     #[test]
     #[ignore = "requires slang + sv2v + yosys (mununu-sva image)"]
     fn e2e_partsel_partial_write_refused_on_slang_decided_on_sv2v() {
@@ -7285,21 +7289,25 @@ endmodule
                 .clone()
         };
 
-        // slang: a_q (free-input split) AND p_q (anonymous-sub-register split) both
-        // REFUSED (Skipped) — no silent HOLDS; the faithful three Violated.
+        // slang: `a_q` (plain-vector split → free inputs) is REFUSED (Skipped) — no
+        // silent HOLDS. `p_q` (packed-2-D split → anonymous sub-registers, NO free
+        // inputs) now DECIDES Violated via the NID-indexed COI. The faithful three
+        // decide Violated.
         let slang = run(crate::adapter::yosys::SvFrontend::Slang, false);
-        for reg in ["a_q == 0", "p_q == 0"] {
-            assert!(
-                matches!(outcome_of(&slang, reg), VerifyOutcome::Skipped { .. }),
-                "slang: AG({reg}) must be Skipped (partial-write register split by the \
-                 lift), never a silent Holds; got {:?}",
-                outcome_of(&slang, reg)
-            );
-        }
-        for reg in ["b_q == 0", "c_q == 0", "d_q == 0"] {
+        assert!(
+            matches!(
+                outcome_of(&slang, "a_q == 0"),
+                VerifyOutcome::Skipped { .. }
+            ),
+            "slang: AG(a_q==0) must be Skipped (unwritten bits are free inputs), never \
+             a silent Holds; got {:?}",
+            outcome_of(&slang, "a_q == 0")
+        );
+        for reg in ["b_q == 0", "c_q == 0", "d_q == 0", "p_q == 0"] {
             assert!(
                 matches!(outcome_of(&slang, reg), VerifyOutcome::Violated { .. }),
-                "slang: AG({reg}) is a faithful register ⇒ Violated; got {:?}",
+                "slang: AG({reg}) must be Violated (faithful register, or packed-2-D split \
+                 kept by the NID COI); got {:?}",
                 outcome_of(&slang, reg)
             );
         }
