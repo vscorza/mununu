@@ -850,6 +850,46 @@ struct Seeded {
     derived_relational: Vec<(String, PredicateExpr)>,
 }
 
+/// monono#partsel soundness guard — the first register/signal name a formula's
+/// predicate atoms reference that binds to a signal reaching an ANONYMOUS leaf (an
+/// undriven-register-bit free input, or an anonymous split sub-register the
+/// cone-of-influence freezes), or `None` when the formula is sound to decide.
+///
+/// The yosys-slang lift of a partial register assignment (`q[hi:lo] <= d`, or
+/// `q[idx] <= d` on a packed 2-D reg) splits the register: the register name `q`
+/// aliases a `concat` over anonymous cells — free `input`s for its unwritten bits
+/// and/or anonymous split sub-`state`s (see
+/// [`parser::signal_reaches_anonymous_leaf`]). A predicate atom over `q` — a
+/// register atom (`q == 0`) or a combinational output of it (`o = (q != 0)`) — is
+/// then not a sound state predicate and every engine mis-decides it (a spurious
+/// `HOLDS` on a reachably-non-zero register). Callers refuse (skip) the property
+/// rather than emit that verdict.
+///
+/// Bare atoms are admitted (`parse_predicate_atom_bool` reads `o_partsel` as
+/// `o_partsel != 0`), so a combinational-output property is caught as well as a
+/// register-comparison one.
+fn formula_atom_over_undriven_register(
+    formula: &Formula,
+    file: &crate::adapter::btor2::ast::Btor2File,
+) -> Option<String> {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for node in formula.nodes() {
+        if let Node::Predicate(atom) = node
+            && let Ok(expr) = crate::adapter::btor2::predicate_expr::parse_predicate_atom_bool(atom)
+        {
+            crate::adapter::btor2::symbolic_bitblast::collect_predicate_registers(
+                &expr, &mut names,
+            );
+        }
+    }
+    // Deterministic: report the lexicographically-first offending name.
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names
+        .into_iter()
+        .find(|n| crate::adapter::btor2::parser::signal_reaches_anonymous_leaf(file, n))
+}
+
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
 /// `Node::Predicate` atoms. Each predicate is named exactly the atom string (so
 /// the evaluator's name-match binds the atom to its cube bit).
@@ -2330,6 +2370,44 @@ pub(crate) fn verify_auto_impl(
                 continue;
             }
         };
+
+        // monono#partsel soundness guard (all engines). Refuse — rather than
+        // silently mis-decide — a property whose atom binds to a signal reaching an
+        // ANONYMOUS leaf. The yosys-slang lift of a partial register assignment
+        // (`q[hi:lo] <= d`, or `q[idx] <= d` on a packed 2-D reg) SPLITS the
+        // register and aliases the register name `q` to a `concat` over anonymous
+        // cells — free `input`s for its unwritten bits (havoc), and/or anonymous
+        // split sub-`state`s the symbol-keyed cone-of-influence freezes at 0. A
+        // state predicate over `q` (or over a combinational output of it, e.g.
+        // `q != 0`) is then NOT sound and every engine returns a spurious definite
+        // verdict (the reported `HOLDS` on a reachable-non-zero register — monono's
+        // planted-bug canary). Refusing is honest and recoverable (a downstream gate
+        // fails on `skipped`, never on a false HOLDS); the read_verilog / sv2v
+        // front-end (`--frontend verilog --preprocess-sv2v`) models the register
+        // faithfully and decides it. Runs BEFORE any engine so the cube, exact,
+        // symbolic and explicit paths are all covered uniformly.
+        if let Some(reg) = formula_atom_over_undriven_register(&formula, &file) {
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: formula_str.clone(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: format!(
+                        "property references `{reg}`, which the RTL front-end SPLIT while \
+                         lifting a partial register assignment (`{reg}[…] <= …`) — its bits \
+                         become anonymous cells (undriven free inputs and/or split \
+                         sub-registers the model cannot faithfully track), so a verdict over \
+                         it would be unsound and it is refused rather than silently decided. \
+                         Re-lift with the read_verilog / sv2v front-end \
+                         (`--frontend verilog --preprocess-sv2v`), which models `{reg}` \
+                         faithfully."
+                    ),
+                },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            });
+            continue;
+        }
 
         // D1.6 — exact full-state symbolic MC (`--engine exact-symbolic`): decide
         // the property EXACTLY over the reset-gated btor2's bit-blasted state — no
@@ -7128,6 +7206,115 @@ endmodule
              got {:?}",
             guarantee.outcome
         );
+    }
+
+    /// monono#partsel — the partial-register-assignment soundness fix, end-to-end
+    /// through `verify_auto`. Four 16-bit registers, each reachably non-zero, each
+    /// written a different way; `a_q[11:8] <= val` is the partial write.
+    ///
+    /// Under the **slang** front-end, `a_q`'s unwritten bits become free inputs (see
+    /// [`crate::adapter::btor2::parser::signal_reaches_anonymous_input`]), so a
+    /// verdict over `a_q` would be unsound — verify_auto must now **Skip** it rather
+    /// than emit the reported spurious `HOLDS`. `b_q` / `c_q` / `d_q` are faithful
+    /// registers and are decided `Violated`.
+    ///
+    /// Under the **read_verilog + sv2v** front-end, `a_q` lifts to one faithful
+    /// state cell, so ALL FOUR are decided `Violated` — the correct outcome, and the
+    /// guard does not over-refuse the faithful lift. Together these pin both the fix
+    /// (no silent HOLDS) and its precision (the good path still decides).
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys (mununu-sva image)"]
+    fn e2e_partsel_partial_write_refused_on_slang_decided_on_sv2v() {
+        const CC: &str = r#"// @mununu_guarantee nu X. ((a_q == 0) and [] X)
+// @mununu_guarantee nu X. ((b_q == 0) and [] X)
+// @mununu_guarantee nu X. ((c_q == 0) and [] X)
+// @mununu_guarantee nu X. ((d_q == 0) and [] X)
+// @mununu_guarantee nu X. ((p_q == 0) and [] X)
+module cc (input logic clk, input logic rst_n, input logic [3:0] val,
+           input logic [1:0] idx,
+           output logic o_partsel, output logic o_concat,
+           output logic o_lowconcat, output logic o_plain);
+    logic [15:0] a_q, b_q, c_q, d_q;
+    logic [3:0][3:0] p_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin a_q <= '0; b_q <= '0; c_q <= '0; d_q <= '0; p_q <= '0; end
+        else begin
+            a_q[11:8] <= val;                    // plain vector, constant range -> free inputs
+            b_q       <= {b_q[15:12], val, b_q[7:0]};
+            c_q       <= {12'd0, val};
+            d_q       <= 16'(val);
+            p_q[idx]  <= val;                    // packed 2-D, variable index -> anonymous split sub-regs
+        end
+    end
+    assign o_partsel   = (a_q != '0);
+    assign o_concat    = (b_q != '0);
+    assign o_lowconcat = (c_q != '0);
+    assign o_plain     = (d_q != '0);
+endmodule
+"#;
+        let sources = vec![("cc.sv".to_string(), CC.to_string())];
+        let cfg = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("rst_n".to_string(), 1u64);
+            m
+        };
+        let run = |frontend: crate::adapter::yosys::SvFrontend, use_sv2v: bool| {
+            let yopts = YosysOptions {
+                top: Some("cc".to_string()),
+                use_sv2v,
+                frontend,
+                ..Default::default()
+            };
+            verify_auto(
+                &sources,
+                &yopts,
+                &VerifyAutoOptions {
+                    config_values: cfg.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect("verify_auto runs")
+        };
+        let outcome_of = |report: &AutoVerifyReport, needle: &str| {
+            report
+                .properties
+                .iter()
+                .find(|p| p.formula.contains(needle))
+                .unwrap_or_else(|| panic!("property for {needle} present"))
+                .outcome
+                .clone()
+        };
+
+        // slang: a_q (free-input split) AND p_q (anonymous-sub-register split) both
+        // REFUSED (Skipped) — no silent HOLDS; the faithful three Violated.
+        let slang = run(crate::adapter::yosys::SvFrontend::Slang, false);
+        for reg in ["a_q == 0", "p_q == 0"] {
+            assert!(
+                matches!(outcome_of(&slang, reg), VerifyOutcome::Skipped { .. }),
+                "slang: AG({reg}) must be Skipped (partial-write register split by the \
+                 lift), never a silent Holds; got {:?}",
+                outcome_of(&slang, reg)
+            );
+        }
+        for reg in ["b_q == 0", "c_q == 0", "d_q == 0"] {
+            assert!(
+                matches!(outcome_of(&slang, reg), VerifyOutcome::Violated { .. }),
+                "slang: AG({reg}) is a faithful register ⇒ Violated; got {:?}",
+                outcome_of(&slang, reg)
+            );
+        }
+
+        // read_verilog + sv2v: every register lifts faithfully ⇒ ALL Violated (the
+        // guard does not over-refuse the good lift).
+        let sv2v = run(crate::adapter::yosys::SvFrontend::Verilog, true);
+        for reg in ["a_q == 0", "b_q == 0", "c_q == 0", "d_q == 0", "p_q == 0"] {
+            assert!(
+                matches!(outcome_of(&sv2v, reg), VerifyOutcome::Violated { .. }),
+                "sv2v: AG({reg}) must be Violated (faithful lift, reachably non-zero); \
+                 got {:?}",
+                outcome_of(&sv2v, reg)
+            );
+        }
     }
 
     #[test]
