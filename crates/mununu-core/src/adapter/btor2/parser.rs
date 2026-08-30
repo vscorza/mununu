@@ -582,40 +582,30 @@ pub fn cone_reaches_input(file: &Btor2File, start: Nid) -> bool {
 }
 
 /// monono#partsel soundness guard — does the combinational cone rooted at `start`
-/// reach an **anonymous** leaf: a primary `input` or a `state` cell that
-/// [`collect_symbols`] could not name?
+/// reach an **anonymous** (symbol-less) primary `input`?
 ///
 /// A properly-lifted, flattened design names every real primary input after its
-/// top-module port (`clk`, `rst_n`, …) and names every register (directly or via
-/// a width-matched `uext … 0 NAME` alias). An **anonymous** leaf is therefore an
-/// artifact of the RTL front-end, and the yosys-slang lift of a **partial
-/// register assignment** (`q[hi:lo] <= d` / `q[idx] <= d` on a packed 2-D reg)
-/// produces two anonymous-leaf shapes, both aliased back to the register name `q`
-/// through a width-16 `uext … 0 q` the width filter drops off the narrow cells:
+/// top-module port (`clk`, `rst_n`, …). An **anonymous** `input` — a
+/// `<nid> input <sort>` line with no trailing symbol — is therefore never a real
+/// port: it is a net the RTL front-end left *undriven* and modelled as a free
+/// (havoc-each-cycle) variable. The yosys-slang lift of a plain-vector **partial
+/// register assignment** (`q[hi:lo] <= d`) produces exactly this: the register's
+/// *unwritten* bits become anonymous free `input`s that are `concat`-ed back into
+/// a signal aliased to the register name `q`. A predicate over `q` then reads
+/// those free inputs and mis-decides (a spurious `Holds` on a reachably non-zero
+/// register), so callers REFUSE it.
 ///
-/// - **undriven free inputs** — the register's *unwritten* bits become
-///   symbol-less `input`s (havoc each cycle); a predicate over `q` then reads
-///   those free inputs and mis-decides (a spurious `Holds` on a non-zero
-///   register). This is the plain-vector `q[11:8] <= d` case.
-/// - **anonymous split sub-registers** — the written slice(s) become symbol-less
-///   `state` cells; the SYMBOL-keyed cone-of-influence
-///   ([`crate::adapter::btor2::dep_graph::cone_leaf_nids`]) cannot keep an
-///   un-named cell, so it is (mis)classified out-of-cone and pinned to its init
-///   value → **frozen at 0** → the same spurious `Holds`. This is the packed 2-D
-///   `p_q[idx] <= d` case.
-///
-/// A **named** input or register is a cone leaf and stops the walk — the walk
-/// never descends into a register's `next` function, so a legitimate
-/// combinational function of a *named* register or a *named* input port
-/// (`ready = valid_i && state_q`) is NOT flagged. Callers REFUSE a property whose
-/// atom reaches an anonymous leaf (an honest, recoverable `unsupported` / skip)
-/// rather than emit the unsound verdict. Narrower than [`cone_reaches_input`],
-/// which fires on any (named) input too.
-pub fn cone_reaches_anonymous_leaf(
-    file: &Btor2File,
-    symbols: &HashMap<Nid, String>,
-    start: Nid,
-) -> bool {
+/// Deliberately narrower than [`cone_reaches_input`] (which fires on named ports
+/// too) AND narrower than the anonymous-*state* case: an anonymous split
+/// sub-*register* (the packed-2-D `q[idx] <= d` shape) is now KEPT and modelled by
+/// the NID-indexed cone-of-influence
+/// ([`crate::adapter::btor2::dep_graph::cone_leaf_nids`]), so that case DECIDES
+/// rather than being refused — only the genuinely havoc free-input case (which is
+/// an over-approximation the engines cannot soundly decide for all properties)
+/// trips this guard. A **named** input or any register cell stops the walk (the
+/// walk never descends into a register's `next`), so a legitimate combinational
+/// of a named port / register is not flagged.
+pub fn cone_reaches_anonymous_input(file: &Btor2File, start: Nid) -> bool {
     let mut seen: std::collections::HashSet<Nid> = std::collections::HashSet::new();
     let mut work: Vec<Nid> = vec![start];
     while let Some(nid) = work.pop() {
@@ -626,11 +616,9 @@ pub fn cone_reaches_anonymous_leaf(
             continue;
         };
         match &line.node {
-            // A symbol-less input (undriven-net havoc) or state cell (an anonymous
-            // split sub-register the symbol-keyed COI freezes) is the pathology.
-            Node::Input { .. } | Node::State { .. } if !symbols.contains_key(&nid) => return true,
-            // A NAMED input or register is a sound cone leaf — stop (never recurse
-            // into a register's `next`, which would reach inputs everywhere).
+            // A symbol-less input is the undriven-net (havoc) artifact.
+            Node::Input { symbol: None, .. } => return true,
+            // A named input, or ANY register cell, is a sound cone leaf — stop.
             Node::Input { .. } | Node::State { .. } | Node::Const { .. } | Node::Sort { .. } => {}
             Node::Op { args, .. } => {
                 for a in args {
@@ -653,21 +641,17 @@ pub fn cone_reaches_anonymous_leaf(
 }
 
 /// monono#partsel soundness guard — does the signal a property atom binds to
-/// `NAME` reach an anonymous leaf (an undriven free input, or an anonymous split
-/// sub-register the cone-of-influence freezes)?
+/// `NAME` reach an anonymous (undriven-register-bit) free input?
 ///
 /// Resolves `NAME` to its candidate binding node(s) — a `state` cell of that
 /// name, an `Op` carrying `NAME` as its own symbol (the `uext … 0 NAME`
 /// register-name alias Yosys emits), or a named `output` — and reports whether
-/// any of them [`cone_reaches_anonymous_leaf`]. A **faithful state cell** of
-/// `NAME` (read_verilog / sv2v lift) has a cone that is just the named state
-/// leaf, so this returns false — a real register is never flagged. It fires only
-/// for the broken partial-assignment lift, where `NAME` binds to a `concat` over
-/// the register's split-off anonymous cells (free-input bits and/or anonymous
-/// sub-registers).
-///
-/// See [`cone_reaches_anonymous_leaf`] for why refusing such a property is sound.
-pub fn signal_reaches_anonymous_leaf(file: &Btor2File, name: &str) -> bool {
+/// any of them [`cone_reaches_anonymous_input`]. A **faithful state cell** of
+/// `NAME` (read_verilog / sv2v lift), and an **anonymous split sub-register** the
+/// NID-indexed COI now keeps, both return false — only the plain-vector
+/// partial-write shape whose unwritten bits are modelled as free inputs is
+/// flagged.
+pub fn signal_reaches_anonymous_input(file: &Btor2File, name: &str) -> bool {
     let symbols = collect_symbols(file);
     file.lines.iter().any(|l| {
         let node = match &l.node {
@@ -681,7 +665,7 @@ pub fn signal_reaches_anonymous_leaf(file: &Btor2File, name: &str) -> bool {
             } if s == name => signal.nid(),
             _ => return false,
         };
-        cone_reaches_anonymous_leaf(file, &symbols, node)
+        cone_reaches_anonymous_input(file, node)
     })
 }
 
@@ -1278,10 +1262,10 @@ mod tests {
     }
 
     #[test]
-    fn cone_reaches_anonymous_leaf_ignores_named_ports() {
+    fn cone_reaches_anonymous_input_ignores_named_ports() {
         // monono#partsel — `anon` (nid 3) is an ANONYMOUS input (an undriven
         // register bit under the slang partial-assignment lift); `named` (nid 2) is
-        // a real port. `cone_reaches_anonymous_leaf` fires only for the anonymous
+        // a real port. `cone_reaches_anonymous_input` fires only for the anonymous
         // one — a legitimate combinational of a NAMED input must NOT be refused.
         let src = "1 sort bitvec 1\n\
                    2 input 1 named\n\
@@ -1292,21 +1276,20 @@ mod tests {
                    7 not 1 4 f_state\n\
                    8 next 1 4 4\n";
         let file = parse(src).expect("parse");
-        let syms = collect_symbols(&file);
         // Reaches an ANONYMOUS input.
         assert!(
-            cone_reaches_anonymous_leaf(&file, &syms, 6),
+            cone_reaches_anonymous_input(&file, 6),
             "f_anon reaches nid 3"
         );
         // Reaches only a NAMED input — not the pathology.
         assert!(
-            !cone_reaches_anonymous_leaf(&file, &syms, 5),
+            !cone_reaches_anonymous_input(&file, 5),
             "f_named reaches only the named port `named`"
         );
         // Reaches only a NAMED state.
         assert!(
-            !cone_reaches_anonymous_leaf(&file, &syms, 7),
-            "f_state reaches only the named register `q`"
+            !cone_reaches_anonymous_input(&file, 7),
+            "f_state reaches only the register `q`"
         );
         // But `cone_reaches_input` (the broad one) fires for BOTH input cases — the
         // narrower guard is what avoids over-refusing named-input combinationals.
@@ -1314,43 +1297,35 @@ mod tests {
     }
 
     #[test]
-    fn cone_reaches_anonymous_leaf_flags_anonymous_split_subregisters() {
-        // monono#partsel (packed 2-D `p[idx] <= d`) — the register `p` is split
-        // into ANONYMOUS `state` cells (nid 3, 4) whose width-16 name-alias the
-        // width filter drops; the symbol-keyed COI then freezes them. An atom over
-        // the reconstruction (nid 5) must be flagged even though NO input is in the
-        // cone.
+    fn cone_reaches_anonymous_input_ignores_anonymous_split_subregisters() {
+        // monono#partsel (packed 2-D `p[idx] <= d`) — `p` is split into ANONYMOUS
+        // `state` cells (nid 3, 4). The NID-indexed cone-of-influence now KEEPS
+        // those cells, so this case DECIDES rather than being refused: the
+        // input-only guard must NOT fire on a state-only reconstruction (no free
+        // input in the cone).
         let src = "1 sort bitvec 1\n\
                    2 sort bitvec 2\n\
                    3 state 1\n\
                    4 state 1\n\
                    5 concat 2 3 4\n\
                    6 uext 2 5 0 p\n\
-                   7 state 1 named\n\
-                   8 not 1 7 f_named_state\n\
                    9 next 1 3 3\n\
-                   10 next 1 4 4\n\
-                   11 next 1 7 7\n";
+                   10 next 1 4 4\n";
         let file = parse(src).expect("parse");
-        let syms = collect_symbols(&file);
-        // The reconstruction reaches the anonymous split sub-registers (nid 3, 4).
+        // Anonymous split sub-registers, NO input in the cone → not flagged.
         assert!(
-            cone_reaches_anonymous_leaf(&file, &syms, 5),
-            "the p reconstruction reaches anonymous split sub-registers"
+            !cone_reaches_anonymous_input(&file, 5),
+            "an anonymous-state split (no free input) is kept by the COI, not refused"
         );
-        // NO input in the cone — the broad `cone_reaches_input` does NOT fire, so
-        // only the anonymous-leaf guard catches this freeze mechanism.
         assert!(!cone_reaches_input(&file, 5));
-        // A combinational of a NAMED register is not flagged.
-        assert!(!cone_reaches_anonymous_leaf(&file, &syms, 8));
     }
 
     #[test]
-    fn signal_reaches_anonymous_leaf_via_alias_and_output() {
+    fn signal_reaches_anonymous_input_via_alias_and_output() {
         // A register `q` whose name is carried by a `uext … 0 q` alias over a concat
-        // that mixes an anonymous input (the partial-write shape) is flagged; a
-        // faithful state cell `r` is not. An output over the poisoned signal is
-        // flagged; an output over the faithful state is not.
+        // that mixes an anonymous INPUT (the plain-vector partial-write shape) is
+        // flagged; a faithful state cell `r` is not. An output over the poisoned
+        // signal is flagged; an output over the faithful state is not.
         let src = "1 sort bitvec 1\n\
                    2 input 1\n\
                    3 state 1 r\n\
@@ -1364,14 +1339,14 @@ mod tests {
                    11 next 1 3 3\n";
         let file = parse(src).expect("parse");
         assert!(
-            signal_reaches_anonymous_leaf(&file, "q"),
+            signal_reaches_anonymous_input(&file, "q"),
             "q aliases a concat mixing an anonymous input"
         );
         assert!(
-            !signal_reaches_anonymous_leaf(&file, "r"),
+            !signal_reaches_anonymous_input(&file, "r"),
             "r is a faithful state cell"
         );
-        assert!(signal_reaches_anonymous_leaf(&file, "q_out"));
-        assert!(!signal_reaches_anonymous_leaf(&file, "r_out"));
+        assert!(signal_reaches_anonymous_input(&file, "q_out"));
+        assert!(!signal_reaches_anonymous_input(&file, "r_out"));
     }
 }
