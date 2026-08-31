@@ -217,6 +217,16 @@ pub struct ModelDiagnostics {
     /// stub is an exact behavioral model of the flop datapath; auto-injection is
     /// reported here so it is never silent.
     pub auto_provided_stubs: Vec<String>,
+    /// #466 — the RTL front end that produced the lift (`SvFrontend::lift_label`,
+    /// e.g. `read_verilog + sv2v` / `yosys-slang (read_slang)`). `--frontend auto`
+    /// picks one silently; surfacing it (via the `lift-frontend` note) answers
+    /// "which lift produced this verdict?" — the two paths differ in SOUNDNESS on
+    /// partial writes (#464/#465), so a silent choice is the #459 failure class.
+    pub frontend: Option<String>,
+    /// #466 — when `--frontend auto` FELL BACK (an earlier front end errored before
+    /// the one used succeeded), the prior attempt's error. `None` when there was no
+    /// fallback (an explicit front end, or the first attempt succeeded).
+    pub frontend_fallback_reason: Option<String>,
 }
 
 /// Severity of a [`VerificationNote`] — how it bears on the verdict's trust.
@@ -436,6 +446,39 @@ fn build_notes(
             .into(),
         items: Vec::new(),
     });
+
+    // #466 — which RTL front end produced the lift. `--frontend auto` picks one
+    // silently, but read_verilog and yosys-slang differ in SOUNDNESS on partial
+    // writes (#464/#465), so naming it answers "which lift produced this verdict?".
+    // A fallback (read_verilog errored → slang) is a change of plan ⇒ ScopeCaveat.
+    if let Some(fe) = &d.frontend {
+        let (level, summary, detail) = match &d.frontend_fallback_reason {
+            Some(reason) => (
+                NoteLevel::ScopeCaveat,
+                format!("lift: {fe} — `--frontend auto` fell back ({reason})."),
+                "read_verilog and yosys-slang are NOT interchangeable for soundness (they differ on \
+                 partial register writes such as `q[hi:lo] <= d`), so an auto-fallback is reported \
+                 as a change of plan. Force a front end with `--frontend verilog|slang` to remove \
+                 the choice."
+                    .to_string(),
+            ),
+            None => (
+                NoteLevel::Info,
+                format!("lift: {fe}."),
+                "The RTL front end that produced this BTOR2. `--frontend auto` tries read_verilog \
+                 (+sv2v) first and falls back to yosys-slang on a lift error; the two paths are not \
+                 interchangeable for soundness. Force one with `--frontend verilog|slang`."
+                    .to_string(),
+            ),
+        };
+        notes.push(VerificationNote {
+            kind: "lift-frontend".into(),
+            level,
+            summary,
+            detail,
+            items: Vec::new(),
+        });
+    }
 
     // Config concretization (ScopeCaveat) — H.J.b; present only when the user
     // pinned config inputs to constants.
@@ -1768,6 +1811,11 @@ pub(crate) struct PreLift {
     pub blackboxed_modules: Vec<String>,
     /// Flop-primitive stubs auto-injected on the H.C re-lift (empty when none).
     pub auto_provided_stubs: Vec<String>,
+    /// The concrete front end that produced the BTOR2 (#466) — `Verilog`/`Slang`.
+    pub frontend_used: crate::adapter::yosys::SvFrontend,
+    /// `Some(reason)` when `--frontend auto` fell back after an earlier front end
+    /// errored (#466).
+    pub fallback_reason: Option<String>,
 }
 
 /// Run the SV → BTOR2 lift (yosys) with the `auto_stub_flops` re-lift. Pure function of
@@ -1787,27 +1835,26 @@ pub(crate) fn lift_sv(
     // 2. SV → flattened BTOR2. The lift reports modules it black-boxed (instantiated, no
     // body) — surfaced in `diagnostics.blackboxed_modules` so a cut FSM (the
     // `prim_sparse_fsm_flop`-class root cause) is visible, not silent.
-    let (mut btor2, mut blackboxed_modules) =
-        sv_to_btor2_with_blackboxes(primary_content, yosys_opts).map_err(|mut e| {
-            e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
-            e
-        })?;
+    let mut lift = sv_to_btor2_with_blackboxes(primary_content, yosys_opts).map_err(|mut e| {
+        e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
+        e
+    })?;
     // H.C — if the first lift cut a known flop primitive, inject a behavioral stub for it and
     // re-lift so the register survives (e.g. OpenTitan's `prim_sparse_fsm_flop`). Only stubs
     // ACTUALLY-cut modules (no collision with designs that provide their own body).
     let mut auto_provided_stubs = Vec::new();
     if opts.auto_stub_flops {
-        let stubs = crate::adapter::slang::prim_stubs::stubs_for_cut_modules(&blackboxed_modules);
+        let stubs =
+            crate::adapter::slang::prim_stubs::stubs_for_cut_modules(&lift.blackboxed_modules);
         if !stubs.is_empty() {
             let mut yopts2 = yosys_opts.clone();
             yopts2.additional_sources.extend(stubs.iter().cloned());
-            let (b2, bb2) =
-                sv_to_btor2_with_blackboxes(primary_content, &yopts2).map_err(|mut e| {
-                    e.message = format!("verify_auto: SV → BTOR2 (with flop stubs): {}", e.message);
-                    e
-                })?;
-            btor2 = b2;
-            blackboxed_modules = bb2;
+            // The re-lift produces the FINAL BTOR2, so its front-end/fallback info is
+            // the one to report (#466).
+            lift = sv_to_btor2_with_blackboxes(primary_content, &yopts2).map_err(|mut e| {
+                e.message = format!("verify_auto: SV → BTOR2 (with flop stubs): {}", e.message);
+                e
+            })?;
             auto_provided_stubs = stubs
                 .iter()
                 .map(|(name, _)| name.trim_end_matches(".sv").to_string())
@@ -1815,9 +1862,11 @@ pub(crate) fn lift_sv(
         }
     }
     Ok(PreLift {
-        btor2,
-        blackboxed_modules,
+        btor2: lift.btor2,
+        blackboxed_modules: lift.blackboxed_modules,
         auto_provided_stubs,
+        frontend_used: lift.frontend_used,
+        fallback_reason: lift.fallback_reason,
     })
 }
 
@@ -2005,9 +2054,15 @@ pub(crate) fn prepare_model(
         mut btor2,
         blackboxed_modules,
         auto_provided_stubs,
+        frontend_used,
+        fallback_reason,
     } = lift_sv(sources, yosys_opts, opts)?;
     report.diagnostics.blackboxed_modules = blackboxed_modules;
     report.diagnostics.auto_provided_stubs = auto_provided_stubs;
+    // #466 — record which RTL front end produced this lift (and any auto-fallback)
+    // so verify-auto can report it (the `lift-frontend` note in `build_notes`).
+    report.diagnostics.frontend = Some(frontend_used.lift_label().to_string());
+    report.diagnostics.frontend_fallback_reason = fallback_reason;
 
     // Structural reset auto-pin: when gating is on but no `disable iff` guard was recognized, detect
     // the async-reset input from the lifted BTOR2's reset-mux structure and pin it inactive (else a
@@ -4288,6 +4343,7 @@ module uart_tx(); endmodule"#;
                 blackboxed_modules: vec!["prim_sparse_fsm_flop".into()],
                 gated_resets: vec!["rst_ni=1".into()],
                 auto_provided_stubs: vec!["prim_flop".into()],
+                ..Default::default()
             },
             notes: Vec::new(),
         };
@@ -4367,6 +4423,57 @@ module uart_tx(); endmodule"#;
     }
 
     #[test]
+    fn build_notes_reports_lift_frontend() {
+        // #466 — verify-auto names the RTL front end that produced the lift: Info
+        // when there was no fallback, ScopeCaveat + the reason when `--frontend auto`
+        // fell back (read_verilog errored → slang), and no note when unrecorded.
+        let base = |frontend: Option<&str>, fallback: Option<&str>| AutoVerifyReport {
+            properties: Vec::new(),
+            unsupported: Vec::new(),
+            diagnostics: ModelDiagnostics {
+                frontend: frontend.map(String::from),
+                frontend_fallback_reason: fallback.map(String::from),
+                ..Default::default()
+            },
+            notes: Vec::new(),
+        };
+        let note_of = |r: &AutoVerifyReport| {
+            build_notes(
+                r,
+                MustEdgeInference::Off,
+                &[],
+                &[],
+                &[],
+                &[],
+                &NotePosture::Cube,
+            )
+            .into_iter()
+            .find(|n| n.kind == "lift-frontend")
+        };
+
+        // No fallback → Info note naming the front end.
+        let n = note_of(&base(Some("read_verilog + sv2v"), None)).expect("lift-frontend note");
+        assert_eq!(n.level, NoteLevel::Info);
+        assert!(n.summary.contains("read_verilog + sv2v"), "{}", n.summary);
+
+        // Fallback → ScopeCaveat naming the front end + why the prior one fell back.
+        let n = note_of(&base(
+            Some("yosys-slang (read_slang)"),
+            Some("read_verilog + sv2v failed: parse error at x.sv:21"),
+        ))
+        .expect("lift-frontend note");
+        assert_eq!(n.level, NoteLevel::ScopeCaveat);
+        assert!(
+            n.summary.contains("fell back") && n.summary.contains("yosys-slang"),
+            "{}",
+            n.summary
+        );
+
+        // No front end recorded (a non-lift path) → no note.
+        assert!(note_of(&base(None, None)).is_none());
+    }
+
+    #[test]
     fn control_slice_note_present_when_cutpoints_given() {
         // The control-slice note is a ScopeCaveat present iff nets were cut, carrying
         // the cut list and the over-approximation posture. It documents that a HOLDS
@@ -4386,6 +4493,7 @@ module uart_tx(); endmodule"#;
                 blackboxed_modules: Vec::new(),
                 gated_resets: Vec::new(),
                 auto_provided_stubs: Vec::new(),
+                ..Default::default()
             },
             notes: Vec::new(),
         };
@@ -4437,6 +4545,7 @@ module uart_tx(); endmodule"#;
                 blackboxed_modules: Vec::new(),
                 gated_resets: Vec::new(),
                 auto_provided_stubs: Vec::new(),
+                ..Default::default()
             },
             notes: Vec::new(),
         };
@@ -4993,6 +5102,7 @@ module uart_tx(); endmodule"#;
             blackboxed_modules: vec!["prim_sparse_fsm_flop".to_string()],
             gated_resets: Vec::new(),
             auto_provided_stubs: Vec::new(),
+            ..Default::default()
         };
         let reason = unseedable_skip_reason(&["state_q == 41".to_string()], &diag);
         assert!(reason.contains("state_q == 41"), "carries the symptom");
@@ -5013,6 +5123,7 @@ module uart_tx(); endmodule"#;
             blackboxed_modules: Vec::new(),
             gated_resets: Vec::new(),
             auto_provided_stubs: Vec::new(),
+            ..Default::default()
         };
         let reason = unseedable_skip_reason(&["foo == 1".to_string()], &diag);
         assert!(
@@ -5029,6 +5140,7 @@ module uart_tx(); endmodule"#;
             blackboxed_modules: Vec::new(),
             gated_resets: Vec::new(),
             auto_provided_stubs: Vec::new(),
+            ..Default::default()
         };
         let reason = unseedable_skip_reason(&["gnt_o != 0".to_string()], &diag);
         assert!(reason.contains("gnt_o != 0"));
@@ -6357,8 +6469,9 @@ endmodule
         // The SAME BTOR2 verify_auto evaluates: single module, no `disable iff`
         // ⇒ no flop stubs / shadows / reset pins, so the lift output is the
         // model under test.
-        let (btor2, _bb) =
-            crate::adapter::yosys::sv_to_btor2_with_blackboxes(sv, &yopts).expect("sv → btor2");
+        let btor2 = crate::adapter::yosys::sv_to_btor2_with_blackboxes(sv, &yopts)
+            .expect("sv → btor2")
+            .btor2;
         let file = crate::adapter::btor2::parser::parse(&btor2).expect("parse lifted btor2");
 
         let trit_of = |o: &VerifyOutcome| match o {
@@ -6496,9 +6609,9 @@ endmodule
         );
 
         // Lift the base BTOR2 + pin the SAME resets verify_auto pinned.
-        let (btor2, _bb) =
-            crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
-                .expect("sv → btor2");
+        let btor2 = crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
+            .expect("sv → btor2")
+            .btor2;
         let pins: Vec<(String, u64)> = report
             .diagnostics
             .gated_resets
@@ -6985,9 +7098,9 @@ endmodule
         );
 
         // Lift the base BTOR2 + pin the SAME resets verify_auto pinned.
-        let (btor2, _bb) =
-            crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
-                .expect("sv → btor2");
+        let btor2 = crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
+            .expect("sv → btor2")
+            .btor2;
         let pins: Vec<(String, u64)> = report
             .diagnostics
             .gated_resets
@@ -7226,6 +7339,55 @@ endmodule
     /// over-refuse the faithful lift. Together these pin the fix (no silent HOLDS),
     /// its precision (the good path still decides), and the COI fix (packed-2-D now
     /// decides on slang instead of being frozen).
+    /// #466 — the `lift-frontend` note names the RTL front end that produced the
+    /// verdicts, end-to-end. Forced `read_verilog` → the note says `read_verilog`
+    /// (Info, no fallback); forced `slang` → the note says `yosys-slang`.
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys (mununu-sva image)"]
+    fn e2e_verify_auto_reports_lift_frontend() {
+        use crate::adapter::yosys::SvFrontend;
+        const DESIGN: &str = "// @mununu_guarantee nu X. ((q == 0) and [] X)\n\
+             module m(input logic clk, input logic rst_n, input logic [3:0] d,\n\
+                      output logic [3:0] q);\n\
+               always_ff @(posedge clk or negedge rst_n)\n\
+                 if (!rst_n) q <= '0; else q <= d;\n\
+             endmodule\n";
+        let sources = vec![("m.sv".to_string(), DESIGN.to_string())];
+        let cfg = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("rst_n".to_string(), 1u64);
+            m
+        };
+        let run = |frontend: SvFrontend| {
+            verify_auto(
+                &sources,
+                &YosysOptions {
+                    top: Some("m".to_string()),
+                    use_sv2v: matches!(frontend, SvFrontend::Verilog),
+                    frontend,
+                    ..Default::default()
+                },
+                &VerifyAutoOptions {
+                    config_values: cfg.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect("verify_auto runs")
+        };
+        let note = |r: &AutoVerifyReport| {
+            r.notes
+                .iter()
+                .find(|n| n.kind == "lift-frontend")
+                .unwrap_or_else(|| panic!("lift-frontend note present; got {:?}", r.notes))
+                .clone()
+        };
+        let v = note(&run(SvFrontend::Verilog));
+        assert_eq!(v.level, NoteLevel::Info);
+        assert!(v.summary.contains("read_verilog"), "{}", v.summary);
+        let s = note(&run(SvFrontend::Slang));
+        assert!(s.summary.contains("yosys-slang"), "{}", s.summary);
+    }
+
     #[test]
     #[ignore = "requires slang + sv2v + yosys (mununu-sva image)"]
     fn e2e_partsel_partial_write_refused_on_slang_decided_on_sv2v() {

@@ -80,6 +80,18 @@ pub enum SvFrontend {
     Slang,
 }
 
+impl SvFrontend {
+    /// Human-readable lift label for diagnostics (the `lift-frontend` note, #466).
+    /// `Auto` is a request, not an outcome — a resolved lift is always `Verilog`/`Slang`.
+    pub fn lift_label(self) -> &'static str {
+        match self {
+            SvFrontend::Slang => "yosys-slang (read_slang)",
+            SvFrontend::Verilog => "read_verilog + sv2v",
+            SvFrontend::Auto => "auto",
+        }
+    }
+}
+
 /// Yosys-specific options.
 #[derive(Debug, Clone, Default)]
 pub struct YosysOptions {
@@ -284,6 +296,12 @@ struct SvFlattenArtifacts {
     btor2: String,
     hier_json: String,
     staged_primary: String,
+    /// The concrete front end that produced this BTOR2 (`Verilog`/`Slang`, never
+    /// `Auto`) — surfaced by verify-auto's `lift-frontend` note (#466).
+    frontend_used: SvFrontend,
+    /// When `Auto` fell back (an earlier front end errored before this one
+    /// succeeded), the prior attempt's error — else `None`. (#466)
+    fallback_reason: Option<String>,
 }
 
 /// Run sv2v (optional) + the flattened Yosys script and return the
@@ -408,16 +426,26 @@ fn run_sv_flatten_btor2(
     let prefer_slang = std::env::var("MUNUNU_YOSYS_FRONTEND")
         .map(|v| v.eq_ignore_ascii_case("slang"))
         .unwrap_or(false);
-    let mut last_err = None;
+    // Track the prior failed attempt so a successful FALLBACK can name what it fell
+    // back from + why (#466) — a silent front-end swap is the #459 failure class.
+    let mut prior: Option<(SvFrontend, AdapterError)> = None;
     for fe in frontend_attempt_order(slang_ok, prefer_slang) {
         let mut y = yopts.clone();
         y.frontend = fe;
         match run_sv_flatten_btor2_concrete(content, &y) {
-            Ok(a) => return Ok(a),
-            Err(e) => last_err = Some(e),
+            Ok(mut a) => {
+                if let Some((prior_fe, e)) = prior {
+                    a.fallback_reason =
+                        Some(format!("{} failed: {}", prior_fe.lift_label(), e.message));
+                }
+                return Ok(a);
+            }
+            Err(e) => prior = Some((fe, e)),
         }
     }
-    Err(last_err.expect("Auto frontend has at least the Verilog attempt"))
+    Err(prior
+        .map(|(_, e)| e)
+        .expect("Auto frontend has at least the Verilog attempt"))
 }
 
 /// The ordered concrete frontends an [`SvFrontend::Auto`] lift attempts (P1.1 fallback). The
@@ -486,6 +514,14 @@ fn run_sv_flatten_btor2_concrete(
         })?),
         SvFrontend::Verilog => None,
         SvFrontend::Auto => slang_frontend_selection(),
+    };
+    // The concrete front end this lift resolved to (#466). `Auto` is never seen here
+    // for the fallback loop (it sets a concrete `fe` per attempt); directly-called
+    // `Auto` resolves via the plugin presence above.
+    let frontend_used = if slang_plugin.is_some() {
+        SvFrontend::Slang
+    } else {
+        SvFrontend::Verilog
     };
     if yopts.use_sv2v && slang_plugin.is_none() {
         let sv2v = locate_sv2v()?;
@@ -587,6 +623,8 @@ fn run_sv_flatten_btor2_concrete(
         btor2,
         hier_json,
         staged_primary: primary.to_string_lossy().into_owned(),
+        frontend_used,
+        fallback_reason: None,
     })
 }
 
@@ -648,6 +686,7 @@ pub fn translate_sv(
         btor2: btor,
         hier_json,
         staged_primary,
+        ..
     } = run_sv_flatten_btor2(content, yopts)?;
 
     // Document B task B1: capture the top module's port directions
@@ -756,7 +795,7 @@ pub fn sv_to_btor2(content: &str, yopts: &YosysOptions) -> Result<String, Adapte
 pub fn sv_to_btor2_with_blackboxes(
     content: &str,
     yopts: &YosysOptions,
-) -> Result<(String, Vec<String>), AdapterError> {
+) -> Result<SvLiftResult, AdapterError> {
     let artifacts = run_sv_flatten_btor2(content, yopts)?;
     let mut names: std::collections::BTreeSet<String> =
         parse_blackbox_modules(&artifacts.hier_json)
@@ -764,7 +803,24 @@ pub fn sv_to_btor2_with_blackboxes(
             .map(|b| b.name)
             .collect();
     names.extend(parse_undefined_module_cells(&artifacts.hier_json));
-    Ok((artifacts.btor2, names.into_iter().collect()))
+    Ok(SvLiftResult {
+        btor2: artifacts.btor2,
+        blackboxed_modules: names.into_iter().collect(),
+        frontend_used: artifacts.frontend_used,
+        fallback_reason: artifacts.fallback_reason,
+    })
+}
+
+/// The SV → BTOR2 lift result: the BTOR2 text, the modules the lift could not
+/// model (blackboxed / undefined cells), and — for `--frontend auto` — which
+/// concrete front end produced it and whether it was a fallback (#466).
+pub struct SvLiftResult {
+    pub btor2: String,
+    pub blackboxed_modules: Vec<String>,
+    /// The concrete front end used (`Verilog`/`Slang`, never `Auto`).
+    pub frontend_used: SvFrontend,
+    /// `Some(reason)` when `Auto` fell back after an earlier front end errored.
+    pub fallback_reason: Option<String>,
 }
 
 /// Scan the pre-flatten hierarchy JSON for cells whose `type` references a

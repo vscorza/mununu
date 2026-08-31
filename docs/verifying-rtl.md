@@ -211,11 +211,20 @@ the yosys-slang `read_slang` plugin is present — `MUNUNU_YOSYS_SLANG_PLUGIN`, 
 `share/yosys/plugins/slang.so`) to lift the RTL with `read_slang` (a complete SV front-end) instead.
 It reads the RTL **only** (`--ignore-assertions` — SVA is extracted separately, so nothing is lost)
 and names named registers/ports **identically** to `read_verilog`, so cutpoints / `--config-value` /
-atoms resolve unchanged. Opt-in; a fallback-on-parse-failure default is future work. *(Example: the
-`xgate` coprocessor, whose RISC core has a rejected `while` loop, is black-boxed under `read_verilog`
-but lifts its full 125-register core under `read_slang`.)*
+atoms resolve unchanged. *(Example: the `xgate` coprocessor, whose RISC core has a rejected `while`
+loop, is black-boxed under `read_verilog` but lifts its full 125-register core under `read_slang`.)*
+
+The default `--frontend auto` tries `read_verilog` (+sv2v) first and **falls back to `read_slang`**
+on a lift error (`MUNUNU_YOSYS_FRONTEND=slang` flips the preference). The two paths are **not
+interchangeable for soundness** — `read_slang` and `read_verilog` model a *partial* register write
+(`q[hi:lo] <= d` / `q[idx] <= d`) differently (see the partial-write refusal / cone fix), so a silent
+choice between them can be green about a different question than the one asked. Verify-auto therefore
+**reports which front end produced the verdicts** as a `lift-frontend` note — Info when there was no
+choice, and a **ScopeCaveat naming the fallback reason** when `auto` fell back. Note also that SVA in
+a `bind`-ed file cannot be parsed by `read_verilog`, so `auto` **always** ends on slang there.
 
 > Source of truth: [`slang_frontend_selection`](../crates/mununu-core/src/adapter/yosys/mod.rs#L1672) — surface: (CLI+API+UI)
+> Source of truth: [`SvFrontend::lift_label`](../crates/mununu-core/src/adapter/yosys/mod.rs) + the `lift-frontend` note in [`build_notes`](../crates/mununu-core/src/adapter/slang/verify_auto.rs) — surface: (CLI+API+UI)
 
 ### 2. Properties come from the module's own assertions
 
