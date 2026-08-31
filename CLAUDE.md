@@ -461,3 +461,7 @@ Reference and how-to material — read when the task calls for it, not on every 
 | Variable | Purpose |
 |---|---|
 | `RUST_LOG=mununu=info` | Enable logging |
+| `MUNUNU_BDD_MAX_BITS` | Exact-symbolic engine **bit cap** — max register+input bits in the property cone before it abstains (`abstained on the BIT CAP`). Raise for a wider cone. |
+| `MUNUNU_BDD_ARENA_NODES` | Exact-symbolic engine **node budget** — the OxiDD arena size, which scales the live-BDD-node budget before it abstains (`abstained on the NODE budget`). Raise (e.g. 4×) for a cone that does not compress. |
+| `MUNUNU_BDD_ITER_BUDGET` | Exact-symbolic engine **fixpoint iteration budget** — the μ/ν pre-image step cap before it abstains (`abstained on the ITERATION budget`) on a large reachable diameter. |
+| `MUNUNU_BDD_TIME_BUDGET_MS` | Exact-symbolic engine **wall-clock budget** for the fixpoint (default `10000`; `0` disables) before it abstains (`abstained on the WALL-CLOCK budget`). |
