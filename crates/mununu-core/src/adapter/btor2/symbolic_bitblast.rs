@@ -7968,7 +7968,9 @@ mod tests {
             use_sv2v: true,
             ..Default::default()
         };
-        let (btor2, _bb) = sv_to_btor2_with_blackboxes(&sv, &yopts).expect("extract uart_tx");
+        let btor2 = sv_to_btor2_with_blackboxes(&sv, &yopts)
+            .expect("extract uart_tx")
+            .btor2;
         let verdict = |f: &str| -> ExactVerdict {
             let ff = crate::mu_calculus::parser::parse(f).expect("formula parses");
             exact_symbolic_verdict(&btor2, &ff).expect("definite verdict, binds")
