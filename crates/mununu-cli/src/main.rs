@@ -5784,7 +5784,12 @@ fn sv_mutate(args: SvMutateArgs) -> Result<(), String> {
         let t = list_targets(&btor2)?;
         let summary = serde_json::json!({
             "file": file,
-            "targets": { "stick": t.stick, "drop_reset": t.drop_reset },
+            "targets": {
+                "stick": t.stick,
+                "drop_reset": t.drop_reset,
+                "off_by_one": t.off_by_one,
+                "invert_cond": t.invert_cond,
+            },
         });
         print_json_summary(&summary)?;
         return Ok(());

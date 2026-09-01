@@ -1449,6 +1449,8 @@ fn sv_mutate_handler_impl(request: SvMutateRequest) -> ApiResult<Json<SvMutateRe
             targets: Some(SvMutateTargets {
                 stick: t.stick,
                 drop_reset: t.drop_reset,
+                off_by_one: t.off_by_one,
+                invert_cond: t.invert_cond,
             }),
             properties: Vec::new(),
             flipped: 0,

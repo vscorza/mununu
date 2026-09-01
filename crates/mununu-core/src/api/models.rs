@@ -1398,6 +1398,10 @@ pub struct SvMutateTargets {
     pub stick: Vec<String>,
     /// Every named register whose next is a reset mux — a `drop-reset:<reg>` target.
     pub drop_reset: Vec<String>,
+    /// Every named register compared against a constant — an `off-by-one:<reg>` target.
+    pub off_by_one: Vec<String>,
+    /// Every named 1-bit signal — an `invert-cond:<sig>` target.
+    pub invert_cond: Vec<String>,
 }
 
 /// One property's baseline-vs-mutant verdict in a [`SvMutateResponse`].

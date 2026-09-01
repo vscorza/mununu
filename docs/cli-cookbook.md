@@ -131,4 +131,12 @@ mununu sv mutate rtl/counter.sv --mutation stick:cnt --engine exact-symbolic
 mununu sv mutate rtl/fsm.sv --mutation drop-reset:state_q --no-gate-reset --engine exact-symbolic
 ```
 
-The mutation catalog is `stick:<reg>` (freeze a register at its reset value) and `drop-reset:<reg>` (remove a register's reset arm). A mutation caught by no property maps to the `violated` CI verdict (`--fail-on none` makes it advisory); a mutation that names a missing register or does not apply is a hard error, never a silent no-op.
+The mutation catalog is `stick:<reg>` (freeze a register at its reset value), `drop-reset:<reg>` (remove a register's reset arm), `off-by-one:<reg>[@<const_nid>][:±1]` (perturb a comparison bound the register is checked against, e.g. `cnt < 8` → `cnt < 9`), and `invert-cond:<sig>` (invert a named 1-bit guard at every use site). `sv mutate --list` enumerates all four target classes. A mutation caught by no property maps to the `violated` CI verdict (`--fail-on none` makes it advisory); a mutation that names a missing register or does not apply is a hard error, never a silent no-op.
+
+```bash
+# Perturb a threshold and re-verify:
+mununu sv mutate rtl/counter.sv --mutation off-by-one:cnt --engine exact-symbolic
+
+# Invert a named guard:
+mununu sv mutate rtl/fsm.sv --mutation invert-cond:ready --engine exact-symbolic
+```

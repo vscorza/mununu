@@ -384,13 +384,26 @@ This is a statement about the **properties**, never a bug report about the desig
 (see [`policies/claims-integrity.md`](policies/claims-integrity.md) §2) — a mutation is
 a deliberately-injected fault, not a discovered one.
 
-The mutation catalog (structural, no source-line targeting needed):
+The mutation catalog — two **structural** (no targeting) and two **targeted** (a
+named-signal + structural-cone resolution, never a source line, which the sv2v lift
+does not preserve):
 
 - **`stick:<reg>`** — freeze a register at its reset value (`next(reg) := reg`).
   Universal; flips any property that depends on the register progressing.
 - **`drop-reset:<reg>`** — remove a register's reset arm (rewrite its reset mux
   `ite(rst, RESET, d)` to the data branch `d`). Flips a reset-dependent property;
   needs the reset **free** (`--no-gate-reset`) to have effect.
+- **`off-by-one:<reg>[@<const_nid>][:±1]`** — perturb by ±1 the constant a register
+  is compared against (`cnt < 8` → `cnt < 9`); the classic boundary fault. The bound
+  is found by walking the comparison cone in the register's fanout; when the register
+  is compared against more than one constant the error lists the candidates and
+  `@<const_nid>` disambiguates. Default delta `+1`.
+- **`invert-cond:<sig>`** — invert a named **1-bit** condition at every use site
+  (flip the polarity of every operand referencing it, via BTOR2's `-N` bit-not
+  shorthand). Flips a property whose truth depends on the guard's polarity.
+
+`sv mutate --list` enumerates all four target classes (`stick` / `drop_reset` /
+`off_by_one` / `invert_cond`).
 
 ```bash
 mununu sv mutate counter.sv --mutation stick:cnt --engine exact-symbolic   # exit 2 ⇒ no property caught it
