@@ -1480,6 +1480,13 @@ enum SvCommand {
     /// gate — surfaced in ~0.1 s before the minutes-long verify. Read-only, changes
     /// no verdict. Surface peer of `POST /api/v1/sv/lint`.
     Lint(SvLintArgs),
+    /// Apply a NAMED structural mutation to the design and re-verify, checking that
+    /// the property verdicts FLIP (property adequacy). A flip confirms a property
+    /// constrains the mutated behaviour; a property that does NOT flip is the
+    /// finding — the spec is vacuous w.r.t. that fault. `--list` enumerates the
+    /// available targets. This is a statement about the PROPERTIES, never a bug
+    /// report about the design. Surface peer of `POST /api/v1/sv/mutate`.
+    Mutate(SvMutateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1941,6 +1948,33 @@ struct SvCheckFsmArgs {
 struct SvLintArgs {
     #[command(flatten)]
     lift: SvLiftArgs,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu sv mutate` — apply a named structural mutation + re-verify.
+#[derive(Args, Debug)]
+struct SvMutateArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// The mutation to apply: `stick:<reg>` (freeze a register) or
+    /// `drop-reset:<reg>` (remove a register's reset arm). Required unless `--list`.
+    #[arg(long, value_name = "stick:REG|drop-reset:REG")]
+    mutation: Option<String>,
+    /// Instead of mutating, list the available mutation TARGETS of the design
+    /// (every register → `stick`; every reset-mux register → `drop-reset`).
+    #[arg(long)]
+    list: bool,
+    /// Verification engine for the baseline + mutant runs (as `sv verify-auto`).
+    #[arg(long, value_enum, default_value_t = EngineArg::PortfolioSequential)]
+    engine: EngineArg,
+    /// Disable reset-gating (keep the reset a free input). Default: reset-gated.
+    #[arg(long)]
+    no_gate_reset: bool,
+    /// Must-edge inference — `smt-hyper-must` gives sound νμ verdicts (needed for a
+    /// recoverability property to flip under `drop-reset`). Default `off`.
+    #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
+    must_edge_inference: MustEdgeInferenceArg,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -3600,6 +3634,8 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         rescue_bottom_safety: !args.no_rescue,
         rescue_bottom_liveness: !args.no_rescue,
         rescue_bottom_recoverability: !args.no_rescue,
+        // `sv verify-auto` verifies the design as-lifted; mutation is the `sv mutate` verb's job.
+        mutation: None,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)
@@ -5444,6 +5480,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
         SvCommand::CheckFsm(args) => sv_check_fsm(args),
         SvCommand::Lint(args) => sv_lint(args),
+        SvCommand::Mutate(args) => sv_mutate(args),
     }
 }
 
@@ -5701,6 +5738,111 @@ fn sv_lint(args: SvLintArgs) -> Result<(), String> {
     // A finding is the lint's `violated`; a clean run is `holds`. Reuses the shared
     // CI gate so `--fail-on {violated|unknown|none}` behaves like the verify verbs.
     let worst = if findings.is_empty() {
+        "holds"
+    } else {
+        "violated"
+    };
+    ci_gate_exit(worst, args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu sv mutate` — apply a named structural mutation + re-verify, checking the
+/// property verdicts flip (property adequacy), or (`--list`) enumerate the targets.
+/// A mutation caught by NO property maps to the `violated` CI verdict (a coverage
+/// gap), so the default `--fail-on violated` fails the build; `--fail-on none` is
+/// advisory. A `--list` run always exits 0.
+fn sv_mutate(args: SvMutateArgs) -> Result<(), String> {
+    use mununu_core::adapter::btor2::kmts_lift::MustEdgeInference;
+    use mununu_core::adapter::btor2::mutate::{Mutation, list_targets};
+    use mununu_core::adapter::slang::verify_auto::{
+        PortfolioMode, VerifyAutoOptions, mutate_and_compare,
+    };
+    use mununu_core::adapter::yosys::{YosysOptions, sv_to_btor2};
+
+    let file = args.lift.primary_display();
+    let lift = read_sv_lift(&args.lift)?;
+    let primary_name = std::path::Path::new(&file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "top.sv".to_string());
+    let mut sources: Vec<(String, String)> = vec![(primary_name, lift.source.clone())];
+    sources.extend(lift.additional_sources.iter().cloned());
+    let yopts = YosysOptions {
+        top: lift.top.clone(),
+        additional_sources: lift.additional_sources.clone(),
+        use_sv2v: lift.use_sv2v,
+        extra_include_dirs: lift.include_dirs.clone(),
+        frontend: lift.frontend,
+        ..Default::default()
+    };
+
+    // `--list` — lift once and enumerate the mutation targets (no verification).
+    if args.list {
+        let btor2 = sv_to_btor2(&lift.source, &yopts)
+            .map_err(|e| format!("sv mutate --list: {}", e.message))?;
+        let t = list_targets(&btor2)?;
+        let summary = serde_json::json!({
+            "file": file,
+            "targets": { "stick": t.stick, "drop_reset": t.drop_reset },
+        });
+        print_json_summary(&summary)?;
+        return Ok(());
+    }
+
+    let spec = args.mutation.as_deref().ok_or_else(|| {
+        "sv mutate: --mutation is required (or use --list to discover targets); \
+         expected `stick:<reg>` or `drop-reset:<reg>`"
+            .to_string()
+    })?;
+    let mutation = Mutation::parse(spec)?;
+
+    let must_edge_inference = match args.must_edge_inference {
+        MustEdgeInferenceArg::Off => MustEdgeInference::Off,
+        MustEdgeInferenceArg::SmtPerTarget => MustEdgeInference::SmtPerTarget,
+        MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
+        MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
+    };
+    let opts = VerifyAutoOptions {
+        must_edge_inference,
+        gate_reset: !args.no_gate_reset,
+        symbolic_engine: args.engine == EngineArg::Symbolic,
+        exact_symbolic: args.engine == EngineArg::ExactSymbolic,
+        portfolio: match args.engine {
+            EngineArg::PortfolioSequential => Some(PortfolioMode::Sequential),
+            EngineArg::PortfolioParallel => Some(PortfolioMode::Parallel),
+            _ => None,
+        },
+        ..Default::default()
+    };
+
+    let report = mutate_and_compare(&sources, &yopts, &opts, mutation)
+        .map_err(|e| format!("sv mutate: {}", e.message))?;
+
+    let properties: Vec<serde_json::Value> = report
+        .properties
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "baseline": p.baseline,
+                "mutant": p.mutant,
+                "flipped": p.flipped,
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "file": file,
+        "mutation": report.mutation,
+        "flipped": report.flipped,
+        "unflipped": report.unflipped,
+        "properties": properties,
+    });
+    print_json_summary(&summary)?;
+
+    // A mutation caught by at least one property (some flip) is `holds`; a mutation
+    // NO property catches is `violated` (a coverage gap the CI gate should flag).
+    let worst = if report.flipped > 0 {
         "holds"
     } else {
         "violated"

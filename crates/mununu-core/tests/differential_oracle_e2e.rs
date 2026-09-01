@@ -1711,3 +1711,68 @@ fn e2e_reach_rescue_reducibility_census() {
         "==================================================================================\n"
     );
 }
+
+// ── #468 sv mutate — the end-to-end flip oracle ────────────────────────────────
+// A free-running 2-bit counter (`cnt`: 0→1→2→3→0 …). The recoverability property
+// `AG EF (cnt == 3)` HOLDS on the design as-lifted (from every reachable state the
+// counter cycles back through 3). A `stick:cnt` mutation freezes `cnt` at its reset
+// value 0 → `cnt == 3` is unreachable → the property FLIPS to Violated. This is the
+// property-adequacy signal `sv mutate` reports: the property genuinely constrains the
+// counter's progress, so the injected fault is caught. Exercises the whole seam:
+// VerifyAutoOptions.mutation → prepare_model → mutate::apply_mutation → verify → diff.
+const COUNTER3_SV: &str = r#"module counter3 (
+  input  logic       clk_i,
+  input  logic       rst_ni,
+  output logic [1:0] cnt_o
+);
+  logic [1:0] cnt;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) cnt <= 2'd0;
+    else         cnt <= cnt + 2'd1;
+  end
+  assign cnt_o = cnt;
+endmodule
+"#;
+
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn e2e_sv_mutate_stick_flips_recoverability() {
+    use mununu_core::adapter::btor2::mutate::Mutation;
+    use mununu_core::adapter::slang::verify_auto::mutate_and_compare;
+
+    let src = format!(
+        "// @mununu_guarantee nu Y. ((mu X. ((cnt == 3) or <> X)) and [] Y)\n{COUNTER3_SV}"
+    );
+    let sources = [("counter3.sv".to_string(), src)];
+    let yopts = YosysOptions {
+        top: Some("counter3".to_string()),
+        use_sv2v: true,
+        ..Default::default()
+    };
+    let base_opts = VerifyAutoOptions {
+        exact_symbolic: true,
+        config_values: [("rst_ni".to_string(), 1u64)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let report = mutate_and_compare(&sources, &yopts, &base_opts, Mutation::Stick("cnt".into()))
+        .expect("mutate_and_compare runs the baseline + mutant lifts");
+
+    assert_eq!(report.mutation, "stick:cnt");
+    let flip = report
+        .properties
+        .iter()
+        .find(|p| p.baseline == "holds")
+        .expect("the recoverability property holds at baseline");
+    assert!(
+        flip.flipped && flip.mutant == "violated",
+        "freezing cnt must FLIP AG EF(cnt==3) holds→violated (cnt stuck at 0 never reaches 3); \
+         got baseline={} mutant={}",
+        flip.baseline,
+        flip.mutant
+    );
+    assert!(
+        report.flipped >= 1,
+        "the mutation must be caught by ≥1 property"
+    );
+}

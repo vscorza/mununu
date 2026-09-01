@@ -1349,6 +1349,85 @@ pub struct SvLintResponse {
     pub findings: Vec<SvLintFinding>,
 }
 
+/// Request for `POST /api/v1/sv/mutate` (#468) — apply a NAMED structural mutation
+/// and re-verify to check the property verdicts flip (property adequacy). Surface
+/// peer of the CLI `mununu sv mutate`.
+#[derive(Debug, Deserialize)]
+pub struct SvMutateRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
+    /// The mutation to apply: `"stick:<reg>"` (freeze a register) or
+    /// `"drop-reset:<reg>"` (remove a register's reset arm). Required unless
+    /// `list` is true.
+    #[serde(default)]
+    pub mutation: Option<String>,
+    /// When true, ignore `mutation` and return the available mutation TARGETS
+    /// (the `--list` discovery mode) instead of running a mutation.
+    #[serde(default)]
+    pub list: bool,
+    /// Engine selector (as `verify-auto`): `"explicit"` | `"symbolic"` |
+    /// `"exact-symbolic"` | `"portfolio-sequential"` | `"portfolio-parallel"`.
+    /// Default (unspecified) ⇒ `portfolio-sequential`.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Reset-gating (pin the reset inactive + inject the post-reset init). Default `true`.
+    #[serde(default)]
+    pub gate_reset: Option<bool>,
+    /// Must-edge inference (`"smt-hyper-must"` gives sound νμ verdicts for a
+    /// recoverability property under `drop-reset`). Default off.
+    #[serde(default)]
+    pub must_edge_inference: Option<String>,
+}
+
+/// The mutation targets available in a design (the `list` response payload).
+#[derive(Debug, Serialize)]
+pub struct SvMutateTargets {
+    /// Every named register — a `stick:<reg>` target.
+    pub stick: Vec<String>,
+    /// Every named register whose next is a reset mux — a `drop-reset:<reg>` target.
+    pub drop_reset: Vec<String>,
+}
+
+/// One property's baseline-vs-mutant verdict in a [`SvMutateResponse`].
+#[derive(Debug, Serialize)]
+pub struct SvMutatePropertyFlip {
+    /// The property (assertion) name.
+    pub name: String,
+    /// Canonical verdict on the design as-lifted.
+    pub baseline: String,
+    /// Canonical verdict on the mutated design.
+    pub mutant: String,
+    /// `baseline != mutant` — the mutation was caught by this property.
+    pub flipped: bool,
+}
+
+/// Response for `POST /api/v1/sv/mutate`.
+#[derive(Debug, Serialize)]
+pub struct SvMutateResponse {
+    /// The applied mutation's label (null on a `list` request).
+    pub mutation: Option<String>,
+    /// Available targets (present on a `list` request, null otherwise).
+    pub targets: Option<SvMutateTargets>,
+    /// Per-property flips (empty on a `list` request).
+    pub properties: Vec<SvMutatePropertyFlip>,
+    /// Count of properties the mutation flipped (caught it).
+    pub flipped: usize,
+    /// Count the mutation did NOT flip — the property-adequacy finding.
+    pub unflipped: usize,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2

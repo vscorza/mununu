@@ -1397,6 +1397,120 @@ fn sv_lint_handler_impl(request: SvLintRequest) -> ApiResult<Json<SvLintResponse
     }))
 }
 
+/// #468 — apply a NAMED structural mutation and re-verify to check the property
+/// verdicts FLIP (property adequacy), or (with `list`) enumerate the available
+/// mutation targets. Surface peer of the CLI `mununu sv mutate`.
+pub async fn sv_mutate_handler(
+    Json(request): Json<SvMutateRequest>,
+) -> ApiResult<Json<SvMutateResponse>> {
+    blocking(move || sv_mutate_handler_impl(request)).await
+}
+
+fn sv_mutate_handler_impl(request: SvMutateRequest) -> ApiResult<Json<SvMutateResponse>> {
+    use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+    use crate::adapter::btor2::mutate::{Mutation, list_targets};
+    use crate::adapter::slang::verify_auto::{
+        VerifyAutoOptions, engine_selection, mutate_and_compare,
+    };
+    use crate::adapter::yosys::{SvFrontend, YosysOptions, sv_to_btor2};
+
+    let mut sources: Vec<(String, String)> = vec![("top.sv".to_string(), request.source.clone())];
+    for f in &request.additional_sources {
+        sources.push((f.name.clone(), f.content.clone()));
+    }
+    let yopts = YosysOptions {
+        top: request.top.clone(),
+        additional_sources: request
+            .additional_sources
+            .iter()
+            .map(|f| (f.name.clone(), f.content.clone()))
+            .collect(),
+        use_sv2v: request.use_sv2v,
+        frontend: if request.use_slang {
+            SvFrontend::Slang
+        } else {
+            SvFrontend::Auto
+        },
+        ..Default::default()
+    };
+
+    // `list` mode — lift once and enumerate the targets (no verification).
+    if request.list {
+        let btor2 = sv_to_btor2(&request.source, &yopts).map_err(|e| ApiError::BadRequest {
+            message: format!("sv mutate --list: {}", e.message),
+            details: None,
+        })?;
+        let t = list_targets(&btor2).map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
+        return Ok(Json(SvMutateResponse {
+            mutation: None,
+            targets: Some(SvMutateTargets {
+                stick: t.stick,
+                drop_reset: t.drop_reset,
+            }),
+            properties: Vec::new(),
+            flipped: 0,
+            unflipped: 0,
+        }));
+    }
+
+    let mutation_spec = request
+        .mutation
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "sv mutate: `mutation` is required (or set `list` to discover targets)"
+                .to_string(),
+            details: Some("expected \"stick:<reg>\" or \"drop-reset:<reg>\"".into()),
+        })?;
+    let mutation = Mutation::parse(mutation_spec).map_err(|message| ApiError::BadRequest {
+        message,
+        details: None,
+    })?;
+
+    let must_edge_inference = match request.must_edge_inference.as_deref() {
+        Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
+        Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
+        Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
+        _ => MustEdgeInference::Off,
+    };
+    let (engine_symbolic, engine_exact, engine_portfolio) =
+        engine_selection(request.engine.as_deref());
+    let base_opts = VerifyAutoOptions {
+        must_edge_inference,
+        gate_reset: request.gate_reset.unwrap_or(true),
+        symbolic_engine: engine_symbolic,
+        exact_symbolic: engine_exact,
+        portfolio: engine_portfolio,
+        ..Default::default()
+    };
+
+    let report = mutate_and_compare(&sources, &yopts, &base_opts, mutation).map_err(|e| {
+        ApiError::BadRequest {
+            message: format!("sv mutate: {}", e.message),
+            details: None,
+        }
+    })?;
+
+    Ok(Json(SvMutateResponse {
+        mutation: Some(report.mutation),
+        targets: None,
+        properties: report
+            .properties
+            .into_iter()
+            .map(|p| SvMutatePropertyFlip {
+                name: p.name,
+                baseline: p.baseline,
+                mutant: p.mutant,
+                flipped: p.flipped,
+            })
+            .collect(),
+        flipped: report.flipped,
+        unflipped: report.unflipped,
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -1651,6 +1765,8 @@ fn sv_verify_auto_handler_impl(
         rescue_bottom_safety: request.rescue_bottom_safety.unwrap_or(true),
         rescue_bottom_liveness: request.rescue_bottom_liveness.unwrap_or(true),
         rescue_bottom_recoverability: request.rescue_bottom_recoverability.unwrap_or(true),
+        // `verify-auto` verifies the design as-lifted; mutation is the `sv mutate` verb's job.
+        mutation: None,
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
