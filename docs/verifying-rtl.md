@@ -230,11 +230,22 @@ shadow target. Independent shadows compose correctly:
 `shadow(A) ∧ shadow(B) = A@N ∧ B@N`, `shadow(A) ∨ shadow(B) = A@N ∨ B@N`,
 `!shadow(A) = !A@N`.
 
-**Opt-out** — the `MUNUNU_NO_ANTECEDENT_SHADOW=1` environment variable
-disables shadow-synth even for `|=>` shapes, reverting to the Phase A refusal.
-This is a debug / differential-oracle knob (used to cross-check shadow-synth
-verdicts against the predicate-cube engine's independent handling); production
-use should leave it unset.
+**Opt-out** — three channels, thread-safe per-request first, then process-global:
+
+1. **CLI flag** `--no-antecedent-shadow` on `sv verify-auto` (mununu#476 item 4,
+   added 2026-08). Per-invocation, thread-safe.
+2. **API field** `no_antecedent_shadow: true` on `POST /api/v1/sv/verify-auto`
+   (mununu#476 item 4). Per-request, thread-safe — the correct opt-out for a
+   multi-tenant server.
+3. **Env var** `MUNUNU_NO_ANTECEDENT_SHADOW=1`. Process-global; races across
+   concurrent verify-auto calls with different intents. Kept as an
+   ergonomic escape hatch for scripts and CI shells that never spawn
+   concurrent verify-auto calls.
+
+Either channel disabling shadow-synth wins. All three are debug /
+differential-oracle knobs (used to cross-check shadow-synth verdicts against
+the predicate-cube engine's independent handling); production use should
+leave all three unset.
 
 **Non-`|=>` formulas are unaffected.** A hand-authored `mu Y. (a or <> Y)`
 (bare `EF a`) whose atom happens to be input-derived does NOT match the

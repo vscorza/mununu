@@ -1674,6 +1674,16 @@ pub struct SvVerifyAutoRequest {
     /// shape.
     #[serde(default)]
     pub rescue_bottom_recoverability: Option<bool>,
+    /// mununu#476 item 4 — disable antecedent shadow-register synthesis for
+    /// the exact-symbolic engine (default `false` ⇒ shadow-synth enabled, the
+    /// shipped behaviour). Set `true` to force the Phase A refusal for SVA
+    /// `|=>` properties whose antecedent combinationally reaches primary
+    /// inputs — the differential-oracle / debug knob mirrored on the CLI as
+    /// `--no-antecedent-shadow` and via the process-global
+    /// `MUNUNU_NO_ANTECEDENT_SHADOW=1` env var. Per-request opt-out is
+    /// thread-safe (unlike the env var, which is process-global).
+    #[serde(default)]
+    pub no_antecedent_shadow: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.

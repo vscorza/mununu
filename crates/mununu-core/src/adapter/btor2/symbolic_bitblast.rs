@@ -2905,7 +2905,66 @@ pub fn exact_symbolic_verdict_with_witness(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
-    verdict_with_witness_catching(btor2_content, formula, &std::collections::HashSet::new())
+    verdict_with_witness_catching(
+        btor2_content,
+        formula,
+        &std::collections::HashSet::new(),
+        &ExactSymbolicOptions::default(),
+    )
+}
+
+/// Options for the exact-symbolic engine — thread-safe per-invocation overrides
+/// for behaviours that were previously env-var-only. Introduced 2026-08 to
+/// support `--no-antecedent-shadow` (CLI) / `no_antecedent_shadow` (API) as
+/// proper per-request opt-outs; the env-var `MUNUNU_NO_ANTECEDENT_SHADOW=1`
+/// remains as a process-global escape hatch (differential-oracle / debug),
+/// and either channel disabling shadow-synth wins (`false && env-var`).
+#[derive(Debug, Clone, Copy)]
+pub struct ExactSymbolicOptions {
+    /// Whether antecedent shadow-register synthesis (mununu#476 fix) is
+    /// enabled. Defaults to `true`; set to `false` to force the Phase A
+    /// refusal for SVA `|=>` properties with input-derived antecedents, so a
+    /// caller can differentially verify the shadow-synth verdict against the
+    /// refusal path or reproduce pre-mununu#476 behaviour.
+    pub antecedent_shadow_enabled: bool,
+}
+
+impl Default for ExactSymbolicOptions {
+    fn default() -> Self {
+        Self {
+            antecedent_shadow_enabled: true,
+        }
+    }
+}
+
+/// Opts-accepting variant of [`exact_symbolic_verdict`]. Same semantics; the
+/// only per-call knob today is [`ExactSymbolicOptions::antecedent_shadow_enabled`].
+pub fn exact_symbolic_verdict_with_options(
+    btor2_content: &str,
+    formula: &Formula,
+    opts: &ExactSymbolicOptions,
+) -> Result<ExactVerdict, String> {
+    verdict_with_witness_catching(
+        btor2_content,
+        formula,
+        &std::collections::HashSet::new(),
+        opts,
+    )
+    .map(|(v, _)| v)
+}
+
+/// Opts-accepting variant of [`exact_symbolic_verdict_with_witness`].
+pub fn exact_symbolic_verdict_with_witness_and_options(
+    btor2_content: &str,
+    formula: &Formula,
+    opts: &ExactSymbolicOptions,
+) -> Result<(ExactVerdict, Option<StallLasso>), String> {
+    verdict_with_witness_catching(
+        btor2_content,
+        formula,
+        &std::collections::HashSet::new(),
+        opts,
+    )
 }
 
 /// P2.5-F — the SOUND-POSTURE two-player game model: exclude the CLOCK and RESET from the adversary.
@@ -2972,7 +3031,13 @@ pub fn exact_two_player_verdict(
 ) -> Result<ExactVerdict, String> {
     let set: std::collections::HashSet<String> =
         controllable.iter().map(|s| s.to_string()).collect();
-    verdict_with_witness_catching(btor2_content, formula, &set).map(|(v, _)| v)
+    verdict_with_witness_catching(
+        btor2_content,
+        formula,
+        &set,
+        &ExactSymbolicOptions::default(),
+    )
+    .map(|(v, _)| v)
 }
 
 /// P2.5-F — is the controllable-reachability game to `good` REALIZABLE? Builds the reachability formula
@@ -3242,9 +3307,10 @@ fn verdict_with_witness_catching(
     btor2_content: &str,
     formula: &Formula,
     controllable: &std::collections::HashSet<String>,
+    opts: &ExactSymbolicOptions,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exact_symbolic_verdict_with_witness_inner(btor2_content, formula, controllable)
+        exact_symbolic_verdict_with_witness_inner(btor2_content, formula, controllable, opts)
     }))
     .unwrap_or_else(|_| {
         Err(
@@ -3260,6 +3326,7 @@ fn exact_symbolic_verdict_with_witness_inner(
     btor2_content: &str,
     formula: &Formula,
     controllable: &std::collections::HashSet<String>,
+    opts: &ExactSymbolicOptions,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
@@ -3271,10 +3338,17 @@ fn exact_symbolic_verdict_with_witness_inner(
     // rewritten formula are then handed to the rest of this fn. Atoms that
     // cannot be shadowed (see `RefusalReason`) fall through to the Phase A
     // refusal below. See `docs/design/antecedent-shadow-synthesis.md` for the
-    // full design + soundness argument. `MUNUNU_NO_ANTECEDENT_SHADOW=1` opts out
-    // (differential-oracle / debug use).
+    // full design + soundness argument.
+    //
+    // Two orthogonal opt-out channels; EITHER disabling wins:
+    //   1. `opts.antecedent_shadow_enabled = false` — per-invocation opt-out
+    //      threaded from CLI (`--no-antecedent-shadow`) / API
+    //      (`no_antecedent_shadow: true`). Thread-safe, per-request.
+    //   2. `MUNUNU_NO_ANTECEDENT_SHADOW=1` env var — process-global escape
+    //      hatch for differential-oracle / debug use.
     let (file, rewritten_formula) = {
-        let opt_out = std::env::var("MUNUNU_NO_ANTECEDENT_SHADOW").is_ok();
+        let opt_out =
+            !opts.antecedent_shadow_enabled || std::env::var("MUNUNU_NO_ANTECEDENT_SHADOW").is_ok();
         let antecedents = crate::mu_calculus::detect_pipeimplies_antecedent_atoms(formula);
         if !opt_out && !antecedents.is_empty() {
             let synth = crate::adapter::btor2::antecedent_shadow::synthesize_shadows(
@@ -7772,17 +7846,19 @@ mod tests {
             "with shadow-synth, `mem_rvalid_mine |=> (q == 0)` where q'=0 always Holds",
         );
 
-        // Opt-out (MUNUNU_NO_ANTECEDENT_SHADOW=1) restores the Phase A refusal
-        // even for `|=>` shapes — the differential-oracle / debug knob.
-        // SAFETY: single-threaded test; env-var mutation is scoped to this call.
-        unsafe {
-            std::env::set_var("MUNUNU_NO_ANTECEDENT_SHADOW", "1");
-        }
-        let err = exact_symbolic_verdict(BTOR2, &formula)
-            .expect_err("opt-out must revert to the Phase A transitive-fan-in refusal");
-        unsafe {
-            std::env::remove_var("MUNUNU_NO_ANTECEDENT_SHADOW");
-        }
+        // Opt-out via the thread-safe options channel (`--no-antecedent-shadow`
+        // CLI / `no_antecedent_shadow: true` API — mununu#476 item 4). Restores
+        // the Phase A refusal even for `|=>` shapes. Env-var opt-out
+        // (`MUNUNU_NO_ANTECEDENT_SHADOW=1`) is the equivalent process-global
+        // channel; either channel disabling shadow-synth wins.
+        let err = exact_symbolic_verdict_with_options(
+            BTOR2,
+            &formula,
+            &ExactSymbolicOptions {
+                antecedent_shadow_enabled: false,
+            },
+        )
+        .expect_err("opt-out must revert to the Phase A transitive-fan-in refusal");
         assert!(
             err.contains("combinationally driven by primary input"),
             "opt-out refusal should still be the Phase A message: {err}"
