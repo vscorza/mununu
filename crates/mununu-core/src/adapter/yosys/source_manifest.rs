@@ -433,16 +433,34 @@ pub fn assemble_sv_design(
 /// Discover SV/Verilog files under `dir` (recursively), excluding common
 /// non-RTL subtrees (mutations, buggy artifacts, testbenches). CLI helper for
 /// `--design-dir`; the API assembles from provided source *contents* instead.
-pub fn discover_sv_files(dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    fn excluded(p: &Path) -> bool {
+pub fn discover_sv_files(
+    dir: &Path,
+    extra_excludes: &[String],
+) -> Result<Vec<(PathBuf, String)>, String> {
+    // Base skip set — directories that never carry a compilable design under
+    // the reproducible-lift contract (deliberately-broken twins, testbenches,
+    // simulation waveforms, etc.). Extended per-invocation by
+    // `extra_excludes` (mununu#475 item 2 — the `--exclude` CLI flag).
+    //
+    // Match semantics: case-insensitive equality against a single path
+    // component. `--exclude faulty` therefore matches `.../faulty/x.sv` and
+    // `.../a/faulty/y.sv` but NOT `.../faulty_variant/x.sv`. This is not a
+    // full glob (there is no glob dep yet) but it exactly matches the
+    // reporter's `faulty/` use case + the existing hardcoded semantics; a
+    // richer glob syntax is a future extension when a case demands it.
+    let extra_lower: Vec<String> = extra_excludes
+        .iter()
+        .map(|s| s.trim_matches('/').to_ascii_lowercase())
+        .collect();
+    let excluded = |p: &Path| -> bool {
         p.components().any(|c| {
             let s = c.as_os_str().to_string_lossy().to_ascii_lowercase();
             matches!(
                 s.as_str(),
                 "mutations" | "buggy_artifacts" | "buggy" | "tb" | "testbench" | "sim" | "figures"
-            )
+            ) || extra_lower.contains(&s.to_string())
         })
-    }
+    };
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -478,6 +496,91 @@ mod tests {
 
     fn f(name: &str, content: &str) -> (PathBuf, String) {
         (PathBuf::from(name), content.to_string())
+    }
+
+    /// mununu#475 item 2 — `discover_sv_files`'s `extra_excludes` skips a
+    /// named path component on top of the hardcoded skip set. Reporter's
+    /// case: a `faulty/` sibling directory of deliberately-invalid twins
+    /// breaks `--design-dir <parent>` because slang rejects the twins on
+    /// elaboration; `--exclude faulty` restores the whole-tree scan.
+    #[test]
+    fn discover_honours_extra_excludes() {
+        use tempfile::tempdir;
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Layout:
+        //   root/keep/a.sv       (should appear)
+        //   root/faulty/bad.sv   (excluded by --exclude faulty)
+        //   root/mutations/m.sv  (excluded by the hardcoded skip set)
+        //   root/nested/faulty/deep.sv   (excluded — component match anywhere in the path)
+        //   root/faulty_variant/ok.sv    (should appear — component match is EQUALITY, not prefix)
+        for (rel, body) in [
+            ("keep/a.sv", "module a; endmodule\n"),
+            ("faulty/bad.sv", "module bad; endmodule\n"),
+            ("mutations/m.sv", "module m; endmodule\n"),
+            ("nested/faulty/deep.sv", "module deep; endmodule\n"),
+            ("faulty_variant/ok.sv", "module ok; endmodule\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let files = discover_sv_files(root, &["faulty".to_string()])
+            .expect("discovery with the exclude should succeed");
+        let names: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"a.sv".to_string()),
+            "keep/a.sv should be present: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad.sv".to_string()),
+            "faulty/bad.sv should be excluded by --exclude faulty: {names:?}"
+        );
+        assert!(
+            !names.contains(&"m.sv".to_string()),
+            "mutations/ should still be excluded by the hardcoded skip set: {names:?}"
+        );
+        assert!(
+            !names.contains(&"deep.sv".to_string()),
+            "nested/faulty/deep.sv should be excluded (component match anywhere in path): {names:?}"
+        );
+        assert!(
+            names.contains(&"ok.sv".to_string()),
+            "faulty_variant/ok.sv should be present (exclude is equality, not prefix): {names:?}"
+        );
+    }
+
+    /// The `extra_excludes` are case-insensitive and tolerate leading/trailing
+    /// slashes — `--exclude Faulty/` and `--exclude faulty` behave identically.
+    #[test]
+    fn discover_exclude_is_case_insensitive_and_trims_slashes() {
+        use tempfile::tempdir;
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        for (rel, body) in [
+            ("keep/a.sv", "module a; endmodule\n"),
+            ("FAULTY/x.sv", "module x; endmodule\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        // Same lowercase-normalised excludes, given in three forms.
+        for exclude in ["faulty", "Faulty", "/faulty/"] {
+            let files = discover_sv_files(root, &[exclude.to_string()])
+                .expect("discovery with the exclude should succeed");
+            let names: Vec<String> = files
+                .iter()
+                .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !names.iter().any(|n| n == "x.sv"),
+                "FAULTY/x.sv excluded via '{exclude}': {names:?}"
+            );
+        }
     }
 
     #[test]

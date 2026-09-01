@@ -424,6 +424,32 @@ the same reason). A finding maps to the shared CI gate's `violated` verdict, so 
 default `--fail-on violated` fails the build; `--fail-on none` makes it advisory. A
 clean design reports zero findings and exits `0`.
 
+**Exit codes** (2026-08, mununu#475 item 5). `sv lint --fail-on violated` (the
+default) exits `0` on a clean design, `2` when a bad register is found — a
+gate-friendly default that plugs directly into CI. A LIFT FAILURE (front-end
+error, missing file, etc.) exits `1` — distinct from "found something". A batch
+scanner that wants to distinguish "found a bad register" from "could not lift"
+should pass `--fail-on none` and inspect the JSON/text output for findings.
+
+**`function automatic` arguments are no longer false-positives** (2026-08,
+mununu#475 item 1). Yosys/slang mangle SV function arguments as
+`<function>.<arg>` (e.g. monono's `ctrl_code.c`, `ones8.v` in
+`tmds_encoder.sv`). Their combinational cone reaches a function-scope anonymous
+input, so the raw filter used to flag them as partial-write registers.
+`sv lint` now skips any Op-node symbol containing a `.` — a targeted filter
+that leaves the intended catches (register aliases like `a_q` from
+`q[hi:lo] <= d`, hierarchical State names, etc.) reported as before.
+
+**`--exclude <NAME>` on `--design-dir`** (2026-08, mununu#475 item 2). The
+hardcoded skip set (`mutations` / `buggy` / `buggy_artifacts` / `tb` /
+`testbench` / `sim` / `figures`) is now extensible per-invocation. Match is
+case-insensitive against a single path component — `--exclude faulty` skips
+every `.../faulty/...` subtree but leaves `.../faulty_variant/...` alone.
+Repeatable. Not a full glob syntax (a richer form is a future extension when a
+case demands it). The reporter's whole-tree workflow —
+`mununu sv lint --design-dir <root> --exclude faulty` — is now reachable
+without adding to the hardcoded list.
+
 ## Are the properties adequate? `sv mutate`
 
 > Source of truth: [`mutate_and_compare`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L1824) — surface: (CLI+API+UI)
@@ -475,6 +501,14 @@ so default `--fail-on violated` fails the build; `--fail-on none` is advisory. `
 always exits `0`. A mutation that names a missing register — or does not apply (e.g.
 `drop-reset` on a register with no reset mux) — is a hard **error**, never a silent
 no-op (which would masquerade as an unflipped/adequacy finding).
+
+**`--param NAME=VALUE` parity with `sv verify-auto`** (2026-08, mununu#475 item 4).
+`sv mutate` now accepts `--param`, plumbed through to the same yosys `chparam` /
+slang `-G` path `verify-auto` uses. Blocks whose adequacy measurement had to shrink
+a parameterised timing interval (`--param ROW_BITS=2` and similar are load-bearing
+in monono's tree) can now be mutated end-to-end without a wrapper module. Same
+semantics as `verify-auto`'s `--param`: a malformed value is a HARD error; yosys
+errors downstream on a parameter it cannot apply — never a silent drop.
 
 ## Using mununu in CI (GitHub Actions and friends)
 
