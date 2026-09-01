@@ -184,6 +184,10 @@ fn create_router() -> Router {
         // registers the verifier can't keep faithfully, no model checking. Surface
         // peer of the CLI `sv lint`.
         .route("/api/v1/sv/lint", post(handlers::sv_lint_handler))
+        // SV-direct mutation (#468) — apply a named structural fault + re-verify to
+        // check the property verdicts flip (property adequacy), or list targets.
+        // Surface peer of the CLI `sv mutate`.
+        .route("/api/v1/sv/mutate", post(handlers::sv_mutate_handler))
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),

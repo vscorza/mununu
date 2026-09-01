@@ -82,6 +82,19 @@ pub enum VerifyOutcome {
     Skipped { reason: String },
 }
 
+impl VerifyOutcome {
+    /// The canonical `holds` / `violated` / `unknown` / `skipped` label — the
+    /// verdict vocabulary shared across surfaces (and the `sv mutate` flip oracle).
+    pub fn label(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Holds => "holds",
+            VerifyOutcome::Violated { .. } => "violated",
+            VerifyOutcome::Unknown { .. } => "unknown",
+            VerifyOutcome::Skipped { .. } => "skipped",
+        }
+    }
+}
+
 /// One assertion's auto-verification result.
 #[derive(Debug, Clone)]
 pub struct PropertyVerdict {
@@ -789,6 +802,13 @@ pub struct VerifyAutoOptions {
     /// Only fires on the `AG EF (REG == VALUE)` shape. Default `true`; `--no-rescue` /
     /// API `rescue_bottom_recoverability: false` opts out.
     pub rescue_bottom_recoverability: bool,
+    /// #468 — apply a NAMED structural mutation to the prepared BTOR2 before
+    /// verification (`prepare_model`), so `sv mutate` can assert the property
+    /// verdicts FLIP (property adequacy). `None` (default) ⇒ no mutation, the model
+    /// is verified as-lifted. Set by the `sv mutate` driver only; the plain
+    /// `verify-auto` surfaces never populate it. See
+    /// [`crate::adapter::btor2::mutate`].
+    pub mutation: Option<crate::adapter::btor2::mutate::Mutation>,
 }
 
 /// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
@@ -846,6 +866,7 @@ impl Default for VerifyAutoOptions {
             rescue_bottom_safety: true,
             rescue_bottom_liveness: true,
             rescue_bottom_recoverability: true,
+            mutation: None,
         }
     }
 }
@@ -1764,6 +1785,91 @@ pub(crate) fn merge_portfolio_reports(
     Ok(merged)
 }
 
+/// One property's baseline-vs-mutant verdict under a mutation (`sv mutate`).
+#[derive(Debug, Clone)]
+pub struct PropertyFlip {
+    /// The property (assertion) name — the join key between baseline and mutant.
+    pub name: String,
+    /// The canonical verdict on the design as-lifted.
+    pub baseline: String,
+    /// The canonical verdict on the mutated design.
+    pub mutant: String,
+    /// `baseline != mutant` — the mutation was *caught* by this property.
+    pub flipped: bool,
+}
+
+/// The result of an `sv mutate` run: whether a NAMED structural mutation flips the
+/// property verdicts. A **flip** confirms the property constrains the mutated
+/// behaviour; an **unflipped** property is the property-adequacy finding — the
+/// spec does not pin that fault down (vacuous w.r.t. the mutation). Per
+/// [claims-integrity §2] this is a statement about the PROPERTIES, never a bug
+/// report about the design.
+#[derive(Debug, Clone)]
+pub struct MutateReport {
+    /// The applied mutation's label (`stick:<reg>` / `drop-reset:<reg>`).
+    pub mutation: String,
+    /// Per-property baseline-vs-mutant comparison (baseline order).
+    pub properties: Vec<PropertyFlip>,
+    /// Number of properties the mutation flipped (caught it).
+    pub flipped: usize,
+    /// Number the mutation did NOT flip (the adequacy finding).
+    pub unflipped: usize,
+}
+
+/// `sv mutate` core — verify the design **twice** (as-lifted baseline, then with
+/// `mutation` applied in `prepare_model`) and diff the per-property verdicts by
+/// name. A mutation that names a missing register / does not apply is a hard error
+/// from the mutant lift (never a silent no-op). `base_opts.mutation` is ignored
+/// (forced `None` for the baseline, `Some(mutation)` for the mutant).
+pub fn mutate_and_compare(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    base_opts: &VerifyAutoOptions,
+    mutation: crate::adapter::btor2::mutate::Mutation,
+) -> Result<MutateReport, AdapterError> {
+    let mut baseline_opts = base_opts.clone();
+    baseline_opts.mutation = None;
+    let baseline = verify_auto(sources, yosys_opts, &baseline_opts)?;
+
+    let mut mutant_opts = base_opts.clone();
+    mutant_opts.mutation = Some(mutation.clone());
+    let mutant = verify_auto(sources, yosys_opts, &mutant_opts)?;
+
+    let mutant_by_name: std::collections::HashMap<&str, &VerifyOutcome> = mutant
+        .properties
+        .iter()
+        .map(|p| (p.name.as_str(), &p.outcome))
+        .collect();
+
+    let properties: Vec<PropertyFlip> = baseline
+        .properties
+        .iter()
+        .map(|b| {
+            let baseline = b.outcome.label();
+            // A property present at baseline but absent from the mutant reads as
+            // `skipped` (the mutation dropped it) — still a flip if baseline was definite.
+            let mutant = mutant_by_name
+                .get(b.name.as_str())
+                .map_or("skipped", |o| o.label());
+            PropertyFlip {
+                name: b.name.clone(),
+                baseline: baseline.to_string(),
+                mutant: mutant.to_string(),
+                flipped: baseline != mutant,
+            }
+        })
+        .collect();
+
+    let flipped = properties.iter().filter(|p| p.flipped).count();
+    let unflipped = properties.len() - flipped;
+    Ok(MutateReport {
+        mutation: mutation.as_label(),
+        properties,
+        flipped,
+        unflipped,
+    })
+}
+
 pub fn verify_auto(
     sources: &[(String, String)],
     yosys_opts: &YosysOptions,
@@ -2187,6 +2293,22 @@ pub(crate) fn prepare_model(
             ),
         });
     }
+
+    // #468 — apply a named structural mutation to the fully-prepared BTOR2 (after
+    // reset/init/shadow/config-pin) so the `sv mutate` driver can assert the verdicts
+    // FLIP. A mutation that names a missing register or does not apply is a HARD error
+    // (never a silent no-op: a no-op mutant would spuriously read as a "no flip" =
+    // vacuous-property finding it is not). The plain verify-auto surfaces pass `None`.
+    let btor2 = match &opts.mutation {
+        Some(m) => crate::adapter::btor2::mutate::apply_mutation(&btor2, m).map_err(|message| {
+            AdapterError {
+                kind: AdapterErrorKind::UnsupportedConstruct,
+                location: None,
+                message: format!("sv mutate ({}): {message}", m.as_label()),
+            }
+        })?,
+        None => btor2,
+    };
 
     Ok(Prepared::Model(Box::new(PreparedModel {
         btor2,

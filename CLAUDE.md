@@ -307,6 +307,7 @@ The load-bearing rules at a glance:
 
 - **Models from source, not documentation.** Models written from API docs are "design pattern demonstrations," never findings about the real system.
 - **Planted bugs are demos, not findings.** Language must reflect this.
+- **Mutations are property-adequacy, not bug findings.** `sv mutate` injects a *deliberate* structural fault to test whether the properties catch it; a flip measures the **spec's** adequacy, a non-flip is a vacuous property — never frame a mutation result as a discovered bug in the design.
 - **Severity honesty.** Distinguish vulnerability vs. correctness issue vs. structural gap vs. design-pattern violation.
 - **Reproduction path required.** Either a real-system test case or an explicit "structural, not yet reproduced" disclosure.
 - **Verification-first workflow.** The CTXDSL model + `mununu context eval` is the oracle, not human code reading.

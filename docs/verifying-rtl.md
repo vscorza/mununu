@@ -369,6 +369,45 @@ the same reason). A finding maps to the shared CI gate's `violated` verdict, so 
 default `--fail-on violated` fails the build; `--fail-on none` makes it advisory. A
 clean design reports zero findings and exits `0`.
 
+## Are the properties adequate? `sv mutate`
+
+> Source of truth: [`mutate_and_compare`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L1824) — surface: (CLI+API+UI)
+
+A `holds` verdict is only as strong as the property that produced it — a **vacuous**
+property `holds` no matter what the design does. `sv mutate` measures that: it applies
+a **named structural mutation** to the design, re-verifies, and reports whether each
+property's verdict **flips**. A flip (`holds` → `violated`) confirms the property
+genuinely constrains the mutated behaviour; a property that does **not** flip is the
+finding — the spec is *vacuous with respect to that fault*.
+
+This is a statement about the **properties**, never a bug report about the design
+(see [`policies/claims-integrity.md`](policies/claims-integrity.md) §2) — a mutation is
+a deliberately-injected fault, not a discovered one.
+
+The mutation catalog (structural, no source-line targeting needed):
+
+- **`stick:<reg>`** — freeze a register at its reset value (`next(reg) := reg`).
+  Universal; flips any property that depends on the register progressing.
+- **`drop-reset:<reg>`** — remove a register's reset arm (rewrite its reset mux
+  `ite(rst, RESET, d)` to the data branch `d`). Flips a reset-dependent property;
+  needs the reset **free** (`--no-gate-reset`) to have effect.
+
+```bash
+mununu sv mutate counter.sv --mutation stick:cnt --engine exact-symbolic   # exit 2 ⇒ no property caught it
+mununu sv mutate counter.sv --list                                         # discover the targets
+```
+```jsonc
+// POST /api/v1/sv/mutate  { "source": …, "mutation": "stick:cnt", "engine": "exact-symbolic" } →
+{ "mutation": "stick:cnt", "targets": null, "flipped": 1, "unflipped": 0,
+  "properties": [ { "name": "recoverable", "baseline": "holds", "mutant": "violated", "flipped": true } ] }
+```
+
+A mutation caught by **no** property maps to the CI gate's `violated` (a coverage gap),
+so default `--fail-on violated` fails the build; `--fail-on none` is advisory. `--list`
+always exits `0`. A mutation that names a missing register — or does not apply (e.g.
+`drop-reset` on a register with no reset mux) — is a hard **error**, never a silent
+no-op (which would masquerade as an unflipped/adequacy finding).
+
 ## Using mununu in CI (GitHub Actions and friends)
 
 > Source of truth: [`FailOn` / `ci_exit_code`](../crates/mununu-cli/src/main.rs) — surface: CLI

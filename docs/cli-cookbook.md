@@ -113,3 +113,22 @@ mununu --quiet sv lint rtl/mod.sv --frontend slang --fail-on none
 ```
 
 The JSON on stdout lists each flagged `signal` with a `kind` of `"register"` (the root — the register itself) or `"output"` (a downstream combinational output of one). See [`docs/verifying-rtl.md`](verifying-rtl.md) for the soundness background (the monono#partsel guard).
+
+## Check that a design's properties are adequate (mutation testing)
+
+> Source of truth: [`mutate_and_compare`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L1824) — surface: (CLI+API+UI)
+
+`mununu sv mutate` applies a **named structural mutation** to a SystemVerilog design, re-verifies, and reports whether each property's verdict **flips**. A flip (`holds` → `violated`) confirms the property constrains the mutated behaviour; a property that does *not* flip is the finding — the spec is vacuous with respect to that fault. This is a statement about the **properties**, never a bug report about the design.
+
+```bash
+# Discover the mutation targets of a design (every register → stick; reset-mux registers → drop-reset):
+mununu sv mutate rtl/counter.sv --list
+
+# Freeze a register and re-verify — exit 2 if NO property catches the fault (a coverage gap):
+mununu sv mutate rtl/counter.sv --mutation stick:cnt --engine exact-symbolic
+
+# Remove a register's reset arm (needs the reset free for effect):
+mununu sv mutate rtl/fsm.sv --mutation drop-reset:state_q --no-gate-reset --engine exact-symbolic
+```
+
+The mutation catalog is `stick:<reg>` (freeze a register at its reset value) and `drop-reset:<reg>` (remove a register's reset arm). A mutation caught by no property maps to the `violated` CI verdict (`--fail-on none` makes it advisory); a mutation that names a missing register or does not apply is a hard error, never a silent no-op.
