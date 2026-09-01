@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Request for the recoverability endpoint (`POST /api/v1/btor2/verify-recoverability`). Mirrors the CLI `mununu btor2 verify-recoverability`: decides `AG EF target` — \"from every reachable state, can the design get back to `target`?\". `target` is a single register-comparison atom string (`\"state_q == 3\"`).",
+  "properties": {
+    "config_values": {
+      "default": [],
+      "description": "Config-partition (capability A): config inputs to split the verdict over, each `\"NAME=v1,v2,...\"`. The refinement then carries a `config_partition` decided exactly per config. Implies the refined output. Mirrors the CLI `--config-values`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "content": {
+      "description": "BTOR2 source content.",
+      "type": "string"
+    },
+    "discover_assumptions": {
+      "default": false,
+      "description": "Assumption discovery (capability B): when the property does NOT hold, search for an environment assumption φ under which it becomes a non-vacuous HOLDS → the refinement carries `holds_under`. CONDITIONAL-only (never changes the canonical verdict). Implies the refined output. Mirrors the CLI `--discover-assumptions`.",
+      "type": "boolean"
+    },
+    "predicates": {
+      "default": [],
+      "description": "Extra abstraction predicate(s) for the cube-path escalation, each `\"NAME:REGISTER=VALUE\"` (P2 Slice 1). Used only when the exact engine abstains (over the ~40-bit cone cap); the escalation is automatic even with none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "refine": {
+      "default": false,
+      "description": "Also compute a structured [`crate::verdict::VerdictRefinement`] alongside the verdict — a `vacuous` witness when the target is never reachable, an auto `config_partition` over the design's detected reset when recovery depends on it, and a \"why ⊥\" hint. Diagnostic-only: it never changes the canonical verdict. (Mirrors the CLI `--refine`.)",
+      "type": "boolean"
+    },
+    "target": {
+      "description": "The `good` atom to recover to (`\"REG op VALUE\"`).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "content",
+    "target"
+  ],
+  "title": "Btor2VerifyRecoverabilityRequest",
+  "type": "object"
+}

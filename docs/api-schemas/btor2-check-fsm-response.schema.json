@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FsmRegisterFinding": {
+      "description": "One state register's illegal-encoding result in a [`Btor2CheckFsmResponse`].",
+      "properties": {
+        "illegal_encoding_reachable": {
+          "description": "`true` when an illegal encoding is reachable (a finding).",
+          "type": "boolean"
+        },
+        "legal_encodings": {
+          "description": "The legal encodings the register's own logic recognizes (sorted).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "register": {
+          "description": "The state register's symbol.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Canonical verdict — `\"holds\"` (stays within its encoding) | `\"violated\"` (an illegal encoding is reachable) | `\"unknown\"` (the portfolio could not decide).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "illegal_encoding_reachable",
+        "legal_encodings",
+        "register",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Response for `POST /api/v1/btor2/check-fsm`.",
+  "properties": {
+    "fsm_registers_checked": {
+      "description": "Number of FSM-like state registers scanned.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "illegal_encodings_found": {
+      "description": "Number of registers with a reachable illegal encoding (`verdict == \"violated\"`).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "registers": {
+      "description": "Per-register results.",
+      "items": {
+        "$ref": "#/definitions/FsmRegisterFinding"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "fsm_registers_checked",
+    "illegal_encodings_found",
+    "registers"
+  ],
+  "title": "Btor2CheckFsmResponse",
+  "type": "object"
+}

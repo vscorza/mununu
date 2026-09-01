@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Request for the response-liveness endpoint (`POST /api/v1/btor2/verify-liveness`). Mirrors the CLI `mununu btor2 verify-liveness`: decides `AG(request → AF grant)` via the l2s reduction + the portfolio. `request` / `grant` are register-comparison atom strings (`\"st == 1\"`).",
+  "properties": {
+    "content": {
+      "description": "BTOR2 source content.",
+      "type": "string"
+    },
+    "grant": {
+      "description": "The grant atom that must eventually follow on every path.",
+      "type": "string"
+    },
+    "request": {
+      "description": "The request atom (`\"REG op VALUE\"`).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "content",
+    "grant",
+    "request"
+  ],
+  "title": "Btor2VerifyLivenessRequest",
+  "type": "object"
+}

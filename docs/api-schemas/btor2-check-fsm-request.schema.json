@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Request for the auto FSM illegal-encoding scan (`POST /api/v1/btor2/check-fsm`). Mirrors the CLI `mununu btor2 check-fsm`: auto-discovers the FSM-like state registers and checks, from the reset state, whether any illegal encoding (a value outside the register's legal set) is reachable — with **no user input** (the legal set is derived from the design).",
+  "properties": {
+    "content": {
+      "description": "BTOR2 source content.",
+      "type": "string"
+    },
+    "max_width": {
+      "default": 8,
+      "description": "Max state-register width treated as an FSM (wider = datapath/counter, skipped).",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "content"
+  ],
+  "title": "Btor2CheckFsmRequest",
+  "type": "object"
+}

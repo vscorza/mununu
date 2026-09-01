@@ -926,7 +926,7 @@ pub struct Btor2CegarRequest {
 /// Request for the multi-engine safety portfolio endpoint
 /// (`POST /api/v1/btor2/verify`). Mirrors the CLI `mununu btor2 verify`: decides
 /// `bad`-reachability of a BTOR2 design across every available sound engine.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Btor2VerifyRequest {
     /// BTOR2 source content.
     pub content: String,
@@ -935,7 +935,7 @@ pub struct Btor2VerifyRequest {
 /// Response for `POST /api/v1/btor2/verify` — the merged portfolio verdict plus
 /// which engines reached each definite conclusion. Mirrors
 /// [`crate::adapter::reach_portfolio::ReachOutcome`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Btor2VerifyResponse {
     /// Canonical property verdict — `"holds"` (`bad` unreachable) | `"violated"`
     /// (reachable) | `"unknown"` (undecided / contradiction), via
@@ -955,7 +955,7 @@ pub struct Btor2VerifyResponse {
 /// `mununu btor2 verify-liveness`: decides `AG(request → AF grant)` via the l2s
 /// reduction + the portfolio. `request` / `grant` are register-comparison atom
 /// strings (`"st == 1"`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Btor2VerifyLivenessRequest {
     /// BTOR2 source content.
     pub content: String,
@@ -967,7 +967,7 @@ pub struct Btor2VerifyLivenessRequest {
 
 /// Response for `POST /api/v1/btor2/verify-liveness`. Mirrors
 /// [`crate::adapter::liveness_rescue::LivenessVerdict`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Btor2VerifyLivenessResponse {
     /// Canonical property verdict — `"holds"` | `"violated"` | `"unknown"`, via
     /// [`crate::verdict::PropertyVerdict`].
@@ -984,7 +984,7 @@ pub struct Btor2VerifyLivenessResponse {
 /// `mununu btor2 verify-liveness-all`: decides `⋀ᵢ AG(aᵢ → AF bᵢ)`. Each `responses`
 /// entry is a `"ANTE => CONS"` pair of register-comparison atoms. At least one
 /// required. Reuses [`Btor2VerifyLivenessResponse`] for the reply.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Btor2VerifyLivenessAllRequest {
     /// BTOR2 source content.
     pub content: String,
@@ -997,7 +997,7 @@ pub struct Btor2VerifyLivenessAllRequest {
 /// `mununu btor2 verify-recoverability`: decides `AG EF target` — "from every
 /// reachable state, can the design get back to `target`?". `target` is a single
 /// register-comparison atom string (`"state_q == 3"`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Btor2VerifyRecoverabilityRequest {
     /// BTOR2 source content.
     pub content: String,
@@ -1028,7 +1028,7 @@ pub struct Btor2VerifyRecoverabilityRequest {
 }
 
 /// Response for `POST /api/v1/btor2/verify-recoverability`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Btor2VerifyRecoverabilityResponse {
     /// Canonical property verdict — `"holds"` (every reachable state can reach
     /// `target`) | `"violated"` (a reachable trap cannot) | `"unknown"` (over the
@@ -1048,7 +1048,7 @@ pub struct Btor2VerifyRecoverabilityResponse {
 /// auto-discovers the FSM-like state registers and checks, from the reset state,
 /// whether any illegal encoding (a value outside the register's legal set) is
 /// reachable — with **no user input** (the legal set is derived from the design).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Btor2CheckFsmRequest {
     /// BTOR2 source content.
     pub content: String,
@@ -1062,7 +1062,7 @@ fn default_fsm_max_width() -> u32 {
 }
 
 /// One state register's illegal-encoding result in a [`Btor2CheckFsmResponse`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FsmRegisterFinding {
     /// The state register's symbol.
     pub register: String,
@@ -1076,7 +1076,7 @@ pub struct FsmRegisterFinding {
 }
 
 /// Response for `POST /api/v1/btor2/check-fsm`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Btor2CheckFsmResponse {
     /// Number of FSM-like state registers scanned.
     pub fsm_registers_checked: usize,
@@ -1171,7 +1171,7 @@ pub struct Btor2GameResponse {
 /// (`/api/v1/sv/verify`, `/sv/verify-liveness`, `/sv/verify-recoverability`). These
 /// lift the module (sv2v + Yosys) and then decide the corresponding BTOR2 property,
 /// returning the same `Btor2Verify*Response` shapes — one call, no `emit-btor2` step.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvVerifyRequest {
     /// SystemVerilog primary source content.
     pub source: String,
@@ -1193,7 +1193,7 @@ pub struct SvVerifyRequest {
 
 /// Request for `POST /api/v1/sv/verify-liveness` — the SV lift fields plus the
 /// response-liveness atoms.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvVerifyLivenessRequest {
     /// SystemVerilog primary source content.
     pub source: String,
@@ -1219,7 +1219,7 @@ pub struct SvVerifyLivenessRequest {
 /// Request for `POST /api/v1/sv/verify-liveness-all` — the SV lift fields plus the
 /// conjunction's `"ANTE => CONS"` response pairs. Mirrors the CLI
 /// `mununu sv verify-liveness-all`; reuses [`Btor2VerifyLivenessResponse`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvVerifyLivenessAllRequest {
     /// SystemVerilog primary source content.
     pub source: String,
@@ -1242,7 +1242,7 @@ pub struct SvVerifyLivenessAllRequest {
 
 /// Request for `POST /api/v1/sv/verify-recoverability` — the SV lift fields plus the
 /// recoverability target atom.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvVerifyRecoverabilityRequest {
     /// SystemVerilog primary source content.
     pub source: String,
@@ -1281,7 +1281,7 @@ pub struct SvVerifyRecoverabilityRequest {
 /// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width
 /// bound. Lifts the module and auto-scans every FSM register for a reachable illegal
 /// encoding (no property to name). Returns a [`Btor2CheckFsmResponse`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvCheckFsmRequest {
     /// SystemVerilog primary source content.
     pub source: String,

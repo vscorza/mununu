@@ -19,6 +19,7 @@ use crate::adapter::reach_portfolio::ReachVerdict;
 
 /// The canonical answer to "did the property hold?", shared by every verify surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub enum PropertyVerdict {
     /// The property holds on every reachable state / path — a sound proof.
     Holds,
@@ -44,6 +45,7 @@ pub enum PropertyVerdict {
 /// [`Self::vacuous`] + [`Self::bot_diagnosis`]; Phase 1 populates [`Self::config_partition`]; Phase 2
 /// populates [`Self::holds_under`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub struct VerdictRefinement {
     /// The recovery target is never reachable from the initial state — `AG EF(good)` is degenerate
     /// (the target is never entered), so the plain verdict is misleading. A SOUND witness (the
@@ -76,6 +78,7 @@ impl VerdictRefinement {
 
 /// See [`VerdictRefinement::vacuous`]. The recovery target is never reached.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub struct VacuityWitness {
     /// `good` is unreachable from the initial state (a sound reachability-portfolio `Unreachable`).
     pub good_unreachable: bool,
@@ -91,6 +94,7 @@ pub type ConfigValuation = Vec<(String, u64)>;
 /// exact-symbolic); `exhaustive` is true ONLY when the enumerated config set is the complete reachable
 /// set. (Populated in Phase 1.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub struct ConfigPartition {
     /// The config leaves case-split on: `(name, width)`.
     pub config_atoms: Vec<(String, u32)>,
@@ -111,6 +115,7 @@ pub struct ConfigPartition {
 
 /// The shape of a discovered environment assumption.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub enum AssumptionKind {
     /// An input held at a constant value (`en = 1`).
     InputHold,
@@ -139,6 +144,7 @@ pub enum AssumptionKind {
 /// See [`VerdictRefinement::holds_under`]. A CONDITIONAL result: the property holds under `phi`.
 /// (Populated in Phase 2.)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub struct DiscoveredAssumption {
     /// A human-readable predicate over named inputs (Phase 2b may carry a typed schedule/strategy).
     pub phi: String,

@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FileContent": {
+      "description": "File content with optional name",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Request for `POST /api/v1/sv/verify-recoverability` — the SV lift fields plus the recoverability target atom.",
+  "properties": {
+    "additional_sources": {
+      "default": [],
+      "description": "Additional SV sources (packages / includes).",
+      "items": {
+        "$ref": "#/definitions/FileContent"
+      },
+      "type": "array"
+    },
+    "config_values": {
+      "default": [],
+      "description": "Config-partition config inputs, each `\"NAME=v1,v2,...\"` (mirrors the CLI `--config-values`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "discover_assumptions": {
+      "default": false,
+      "description": "Assumption discovery (capability B): search for an enabling φ when the property does not hold → `holds_under` (conditional-only). Mirrors the CLI `--discover-assumptions`.",
+      "type": "boolean"
+    },
+    "predicates": {
+      "default": [],
+      "description": "Extra abstraction predicate(s) for the cube-path escalation, each `\"NAME:REGISTER=VALUE\"` (P2 Slice 1). Used only when the exact engine abstains.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "refine": {
+      "default": false,
+      "description": "Also compute a structured `refinement` alongside the verdict (mirrors the CLI `--refine`). Diagnostic-only — never changes the canonical verdict.",
+      "type": "boolean"
+    },
+    "source": {
+      "description": "SystemVerilog primary source content.",
+      "type": "string"
+    },
+    "target": {
+      "description": "The `good` atom to recover to (`\"REG op VALUE\"`).",
+      "type": "string"
+    },
+    "top": {
+      "default": null,
+      "description": "Top module for the lift (auto-detect when omitted).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "use_slang": {
+      "default": false,
+      "description": "Force the slang RTL front-end (`read_slang`). Requires the yosys-slang plugin. Default `false`.",
+      "type": "boolean"
+    },
+    "use_sv2v": {
+      "default": false,
+      "description": "Run sv2v before Yosys. Default `false`.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "source",
+    "target"
+  ],
+  "title": "SvVerifyRecoverabilityRequest",
+  "type": "object"
+}
