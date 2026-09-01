@@ -333,6 +333,42 @@ portfolio engines) — an agent can trust a definite verdict and treat `unknown`
 
 ---
 
+## Preflight: `sv lint` — the partial-write registers the lift can't keep
+
+> Source of truth: [`sv_lint_registers`](../crates/mununu-core/src/adapter/sv_verify.rs#L228) — surface: (CLI+API+UI)
+
+Some SystemVerilog is **not lifted faithfully**, and the verifier is honest about
+it: a plain-vector partial register assignment (`q[hi:lo] <= d`) leaves `q`'s other
+bits undriven, so the yosys-slang front end models them as **free inputs** (havoc)
+and aliases the register name to the `concat` that mixes them. A state predicate
+over `q` would then read those free inputs, so the engine **refuses** (skips) such a
+property rather than emit an unsound verdict (the monono#partsel soundness guard —
+see [`recoverability-vs-sva.md`](design/recoverability-vs-sva.md)). The packed-2-D
+`q[idx] <= d` split (anonymous *sub-registers*, no free inputs) is kept and decides;
+a fully-written register is faithful.
+
+`sv lint` surfaces exactly those refusable registers **at CI time** — it lifts the
+design and scans it (~lift cost, **no** model checking, cap-immune, ~0.1 s) so an
+unfaithful lift is caught *before* the minutes-long formal gate runs. It **changes
+no verdict**; it is a read-only preflight.
+
+```bash
+mununu --quiet sv lint rtl/mod.sv --frontend slang        # exit 2 ⇒ a register can't be kept
+```
+
+```jsonc
+// POST /api/v1/sv/lint  →
+{ "signals_flagged": 2, "registers_flagged": 1,
+  "findings": [ { "signal": "a_q", "kind": "register" },     // the root
+                { "signal": "o_partsel", "kind": "output" } ] }   // a downstream output of it
+```
+
+`kind` is `"register"` (the root — the register whose bits are undriven) or
+`"output"` (a combinational output that reads one; a property over it is refused for
+the same reason). A finding maps to the shared CI gate's `violated` verdict, so the
+default `--fail-on violated` fails the build; `--fail-on none` makes it advisory. A
+clean design reports zero findings and exits `0`.
+
 ## Using mununu in CI (GitHub Actions and friends)
 
 > Source of truth: [`FailOn` / `ci_exit_code`](../crates/mununu-cli/src/main.rs) — surface: CLI

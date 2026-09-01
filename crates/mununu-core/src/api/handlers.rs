@@ -1342,6 +1342,61 @@ fn sv_check_fsm_handler_impl(request: SvCheckFsmRequest) -> ApiResult<Json<Btor2
     }))
 }
 
+/// monono#partsel preflight (#469) — lift SV and report the partial-write
+/// registers the verifier cannot keep faithfully, with no model checking. Surface
+/// peer of the CLI `mununu sv lint`; read-only, changes no verdict.
+pub async fn sv_lint_handler(
+    Json(request): Json<SvLintRequest>,
+) -> ApiResult<Json<SvLintResponse>> {
+    blocking(move || sv_lint_handler_impl(request)).await
+}
+
+fn sv_lint_handler_impl(request: SvLintRequest) -> ApiResult<Json<SvLintResponse>> {
+    use crate::adapter::sv_verify::{SvLift, SvLintSignalKind, sv_lint_registers};
+
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+        // As with the other SV-direct handlers: the request stages include content
+        // by name, so an on-disk include-search dir is a CLI-only concept here.
+        include_dirs: Vec::new(),
+        frontend: if request.use_slang {
+            crate::adapter::yosys::SvFrontend::Slang
+        } else {
+            crate::adapter::yosys::SvFrontend::Auto
+        },
+    };
+
+    let findings = sv_lint_registers(&lift).map_err(|message| ApiError::BadRequest {
+        message,
+        details: None,
+    })?;
+
+    let registers_flagged = findings
+        .iter()
+        .filter(|f| f.kind == SvLintSignalKind::Register)
+        .count();
+    let findings = findings
+        .into_iter()
+        .map(|f| SvLintFinding {
+            signal: f.signal,
+            kind: f.kind.as_str().to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(SvLintResponse {
+        signals_flagged: findings.len(),
+        registers_flagged,
+        findings,
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the

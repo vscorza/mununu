@@ -171,6 +171,112 @@ pub fn sv_check_fsm(
     crate::adapter::fsm_scan::fsm_encoding_scan(&btor2, max_width)
 }
 
+/// Whether a lint finding names a state register (or its alias) or a
+/// combinational output derived from one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SvLintSignalKind {
+    /// A state register — the root of the finding: the RTL front-end left some of
+    /// its bits undriven (modelled as free inputs).
+    Register,
+    /// A combinational output that reads such a register — flagged downstream of a
+    /// `Register` finding (a property over it would be refused for the same reason).
+    Output,
+}
+
+impl SvLintSignalKind {
+    /// The stable lowercase tag used across the CLI JSON / API / UI surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SvLintSignalKind::Register => "register",
+            SvLintSignalKind::Output => "output",
+        }
+    }
+}
+
+/// One `sv lint` finding — a named signal whose lift the engine cannot keep
+/// faithfully (monono#partsel): its cone reaches an ANONYMOUS free input, so a
+/// state predicate over it would be *refused* (skipped) by the verifier rather
+/// than mis-decided. See [`sv_lint_registers`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SvLintFinding {
+    /// The offending signal's symbol (register name or the combinational output).
+    pub signal: String,
+    /// Whether `signal` is the register itself or a downstream output.
+    pub kind: SvLintSignalKind,
+}
+
+/// `sv lint` — lift SV and report, at CI time (~lift cost, no bit-blast / no
+/// model checking), every register whose partial-write lift the verifier can NOT
+/// keep faithfully.
+///
+/// This is the read-only, cap-immune preflight for the monono#partsel soundness
+/// refusal shipped in #464/#465: the yosys-slang lift of a plain-vector partial
+/// register assignment (`q[hi:lo] <= d`) models `q`'s *unwritten* bits as free
+/// `input`s (havoc) and aliases the register name to the `concat` mixing them, so
+/// a state predicate over `q` reads those free inputs and would be unsound — the
+/// verifier *refuses* (skips) such a property up front
+/// ([`parser::signal_reaches_anonymous_input`]). `sv lint` surfaces exactly those
+/// registers *before* the ~minutes-long formal gate runs, so a design whose lift
+/// is unfaithful is caught in ~0.1 s. It changes **no verdict**: a faithful state
+/// cell (read_verilog / sv2v) and a packed-2-D `q[idx] <= d` split (anonymous
+/// *sub-registers*, no free inputs — the NID-indexed cone keeps them) are both
+/// NOT flagged; the latter decides.
+///
+/// Findings are deterministic (sorted by name, deduplicated); a name that is both
+/// a register alias and an output is reported once, as a `Register`.
+pub fn sv_lint_registers(lift: &SvLift) -> Result<Vec<SvLintFinding>, String> {
+    let btor2 = lift.lift()?;
+    lint_undriven_partial_writes(&btor2)
+}
+
+/// The pure BTOR2 core of [`sv_lint_registers`] — parse the flattened design and
+/// return every named register/output whose cone reaches an anonymous free input.
+/// Split out so the regression suite can exercise it on a captured BTOR2 fixture
+/// with no sv2v / Yosys on the host.
+fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, String> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::parser::signal_reaches_anonymous_input;
+
+    let file = parser::parse(btor2).map_err(|e| format!("BTOR2 parse: {e}"))?;
+
+    // Candidate name universe = exactly the names `signal_reaches_anonymous_input`
+    // can match on: State + Op(symbol) → a register (the partsel alias `a_q` is a
+    // `uext`/`concat` Op carrying the register's name), Output(symbol) → a
+    // combinational output. `Register` wins when a name appears as both.
+    let mut kinds: std::collections::BTreeMap<String, SvLintSignalKind> =
+        std::collections::BTreeMap::new();
+    for line in &file.lines {
+        let (name, kind) = match &line.node {
+            Node::State {
+                symbol: Some(s), ..
+            }
+            | Node::Op {
+                symbol: Some(s), ..
+            } => (s, SvLintSignalKind::Register),
+            Node::Output {
+                symbol: Some(s), ..
+            } => (s, SvLintSignalKind::Output),
+            _ => continue,
+        };
+        kinds
+            .entry(name.clone())
+            .and_modify(|k| {
+                if kind == SvLintSignalKind::Register {
+                    *k = SvLintSignalKind::Register;
+                }
+            })
+            .or_insert(kind);
+    }
+
+    // BTreeMap keeps the output sorted-by-name (deterministic).
+    Ok(kinds
+        .into_iter()
+        .filter(|(name, _)| signal_reaches_anonymous_input(&file, name))
+        .map(|(signal, kind)| SvLintFinding { signal, kind })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +307,121 @@ mod tests {
     fn recoverability_rejects_malformed_target_before_lift() {
         let e = sv_verify_recoverability(&lift_of("module m; endmodule"), "not an atom !!");
         assert!(e.is_err(), "a malformed target must be rejected pre-lift");
+    }
+
+    // monono#partsel lint core — the yosys-slang lift of a plain-vector partial
+    // register assignment (`a_q[11:8] <= val`), captured verbatim so the
+    // regression runs in make-ci without slang. `a_q`'s unwritten bits are free
+    // `input`s (nid 17, 21) mixed into the `concat` its name aliases; `o_partsel`
+    // reads them. `b_q`/`c_q`/`d_q` (and their outputs) reach only the *named*
+    // `val` input — faithful, never flagged. `sv lint` reports exactly the pair
+    // the verifier would refuse: `a_q` (register) + `o_partsel` (output).
+    const SLANG_PARTSEL_LIFT: &str = r#"1 sort bitvec 1
+2 input 1 clk
+3 one 1 rst_n
+4 sort bitvec 4
+5 input 4 val
+6 sort bitvec 16
+7 const 6 0000000000000000
+8 state 6
+9 ite 6 3 8 7
+10 redor 1 9
+11 output 10 o_concat
+12 state 6
+13 ite 6 3 12 7
+14 redor 1 13
+15 output 14 o_lowconcat
+16 sort bitvec 8
+17 input 16
+18 const 4 0000
+19 state 4
+20 ite 4 3 19 18
+21 input 4
+22 sort bitvec 12
+23 concat 22 20 17
+24 concat 6 21 23
+25 redor 1 24
+26 output 25 o_partsel
+27 state 6
+28 ite 6 3 27 7
+29 redor 1 28
+30 output 29 o_plain
+31 uext 6 24 0 a_q
+32 uext 6 9 0 b_q
+33 uext 6 13 0 c_q
+34 uext 6 28 0 d_q
+35 slice 16 9 7 0
+36 concat 22 5 35
+37 slice 4 9 15 12
+38 concat 6 37 36
+39 ite 6 3 38 7
+40 next 6 8 39
+41 const 22 000000000000
+42 concat 6 41 5
+43 ite 6 3 42 7
+44 next 6 12 43
+45 ite 4 3 5 18
+46 next 4 19 45
+47 ite 6 3 42 7
+48 next 6 27 47
+49 constd 6 0
+50 init 6 8 49
+51 constd 6 0
+52 init 6 12 51
+53 constd 4 0
+54 init 4 19 53
+55 constd 6 0
+56 init 6 27 55
+"#;
+
+    #[test]
+    fn lint_reports_only_the_undriven_partial_write_signals() {
+        let findings =
+            lint_undriven_partial_writes(SLANG_PARTSEL_LIFT).expect("lint parses the BTOR2");
+        let names: Vec<&str> = findings.iter().map(|f| f.signal.as_str()).collect();
+        // Exactly the register whose unwritten bits are free inputs, plus the one
+        // output that reads it — deterministic, sorted, deduplicated.
+        assert_eq!(
+            names,
+            vec!["a_q", "o_partsel"],
+            "lint must flag the undriven partial-write register + its output, and \
+             NOTHING faithful (b_q/c_q/d_q reach only the named `val`)"
+        );
+        assert_eq!(
+            findings[0].kind,
+            SvLintSignalKind::Register,
+            "a_q is a register"
+        );
+        assert_eq!(
+            findings[1].kind,
+            SvLintSignalKind::Output,
+            "o_partsel is an output"
+        );
+    }
+
+    #[test]
+    fn lint_is_clean_when_every_register_is_faithful() {
+        // A fully-driven single register: no free inputs, no findings.
+        const FAITHFUL: &str = "1 sort bitvec 1
+2 input 1 d
+3 state 1 q
+4 next 1 3 2
+5 zero 1
+6 init 1 3 5
+";
+        let findings = lint_undriven_partial_writes(FAITHFUL).expect("lint parses");
+        assert!(
+            findings.is_empty(),
+            "a faithful register driven by a named input must not be flagged; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn lint_rejects_malformed_btor2() {
+        assert!(
+            lint_undriven_partial_writes("not btor2 at all").is_err(),
+            "a malformed BTOR2 body must surface a parse error, not an empty pass"
+        );
     }
 
     // P2 industrial anchor — recoverability on REAL OpenTitan RTL. From every reachable
@@ -241,6 +462,53 @@ mod tests {
             PropertyVerdict::Holds,
             "AG EF idle must HOLD on the AES cipher-control FSM (every reachable state can \
              return to CIPHER_CTRL_IDLE); got {verdict:?}"
+        );
+    }
+
+    // monono#partsel — the real slang lift of a plain-vector partial register
+    // assignment. `a_q[11:8] <= val` leaves `a_q`'s other bits undriven → slang
+    // models them as free inputs → `sv lint` flags `a_q`; `b_q` is written in full
+    // → faithful → not flagged. The `--frontend slang` path is what produces the
+    // free-input shape (read_verilog/sv2v models it differently), so this pins the
+    // slang front end. Runs only in the mununu-sva image.
+    #[test]
+    #[ignore = "requires yosys-slang (mununu-sva docker image); run with --ignored"]
+    fn e2e_sv_lint_flags_slang_partial_write_register() {
+        const SRC: &str = r#"module partsel_lint (
+  input  logic       clk,
+  input  logic       rst_n,
+  input  logic [3:0] val
+);
+  logic [15:0] a_q;  // only [11:8] written -> unwritten bits are free inputs (slang)
+  logic [15:0] b_q;  // written in full -> faithful state cell
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      a_q <= '0;
+      b_q <= '0;
+    end else begin
+      a_q[11:8] <= val;
+      b_q       <= {12'b0, val};
+    end
+  end
+endmodule
+"#;
+        let lift = SvLift {
+            source: SRC.to_string(),
+            additional_sources: Vec::new(),
+            top: Some("partsel_lint".into()),
+            use_sv2v: false,
+            include_dirs: Vec::new(),
+            frontend: SvFrontend::Slang,
+        };
+        let findings = sv_lint_registers(&lift).expect("lint lifts + scans the design");
+        let names: Vec<&str> = findings.iter().map(|f| f.signal.as_str()).collect();
+        assert!(
+            names.iter().any(|n| *n == "a_q"),
+            "the partial-write register a_q must be flagged; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "b_q"),
+            "the fully-written register b_q is faithful and must NOT be flagged; got {names:?}"
         );
     }
 
