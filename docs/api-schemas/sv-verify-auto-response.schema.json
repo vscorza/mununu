@@ -1,0 +1,248 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CexCellView": {
+      "description": "One register's concrete value in a counterexample state.",
+      "properties": {
+        "register": {
+          "type": "string"
+        },
+        "value": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "register",
+        "value"
+      ],
+      "type": "object"
+    },
+    "CounterexampleView": {
+      "description": "D1.8b — a stall-lasso counterexample for the API (mirrors `ExactCounterexample`): reset → `prefix` → repeating `cycle`, each state an ordered list of register cells.",
+      "properties": {
+        "cycle": {
+          "description": "The repeating stall cycle; the last state steps back to `cycle[0]`.",
+          "items": {
+            "items": {
+              "$ref": "#/definitions/CexCellView"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "prefix": {
+          "description": "States from the reset state up to (excluding) the cycle entry.",
+          "items": {
+            "items": {
+              "$ref": "#/definitions/CexCellView"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "unreachable_target": {
+          "description": "A.4 — for a `Violated` bare `EF p` (reachability): the target predicate atoms that are UNREACHABLE from reset (\"the design never reaches these\"). Empty for the stall-lasso / trap-path (liveness) counterexamples, which carry `prefix`/`cycle`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cycle",
+        "prefix"
+      ],
+      "type": "object"
+    },
+    "ModelDiagnosticsView": {
+      "description": "Model-level lift diagnostics (mirrors [`crate::adapter::slang::verify_auto::ModelDiagnostics`]).",
+      "properties": {
+        "auto_provided_stubs": {
+          "description": "Cut flop-primitive modules for which a behavioral stub was auto-injected so the register survives the lift (e.g. `prim_sparse_fsm_flop`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "blackboxed_modules": {
+          "description": "Modules instantiated without a body, cut to free inputs (registers they drive are not modeled as state). Empty for a self-contained design.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "gated_resets": {
+          "description": "Reset inputs pinned inactive at the model level (`\"<signal>=<value>\"`), with their `disable iff` guards dropped from the formulas. Empty when reset-gating is off or no `disable iff` reset was recognized.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state_register_count": {
+          "description": "Number of state register lines in the lifted model.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "auto_provided_stubs",
+        "blackboxed_modules",
+        "gated_resets",
+        "state_register_count"
+      ],
+      "type": "object"
+    },
+    "PropertyVerdictView": {
+      "description": "One property's auto-verification verdict (mirrors `PropertyVerdict`).",
+      "properties": {
+        "counterexample": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CounterexampleView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D1.8b — a concrete stall-lasso counterexample, present only for a Violated bare `AF p` decided by the exact engine (`engine: \"exact-symbolic\"`)."
+        },
+        "detail": {
+          "description": "`false_cells` (violated) / `unknown_cells` (unknown) / the skip reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "formula": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "`\"assert\"` | `\"assume\"` | `\"cover\"`.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "outcome": {
+          "description": "`\"holds\"` | `\"violated\"` | `\"unknown\"` | `\"skipped\"`.",
+          "type": "string"
+        },
+        "seeded_predicates": {
+          "description": "The cube predicates auto-seeded for this property (atom strings).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "formula",
+        "kind",
+        "name",
+        "outcome",
+        "seeded_predicates"
+      ],
+      "type": "object"
+    },
+    "UnsupportedAssertionView": {
+      "description": "An assertion outside the supported fragment (mirrors `UnsupportedAssertion`).",
+      "properties": {
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "VerificationNoteView": {
+      "description": "One provenance note (mirrors [`crate::adapter::slang::verify_auto::VerificationNote`]).",
+      "properties": {
+        "detail": {
+          "description": "Longer explanation (the why + the soundness/scope implication).",
+          "type": "string"
+        },
+        "items": {
+          "description": "Structured operands (e.g. `[\"cfg_detect_timer_i=7\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "Machine-stable kebab category (e.g. `\"config-concretization\"`).",
+          "type": "string"
+        },
+        "level": {
+          "description": "`\"info\"` | `\"scope-caveat\"` | `\"soundness-caveat\"`.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "One-line human summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "detail",
+        "items",
+        "kind",
+        "level",
+        "summary"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Response for `/api/v1/sv/verify-auto`.",
+  "properties": {
+    "diagnostics": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelDiagnosticsView"
+        }
+      ],
+      "description": "Model-level diagnostics: state-register count + black-boxed (cut) modules. Lets a SKIPPED outcome point at its root cause."
+    },
+    "notes": {
+      "default": [],
+      "description": "H.J — human-facing provenance notes: every abstraction / scoping decision the run made (config concretizations, reset-gating, flop stubs, cut modules, the abstraction posture, the coverage summary), so a verdict's scope and caveats are explicit in the payload.",
+      "items": {
+        "$ref": "#/definitions/VerificationNoteView"
+      },
+      "type": "array"
+    },
+    "properties": {
+      "items": {
+        "$ref": "#/definitions/PropertyVerdictView"
+      },
+      "type": "array"
+    },
+    "unsupported": {
+      "description": "Assertions that did not translate (reuses the extract-sva view shape; `kind` is `None` here).",
+      "items": {
+        "$ref": "#/definitions/UnsupportedAssertionView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "diagnostics",
+    "properties",
+    "unsupported"
+  ],
+  "title": "SvVerifyAutoResponse",
+  "type": "object"
+}

@@ -68,6 +68,13 @@ axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", optional = true, features = ["cors", "trace", "timeout"] }
 tokio = { version = "1", optional = true, features = ["full"] }
+# JSON Schema derivation for the API wire types — powers `docs/api-schemas/`
+# generated schema files + the drift-detector test that ensures the committed
+# schemas match the current Rust types. Feature-gated behind `api` since the
+# derived types themselves are api-only. Chosen over `utoipa` because we
+# don't (yet) need a full OpenAPI spec / axum handler integration —
+# consumers want the schema file, not a runtime `/openapi.json` endpoint.
+schemars = { version = "0.8", optional = true }
 
 # AST extraction (optional — tree-sitter grammars for source code analysis)
 tree-sitter = { version = "0.24", optional = true }
@@ -117,7 +124,7 @@ rand_chacha = "0.3"
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:schemars"]
 ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust"]
 syntcomp = []
 # Optimization-programme features (see notebook/0000-overview.md). Each is

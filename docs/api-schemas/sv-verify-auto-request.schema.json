@@ -1,0 +1,173 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FileContent": {
+      "description": "File content with optional name",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "XL.6b — automated SVA verification endpoint (`POST /api/v1/sv/verify-auto`). Mirrors the CLI `mununu sv verify-auto`: extract the design's SVA, lift, and verify each property against the model with no sidecar. slang parses SV directly, but the verify lift uses sv2v + Yosys, so `top` / `use_sv2v` apply.",
+  "properties": {
+    "additional_sources": {
+      "default": [],
+      "description": "Additional SV sources (packages / `include` targets).",
+      "items": {
+        "$ref": "#/definitions/FileContent"
+      },
+      "type": "array"
+    },
+    "auto_stub_flops": {
+      "default": null,
+      "description": "Auto-inject behavioral stubs for cut flop primitives (e.g. OpenTitan's `prim_sparse_fsm_flop`) so the register survives the lift (default `true`). Set `false` to leave cut flops reported as black-boxed.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "config_values": {
+      "default": [],
+      "description": "H.J.b — config concretization: pin wide config inputs to constants so comparisons against them become decidable. Each entry `\"signal=value\"` (e.g. `\"cfg_detect_timer_i=7\"`). The verdicts are then SCOPED to these values (surfaced as a `config-concretization` note). Default empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "counter_bounds": {
+      "default": [],
+      "description": "H.H — counter upper bounds: seed a `signal <= value` cube-partition to refine a counter-monotonicity property (`cnt_q >= $past(cnt_q)`) whose ⊥ is caused by the abstract 32-bit wraparound. Each entry `\"signal<=value\"` (the `\"signal=value\"` spelling is also accepted, same meaning). Sound (a partition, not an assumption — the must-edges verify it); requires `must_edge_inference` on. Bounds are also auto-derived from `config_values`; a manual entry here overrides the inferred one. Surfaced as a `counter-bound` note. Default empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "cutpoint": {
+      "default": [],
+      "description": "Control-slice cut points, mirroring the CLI `--cutpoint`: net names to replace with a free `$anyseq` input in the SV → BTOR2 lift (Yosys `cutpoint w:<net>`), so the FSM's datapath guards drop out of the cone via cone-of-influence — the sound, netlist-level way to fit `\"exact-symbolic\"` on a wide control FSM. Each entry is a bare net name (e.g. `\"must_refresh\"`). OVER-APPROXIMATION: a definite HOLDS transfers for a SAFETY / universal property (safety + over-approx); for an ALTERNATING (νμ) recoverability property (`AG EF`) a HOLDS is sound for the abstract model only (νμ collapses under approximation) — decide those on the un-cutpointed cone. A definite VIOLATED is sound only when guard-independent (an orphaned FSM state). Surfaced as a `control-slice` note. Default empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "engine": {
+      "default": null,
+      "description": "Engine selector, mirroring the CLI `--engine`: `\"explicit\"`, `\"symbolic\"`, `\"exact-symbolic\"`, `\"portfolio-sequential\"`, `\"portfolio-parallel\"`. **Unspecified ⇒ the default `\"portfolio-sequential\"`** (2026-07-06): run exact → symbolic → explicit, stopping when every property is decided — the most precise sound choice, no slower than the former `explicit` default on designs `explicit` already decided. Resolved by `verify_auto::engine_selection`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gate_reset": {
+      "default": null,
+      "description": "Reset-gating: drop recognized `disable iff (reset)` guards and pin the reset input inactive at the model level (default `true`). Set `false` to keep the guard and leave the reset free.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "max_iterations": {
+      "default": null,
+      "description": "Max CEGAR iterations per property (default 16).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "must_edge_inference": {
+      "default": null,
+      "description": "Must-edge inference per property (default `\"off\"`; `\"smt-hyper-must\"` gives sound νμ verdicts).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "no_antecedent_shadow": {
+      "default": null,
+      "description": "mununu#476 item 4 — disable antecedent shadow-register synthesis for the exact-symbolic engine (default `false` ⇒ shadow-synth enabled, the shipped behaviour). Set `true` to force the Phase A refusal for SVA `|=>` properties whose antecedent combinationally reaches primary inputs — the differential-oracle / debug knob mirrored on the CLI as `--no-antecedent-shadow` and via the process-global `MUNUNU_NO_ANTECEDENT_SHADOW=1` env var. Per-request opt-out is thread-safe (unlike the env var, which is process-global).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "params": {
+      "default": [],
+      "description": "Module-parameter overrides applied via yosys `chparam -set` before the lift (mirrors the CLI `--param`). Each entry is `\"NAME=VALUE\"` (applied to the top module) or `\"MODULE.NAME=VALUE\"` (scoped to `MODULE`). Shrinks a parameterised timing interval so its counters get smaller — without a wrapper module (which would rename the SVA atoms). A parameter yosys cannot apply is an ERROR (never silently dropped); the verdicts are scoped to the applied values (surfaced as a `parameter-override` note). Default empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "predicate": {
+      "default": [],
+      "description": "Abstraction-predicate hints, mirroring the CLI `--predicate` and the in-source `// @mununu_predicate <expr>` annotation (all three are merged). Each entry is a predicate expression (`\"reg == value\"`, `\"reg == reg\"`, `\"reg >= K\"`) seeded as a cube dimension for EVERY property, even when absent from the property formula. Sound by monotonicity — a hint only refines the cube (a ⊥ can become definite; a definite verdict never flips; an unclassifiable hint is dropped). Default empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "rescue_bottom_liveness": {
+      "default": null,
+      "description": "Liveness-⊥ escalation (default `true`): a *box-AF* liveness property `AG(a → AF b)` the cube leaves ⊥ is retried via the liveness-to-safety reduction + the reachability portfolio. Set `false` to report the cube's ⊥ unchanged. Only fires on the l2s-able box-AF shape (diamond-EF recoverability stays on the νμ path).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "rescue_bottom_recoverability": {
+      "default": null,
+      "description": "Recoverability-⊥ escalation (default `true`): a νμ recoverability property `AG EF good` the cube leaves ⊥ is retried via the cube + `smt-hyper-must` νμ path. Set `false` to report the cube's ⊥ unchanged. Only fires on the `AG EF (REG == VALUE)` shape.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "rescue_bottom_safety": {
+      "default": null,
+      "description": "Safety-⊥ escalation (default `true`): a *safety* property the cube leaves ⊥ (a reducible AG-invariant) is retried with the multi-engine reachability portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). Set `false` to report the cube's ⊥ unchanged. Only fires on ⊥ reducible AG-invariants.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "source": {
+      "description": "SystemVerilog primary source content.",
+      "type": "string"
+    },
+    "top": {
+      "default": null,
+      "description": "Top module for the SV → BTOR2 lift (auto-detect when omitted).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "use_slang": {
+      "default": false,
+      "description": "Force the slang RTL front-end (`read_slang`) for modern-SV constructs yosys/sv2v reject. Mirrors `--frontend slang`. Requires the yosys-slang plugin. Default `false`.",
+      "type": "boolean"
+    },
+    "use_sv2v": {
+      "default": false,
+      "description": "Run sv2v before Yosys (modern SV). Mirrors `--preprocess-sv2v`.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "source"
+  ],
+  "title": "SvVerifyAutoRequest",
+  "type": "object"
+}
