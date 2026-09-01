@@ -43,6 +43,8 @@ Fall back to the Phase A refusal when any of these hold:
 - **A's cone reaches an anonymous free input** (the `signal_reaches_anonymous_input` case at symbolic_bitblast.rs:3410). The partial-write havoc pattern is a different soundness posture; shadow-synth doesn't fix it. Refuse.
 - **`--no-antecedent-shadow` flag on the CLI / `antecedent_shadow: false` in the API.** Explicit user opt-out for debugging or differential-oracle purposes. Refuse and cite the flag in the diagnostic.
 
+**Multi-atom antecedents (extended 2026-08 post-mununu#476 shipping).** The detector was originally single-atom-only: `(a && b) |=> c` fell through to the Phase A refusal. It now walks any Boolean subtree under the antecedent-side `Not` — `And`, `Or`, nested `Not` — and collects every `Predicate` leaf as an independent shadow target. Soundness: independent shadows compose correctly for `And` (`shadow(A) ∧ shadow(B) = A@N ∧ B@N`), `Or` (`shadow(A) ∨ shadow(B) = A@N ∨ B@N`), and negation (`!shadow(A) = !A@N`). The five fallback conditions above still apply per-leaf — if any leaf is a bare primary input, that leaf falls through to the Phase A refusal even in a multi-atom context; the other leaves still get shadows. See `detect_pipeimplies_antecedent_atoms` in `mu_calculus/mod.rs`.
+
 ## Implementation shape
 
 ### New module — `crates/mununu-core/src/adapter/btor2/antecedent_shadow.rs`

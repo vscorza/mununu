@@ -379,22 +379,40 @@ pub struct FormulaVar {
 /// mununu#476 — detect antecedent atoms of the canonical `|=>` SVA lift shape.
 ///
 /// The SVA lift of `A |=> B` emits (as a mu-calc string) `(!A || [] B)`, which
-/// the parser turns into `Or(Not(Predicate(A)), Modal { Box, _, ... })`. This
-/// helper walks the formula arena and returns every atom name that appears in
-/// the antecedent position of such a shape, deduped and sorted.
+/// the parser turns into `Or(Not(<antecedent-expr>), Modal { Box, _, ... })`.
+/// This helper walks the formula arena and returns every atom name that appears
+/// in the antecedent position of such a shape, deduped and sorted.
 ///
-/// **Soundness note**: any formula of the shape `Or(Not(Predicate(A)), Box(B))`
-/// has `A → next B` semantics — the same as SVA `A |=> B` — regardless of source
-/// (SVA lift, hand-authored, other rewrite pass). So detecting the shape here and
-/// asking the caller to substitute `A` → `shadow(A)` (where `shadow` samples A per
-/// cycle) is verdict-preserving. See `docs/design/antecedent-shadow-synthesis.md`.
+/// **Antecedent shape** (extended 2026-08 per mununu#475 follow-up): the negated
+/// subtree may be a single `Predicate(A)` (single-atom antecedent — the shipped
+/// case) OR a Boolean tree of `And` / `Or` / nested `Not` over `Predicate` leaves
+/// (multi-atom antecedents like `(a && b) |=> c`, `(a || b) |=> c`,
+/// `(a && !b) |=> c`). Every leaf `Predicate(name)` under the antecedent-side
+/// `Not` is collected; the caller applies a shadow to each one independently.
 ///
-/// **Non-goal**: multi-atom antecedents like `(a && b) |=> c` — the AST shape is
-/// `Or(Not(And(Predicate(a), Predicate(b))), Box(_))`, not caught here. Those
-/// atoms fall through to the exact engine's Phase A refusal (still sound). A
-/// future extension can walk the negated Boolean tree; the current scope is the
-/// single-atom antecedent that dominates real SVA.
+/// **Soundness note**: any formula of the shape `Or(Not(φ), Box(ψ))` has
+/// `φ → next ψ` semantics — the same as SVA `φ |=> ψ` — regardless of source
+/// (SVA lift, hand-authored, other rewrite pass). Independent shadows compose
+/// correctly for `And` (`shadow(A) ∧ shadow(B) = A@N ∧ B@N`), `Or`
+/// (`shadow(A) ∨ shadow(B) = A@N ∨ B@N`), and negation (`!shadow(A) = !A@N`).
+/// See `docs/design/antecedent-shadow-synthesis.md`.
 pub fn detect_pipeimplies_antecedent_atoms(formula: &Formula) -> Vec<String> {
+    /// Walk any Boolean subtree (`And` / `Or` / `Not` / `Predicate`) and collect
+    /// every `Predicate` leaf's name. Non-Boolean nodes (Modal / fixpoint /
+    /// Variable / True / False) are silently skipped — they would not appear in
+    /// a well-formed SVA antecedent, but if they do, they are not shadow targets.
+    fn collect_predicate_leaves(formula: &Formula, id: NodeId, out: &mut Vec<String>) {
+        match formula.node(id) {
+            Node::Predicate(name) => out.push(name.clone()),
+            Node::And(l, r) | Node::Or(l, r) => {
+                collect_predicate_leaves(formula, *l, out);
+                collect_predicate_leaves(formula, *r, out);
+            }
+            Node::Not(inner) => collect_predicate_leaves(formula, *inner, out),
+            _ => {}
+        }
+    }
+
     let mut out: Vec<String> = Vec::new();
     for node in formula.nodes() {
         let Node::Or(l, r) = node else {
@@ -404,9 +422,6 @@ pub fn detect_pipeimplies_antecedent_atoms(formula: &Formula) -> Vec<String> {
             let Node::Not(inner) = formula.node(ante_id) else {
                 continue;
             };
-            let Node::Predicate(name) = formula.node(*inner) else {
-                continue;
-            };
             let Node::Modal {
                 kind: ModalKind::Box,
                 ..
@@ -414,7 +429,7 @@ pub fn detect_pipeimplies_antecedent_atoms(formula: &Formula) -> Vec<String> {
             else {
                 continue;
             };
-            out.push(name.clone());
+            collect_predicate_leaves(formula, *inner, &mut out);
             break;
         }
     }
@@ -869,6 +884,64 @@ mod tests {
         assert_eq!(
             detect_pipeimplies_antecedent_atoms(&f),
             vec!["p".to_string(), "r".to_string()],
+        );
+    }
+
+    /// mununu#475 follow-up (item 3 of the shadow-synth follow-up list) —
+    /// multi-atom AND antecedent: `(a && b) |=> c` lifts to
+    /// `Or(Not(And(Predicate(a), Predicate(b))), Box(Predicate(c)))`.
+    /// Every leaf under the Not is collected as a shadow candidate.
+    #[test]
+    fn detect_pipeimplies_and_antecedent_collects_all_leaves() {
+        let f = parser::parse("(not (a and b) or [] c)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["a".to_string(), "b".to_string()],
+        );
+    }
+
+    /// OR antecedent: `(a || b) |=> c` — every leaf is a shadow candidate,
+    /// because shadowing `A` and `B` independently gives
+    /// `shadow(A) ∨ shadow(B) = A@N ∨ B@N`.
+    #[test]
+    fn detect_pipeimplies_or_antecedent_collects_all_leaves() {
+        let f = parser::parse("(not (a or b) or [] c)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["a".to_string(), "b".to_string()],
+        );
+    }
+
+    /// Mixed AND + nested-NOT antecedent: `(a && !b) |=> c`. The inner `Not`
+    /// under the antecedent-side `Not` is followed to reach `b`.
+    #[test]
+    fn detect_pipeimplies_mixed_and_negation_antecedent() {
+        let f = parser::parse("(not (a and not b) or [] c)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["a".to_string(), "b".to_string()],
+        );
+    }
+
+    /// Duplicate leaves are deduped: `(a && a && b) |=> c` yields `[a, b]`,
+    /// not `[a, a, b]`.
+    #[test]
+    fn detect_pipeimplies_dedupes_repeated_leaves() {
+        let f = parser::parse("(not ((a and a) and b) or [] c)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["a".to_string(), "b".to_string()],
+        );
+    }
+
+    /// A nested compound antecedent inside a full safety envelope — the
+    /// canonical shape a real SVA `(cond1 && cond2) |=> next` lift emits.
+    #[test]
+    fn detect_pipeimplies_multi_atom_under_safety_envelope() {
+        let f = parser::parse("nu X. ((not (req and grant) or [] (state == 1)) and [] X)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["grant".to_string(), "req".to_string()],
         );
     }
 

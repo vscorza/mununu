@@ -217,8 +217,18 @@ answer):
   case — restate as `AG(prev(A) → C)` if truly desired).
 - Cone reaches an anonymous free input from a partial-write havoc
   (a different soundness posture; see `signal_reaches_anonymous_input`).
-- Multi-atom antecedents like `(a && b) |=> c` (initial scope caught the
-  single-atom case; extension to Boolean-tree antecedents is a follow-up).
+- Any leaf inside a multi-atom antecedent that itself hits one of the four
+  conditions above (e.g. a leaf that IS a primary input). The remaining
+  leaves still get shadows; only the problematic leaf falls through to the
+  Phase A refusal.
+
+Multi-atom antecedents like `(a && b) |=> c`, `(a || b) |=> c`, and
+`(a && !b) |=> c` are supported as of 2026-08 (extended from the initial
+single-atom scope). The detector walks any Boolean subtree under the
+antecedent-side `Not` and returns every `Predicate` leaf as an independent
+shadow target. Independent shadows compose correctly:
+`shadow(A) ∧ shadow(B) = A@N ∧ B@N`, `shadow(A) ∨ shadow(B) = A@N ∨ B@N`,
+`!shadow(A) = !A@N`.
 
 **Opt-out** — the `MUNUNU_NO_ANTECEDENT_SHADOW=1` environment variable
 disables shadow-synth even for `|=>` shapes, reverting to the Phase A refusal.
