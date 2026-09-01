@@ -317,6 +317,19 @@ The load-bearing rules at a glance:
 
 The full policy — with the abstraction-soundness procedure, the extraction-pipeline contract, the RTL evidence rules, the C-extractor unit-vs-end-to-end distinction, and the editorial framing rules for LinkedIn / Substack / talks — is at [`docs/policies/claims-integrity.md`](docs/policies/claims-integrity.md). Read it before publishing anything that references a real system.
 
+## Cross-Repo Impact Reporting
+
+Every PR that changes user-visible behaviour of a mununu surface consumed by a downstream repo (ROSF, monono, mununu-ui, or any future consumer) must ship a **consumer briefing** — a single markdown file under [`docs/consumer-briefings/`](docs/consumer-briefings/) — that names the consumers affected, explains what changed for them, and states which Docker images (if any) need rebuilding.
+
+The load-bearing rules at a glance:
+
+- **When it fires.** Verdict-value or verdict-message changes; JSON response-shape changes; CLI flag adds/removes/renames; HTTP route adds/removes; verdict-semantics changes (properties that used to `Skipped` now decide, `Holds` becomes `Violated` or vice versa — bugfixes count); subprocess-tool version bumps in `docker/Dockerfile*`; sidecar-schema changes.
+- **What the briefing contains.** Audience banner, TL;DR, per-consumer section (what to update, what to expect, report-parsing impact, Docker rebuild disposition, test-the-transition steps), a mandatory Docker-rebuild table (`Image | Impact | Rebuild required?` — no blanks, no "Maybe"), a shared footer, provenance (fix commit + issue + design doc + policy link), and a "not covered here" follow-ups list.
+- **Where it lives.** `docs/consumer-briefings/YYYY-MM-<slug>.md`. One file per PR that fires the policy; a multi-surface PR gets ONE briefing covering all changes so consumers read one document per adoption round.
+- **What is exempt.** Internal refactors that preserve every observable behaviour; test-only changes; doc changes that only clarify existing behaviour; changes to `REVIEW_LOG.md`, `ONBOARDING.md`, or `scratchpad/`.
+
+The full policy — trigger criteria, mandatory sections, standard Docker-rebuild verdict vocabulary, enforcement notes, and the historical context that motivated writing it down — is at [`docs/policies/cross-repo-impact.md`](docs/policies/cross-repo-impact.md). Read it before opening a PR that touches any mununu-consumer surface.
+
 ## Adapter / Emitter Capability Use
 
 The CLTS data model and CTXDSL grammar already express more than most adapters reach for. When writing or modifying an extractor, adapter, or emitter, prefer these primitives over re-encoding source-language features as state-name suffixes or parallel single-label edges.
@@ -451,6 +464,8 @@ Reference and how-to material — read when the task calls for it, not on every 
 - [`docs/adapters/extraction.md`](docs/adapters/extraction.md) — `.espec.json` extraction adapter, mode filtering, property templates.
 - [`docs/adapters/tlsf-aiger.md`](docs/adapters/tlsf-aiger.md) — Turn-based compound-label encoding for TLSF and AIGER.
 - [`docs/policies/claims-integrity.md`](docs/policies/claims-integrity.md) — Full claims-integrity policy (10 rules + editorial framing).
+- [`docs/policies/cross-repo-impact.md`](docs/policies/cross-repo-impact.md) — Cross-repo impact reporting: when a PR must ship a consumer briefing under `docs/consumer-briefings/`, mandatory sections, and the Docker-rebuild-disposition table format.
+- [`docs/design/antecedent-shadow-synthesis.md`](docs/design/antecedent-shadow-synthesis.md) — Antecedent shadow-register synthesis for SVA `|=>` with input-derived antecedents (mununu#476 fix).
 - [`docs/design/black-box-modules.md`](docs/design/black-box-modules.md) — Document A (foundations of black-box contracts).
 - [`docs/design/rtl-frontend-unification.md`](docs/design/rtl-frontend-unification.md) — Document B (SV frontends).
 - [`docs/design/contract-corpus-and-config.md`](docs/design/contract-corpus-and-config.md) — Document D (corpus + annotations).

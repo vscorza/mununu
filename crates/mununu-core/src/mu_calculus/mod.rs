@@ -376,6 +376,87 @@ pub struct FormulaVar {
     pub name: String,
 }
 
+/// mununu#476 — detect antecedent atoms of the canonical `|=>` SVA lift shape.
+///
+/// The SVA lift of `A |=> B` emits (as a mu-calc string) `(!A || [] B)`, which
+/// the parser turns into `Or(Not(Predicate(A)), Modal { Box, _, ... })`. This
+/// helper walks the formula arena and returns every atom name that appears in
+/// the antecedent position of such a shape, deduped and sorted.
+///
+/// **Soundness note**: any formula of the shape `Or(Not(Predicate(A)), Box(B))`
+/// has `A → next B` semantics — the same as SVA `A |=> B` — regardless of source
+/// (SVA lift, hand-authored, other rewrite pass). So detecting the shape here and
+/// asking the caller to substitute `A` → `shadow(A)` (where `shadow` samples A per
+/// cycle) is verdict-preserving. See `docs/design/antecedent-shadow-synthesis.md`.
+///
+/// **Non-goal**: multi-atom antecedents like `(a && b) |=> c` — the AST shape is
+/// `Or(Not(And(Predicate(a), Predicate(b))), Box(_))`, not caught here. Those
+/// atoms fall through to the exact engine's Phase A refusal (still sound). A
+/// future extension can walk the negated Boolean tree; the current scope is the
+/// single-atom antecedent that dominates real SVA.
+pub fn detect_pipeimplies_antecedent_atoms(formula: &Formula) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for node in formula.nodes() {
+        let Node::Or(l, r) = node else {
+            continue;
+        };
+        for (ante_id, cons_id) in [(*l, *r), (*r, *l)] {
+            let Node::Not(inner) = formula.node(ante_id) else {
+                continue;
+            };
+            let Node::Predicate(name) = formula.node(*inner) else {
+                continue;
+            };
+            let Node::Modal {
+                kind: ModalKind::Box,
+                ..
+            } = formula.node(cons_id)
+            else {
+                continue;
+            };
+            out.push(name.clone());
+            break;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Return a new [`Formula`] identical to `formula` except that every
+/// `Node::Predicate(name)` whose `name` appears in `subs` is replaced with
+/// `Node::Predicate(subs[name])`. Preserves the root, fixpoint variables,
+/// modality guards, and all NodeId indices — so callers who computed
+/// NodeId-referenced side data on `formula` may continue to use the new one.
+///
+/// Empty-`subs` fast path: returns a clone of `formula` (no rewrite work).
+///
+/// Callers: SVA-lift path in `symbolic_bitblast.rs::exact_symbolic_verdict`,
+/// after `antecedent_shadow::synthesize_shadows` returns a rename map.
+pub fn substitute_predicates(
+    formula: &Formula,
+    subs: &std::collections::BTreeMap<String, String>,
+) -> Formula {
+    if subs.is_empty() {
+        return formula.clone();
+    }
+    let new_nodes: Vec<Node> = formula
+        .nodes()
+        .iter()
+        .map(|node| match node {
+            Node::Predicate(name) => {
+                if let Some(replacement) = subs.get(name) {
+                    Node::Predicate(replacement.clone())
+                } else {
+                    node.clone()
+                }
+            }
+            _ => node.clone(),
+        })
+        .collect();
+    Formula::new(formula.root(), new_nodes, formula.vars().to_vec())
+}
+
 /// Typed μ-calculus node inside a [`Formula`] arena.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
@@ -584,8 +665,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::PropertyClass;
     use super::parser;
+    use super::{Node, PropertyClass, detect_pipeimplies_antecedent_atoms, substitute_predicates};
 
     #[test]
     fn parses_basic_formula() {
@@ -741,6 +822,88 @@ mod tests {
                 .box_modality_count(),
             2
         );
+    }
+
+    /// mununu#476 — the `|=>` shape detector should identify the canonical
+    /// SVA-lift output `nu X. ((¬A ∨ □B) ∧ □X)` and return `A`.
+    #[test]
+    fn detect_pipeimplies_finds_canonical_lift_shape() {
+        let f = parser::parse("nu X. ((not a or [] b) and [] X)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["a".to_string()]
+        );
+    }
+
+    /// Detector is order-agnostic within an `Or` — `(<> _) || ¬A` counts too.
+    #[test]
+    fn detect_pipeimplies_order_agnostic() {
+        let f = parser::parse("nu X. (([] c or not b) and [] X)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["b".to_string()]
+        );
+    }
+
+    /// Non-`|=>` shapes (bare `EF`, bare box-only, no negated antecedent) return
+    /// nothing — the exact engine's Phase A refusal handles those.
+    #[test]
+    fn detect_pipeimplies_ignores_ef_shape() {
+        let f = parser::parse("mu Y. (a or <> Y)").unwrap();
+        assert!(detect_pipeimplies_antecedent_atoms(&f).is_empty());
+    }
+
+    /// `<>` (diamond) in the consequent is NOT the `|=>` shape (that's `A → EF B`,
+    /// not `A → next B`). Detector must not match.
+    #[test]
+    fn detect_pipeimplies_diamond_consequent_ignored() {
+        let f = parser::parse("(not a or <> b)").unwrap();
+        assert!(detect_pipeimplies_antecedent_atoms(&f).is_empty());
+    }
+
+    /// Multiple `|=>` conjuncts — a GR(1)-style property with several antecedents —
+    /// each antecedent is picked up. Result is sorted + deduped.
+    #[test]
+    fn detect_pipeimplies_multiple_antecedents() {
+        let f = parser::parse("nu X. (((not p or [] q) and (not r or [] s)) and [] X)").unwrap();
+        assert_eq!(
+            detect_pipeimplies_antecedent_atoms(&f),
+            vec!["p".to_string(), "r".to_string()],
+        );
+    }
+
+    /// `substitute_predicates` swaps the named predicates and leaves everything
+    /// else (variables, modality guards, non-substituted atoms) untouched.
+    #[test]
+    fn substitute_predicates_rewrites_named_atoms_only() {
+        use std::collections::BTreeMap;
+        let f = parser::parse("nu X. ((not mem_rvalid_mine or [] (q == 0)) and [] X)").unwrap();
+        let mut subs = BTreeMap::new();
+        subs.insert(
+            "mem_rvalid_mine".to_string(),
+            "_mununu_antshadow_0".to_string(),
+        );
+        let g = substitute_predicates(&f, &subs);
+        let atoms: Vec<&str> = g
+            .nodes()
+            .iter()
+            .filter_map(|n| match n {
+                Node::Predicate(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(atoms.contains(&"_mununu_antshadow_0"));
+        assert!(atoms.contains(&"q == 0"));
+        assert!(!atoms.contains(&"mem_rvalid_mine"));
+    }
+
+    /// Empty-`subs` fast path returns a clone (formulas equal).
+    #[test]
+    fn substitute_predicates_empty_subs_is_identity() {
+        use std::collections::BTreeMap;
+        let f = parser::parse("mu Y. (a or <> Y)").unwrap();
+        let g = substitute_predicates(&f, &BTreeMap::new());
+        assert_eq!(f, g);
     }
 
     #[test]
