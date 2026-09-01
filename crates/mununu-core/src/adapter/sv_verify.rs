@@ -503,11 +503,11 @@ endmodule
         let findings = sv_lint_registers(&lift).expect("lint lifts + scans the design");
         let names: Vec<&str> = findings.iter().map(|f| f.signal.as_str()).collect();
         assert!(
-            names.iter().any(|n| *n == "a_q"),
+            names.contains(&"a_q"),
             "the partial-write register a_q must be flagged; got {names:?}"
         );
         assert!(
-            !names.iter().any(|n| *n == "b_q"),
+            !names.contains(&"b_q"),
             "the fully-written register b_q is faithful and must NOT be flagged; got {names:?}"
         );
     }
