@@ -1756,6 +1756,18 @@ struct SvVerifyAutoArgs {
     /// this to report the cube's ⊥ verdict unchanged for both.
     #[arg(long = "no-rescue")]
     no_rescue: bool,
+    /// mununu#476 item 4 — disable antecedent shadow-register synthesis for
+    /// the exact-symbolic engine. By default (shipped as of mununu#478), an
+    /// SVA `|=>` property whose antecedent combinationally reaches primary
+    /// inputs gets an automatic shadow-register rewrite and DECIDES; pass
+    /// this to force the Phase A refusal instead (properties `Skipped` with
+    /// the "combinationally driven by primary input" message). Differential-
+    /// oracle / debug use — production runs should leave this unset. Mirrored
+    /// on the API as `no_antecedent_shadow: true` and via the process-global
+    /// `MUNUNU_NO_ANTECEDENT_SHADOW=1` env var (per-request opt-out here is
+    /// thread-safe; the env var is not).
+    #[arg(long = "no-antecedent-shadow")]
+    no_antecedent_shadow: bool,
     /// H.J.b — config concretization: pin a wide config input to a constant so
     /// comparisons against it become decidable (e.g. a timer threshold).
     /// Repeatable; format `SIGNAL=VALUE` (e.g. `--config-value
@@ -3687,6 +3699,8 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         rescue_bottom_recoverability: !args.no_rescue,
         // `sv verify-auto` verifies the design as-lifted; mutation is the `sv mutate` verb's job.
         mutation: None,
+        // mununu#476 item 4 — --no-antecedent-shadow reverts to the Phase A refusal.
+        antecedent_shadow: !args.no_antecedent_shadow,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

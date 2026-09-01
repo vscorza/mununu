@@ -1796,6 +1796,10 @@ fn sv_verify_auto_handler_impl(
         rescue_bottom_recoverability: request.rescue_bottom_recoverability.unwrap_or(true),
         // `verify-auto` verifies the design as-lifted; mutation is the `sv mutate` verb's job.
         mutation: None,
+        // mununu#476 item 4 — per-request antecedent shadow-synth opt-out.
+        // `no_antecedent_shadow: true` reverts to the Phase A refusal; default
+        // (unspecified / false) keeps the shipped shadow-synth behaviour.
+        antecedent_shadow: !request.no_antecedent_shadow.unwrap_or(false),
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {

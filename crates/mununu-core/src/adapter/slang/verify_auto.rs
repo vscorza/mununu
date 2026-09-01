@@ -809,6 +809,18 @@ pub struct VerifyAutoOptions {
     /// `verify-auto` surfaces never populate it. See
     /// [`crate::adapter::btor2::mutate`].
     pub mutation: Option<crate::adapter::btor2::mutate::Mutation>,
+    /// mununu#476 item 4 — whether antecedent shadow-register synthesis is
+    /// enabled for the exact-symbolic engine. `true` (default) matches the
+    /// shipped shadow-synth behaviour: SVA `|=>` properties whose antecedent
+    /// combinationally reaches primary inputs get an automatic shadow-register
+    /// rewrite and DECIDE. `false` reverts to the Phase A transitive-fan-in
+    /// refusal (properties `Skipped` with the "combinationally driven by
+    /// primary input" message) — the differential-oracle / debug knob, mirrored
+    /// on the CLI as `--no-antecedent-shadow` and on the API as
+    /// `no_antecedent_shadow: true`. The process-global
+    /// `MUNUNU_NO_ANTECEDENT_SHADOW=1` env var is the third channel; either
+    /// channel disabling shadow-synth wins.
+    pub antecedent_shadow: bool,
 }
 
 /// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
@@ -867,6 +879,7 @@ impl Default for VerifyAutoOptions {
             rescue_bottom_liveness: true,
             rescue_bottom_recoverability: true,
             mutation: None,
+            antecedent_shadow: true,
         }
     }
 }
@@ -2600,41 +2613,47 @@ pub(crate) fn verify_auto_impl(
         // (build errors above the bit cap ⇒ Skipped).
         if opts.exact_symbolic {
             use crate::adapter::btor2::symbolic_bitblast::{
-                ExactVerdict, exact_symbolic_verdict_with_witness,
+                ExactSymbolicOptions, ExactVerdict, exact_symbolic_verdict_with_witness_and_options,
             };
-            let (outcome, counterexample) =
-                match exact_symbolic_verdict_with_witness(&btor2, &formula) {
-                    Ok((ExactVerdict::Holds, _)) => (VerifyOutcome::Holds, None),
-                    Ok((ExactVerdict::Violated, witness)) => {
-                        // A definite full-state counterexample (not a cube tally). For a
-                        // liveness/recoverability failure (`AF p` / `AG AF p` / `AG EF p`)
-                        // the witness carries the concrete path (stall lasso / trap path).
-                        // Failing that, a bare `EF p` (reachability) violation carries the
-                        // A.4 unreachable-target witness — no trace, because the target is
-                        // simply never reached (sound under the over-approximating cut).
-                        (
-                            VerifyOutcome::Violated { false_cells: 1 },
-                            witness
-                                .map(exact_counterexample_from_lasso)
-                                .or_else(|| ef_unreachable_counterexample(&formula)),
-                        )
+            let exact_opts = ExactSymbolicOptions {
+                antecedent_shadow_enabled: opts.antecedent_shadow,
+            };
+            let (outcome, counterexample) = match exact_symbolic_verdict_with_witness_and_options(
+                &btor2,
+                &formula,
+                &exact_opts,
+            ) {
+                Ok((ExactVerdict::Holds, _)) => (VerifyOutcome::Holds, None),
+                Ok((ExactVerdict::Violated, witness)) => {
+                    // A definite full-state counterexample (not a cube tally). For a
+                    // liveness/recoverability failure (`AF p` / `AG AF p` / `AG EF p`)
+                    // the witness carries the concrete path (stall lasso / trap path).
+                    // Failing that, a bare `EF p` (reachability) violation carries the
+                    // A.4 unreachable-target witness — no trace, because the target is
+                    // simply never reached (sound under the over-approximating cut).
+                    (
+                        VerifyOutcome::Violated { false_cells: 1 },
+                        witness
+                            .map(exact_counterexample_from_lasso)
+                            .or_else(|| ef_unreachable_counterexample(&formula)),
+                    )
+                }
+                Err(e) => {
+                    // RANKING RESCUE — the bit-blaster is over-cap (a wide counter);
+                    // a recoverability `AG EF <cnt == N>` may still HOLD by a
+                    // well-founded datapath descent the exact engine can't fit. Route
+                    // it to the scalable ranking/recoverability engine before abstaining.
+                    match try_ranking_recoverability(&btor2, &formula) {
+                        Some(outcome) => (outcome, None),
+                        None => (
+                            VerifyOutcome::Skipped {
+                                reason: format!("exact symbolic MC: {e}"),
+                            },
+                            None,
+                        ),
                     }
-                    Err(e) => {
-                        // RANKING RESCUE — the bit-blaster is over-cap (a wide counter);
-                        // a recoverability `AG EF <cnt == N>` may still HOLD by a
-                        // well-founded datapath descent the exact engine can't fit. Route
-                        // it to the scalable ranking/recoverability engine before abstaining.
-                        match try_ranking_recoverability(&btor2, &formula) {
-                            Some(outcome) => (outcome, None),
-                            None => (
-                                VerifyOutcome::Skipped {
-                                    reason: format!("exact symbolic MC: {e}"),
-                                },
-                                None,
-                            ),
-                        }
-                    }
-                };
+                }
+            };
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
@@ -3139,7 +3158,7 @@ pub(crate) fn rescue_skipped_via_exact(
     opts: &VerifyAutoOptions,
 ) -> Vec<VerificationNote> {
     use crate::adapter::btor2::symbolic_bitblast::{
-        ExactVerdict, exact_symbolic_verdict_with_witness,
+        ExactSymbolicOptions, ExactVerdict, exact_symbolic_verdict_with_witness_and_options,
     };
     use crate::mu_calculus::parser as mu_parser;
 
@@ -3149,6 +3168,9 @@ pub(crate) fn rescue_skipped_via_exact(
     if !opts.gate_reset || opts.exact_symbolic {
         return notes;
     }
+    let exact_opts = ExactSymbolicOptions {
+        antecedent_shadow_enabled: opts.antecedent_shadow,
+    };
     for prop in report.properties.iter_mut() {
         if !matches!(prop.outcome, VerifyOutcome::Skipped { .. }) {
             continue;
@@ -3156,7 +3178,7 @@ pub(crate) fn rescue_skipped_via_exact(
         let Ok(formula) = mu_parser::parse(&prop.formula) else {
             continue;
         };
-        match exact_symbolic_verdict_with_witness(design_btor2, &formula) {
+        match exact_symbolic_verdict_with_witness_and_options(design_btor2, &formula, &exact_opts) {
             Ok((ExactVerdict::Holds, _)) => {
                 prop.outcome = VerifyOutcome::Holds;
                 prop.counterexample = None;
