@@ -1389,6 +1389,17 @@ pub struct SvMutateRequest {
     /// recoverability property under `drop-reset`). Default off.
     #[serde(default)]
     pub must_edge_inference: Option<String>,
+    /// mununu#475 item 4 — parity with `POST /api/v1/sv/verify-auto`'s
+    /// `params`. Override module parameters BEFORE elaboration. Each entry
+    /// is `"NAME=VALUE"` (top-module scope) or `"MODULE.NAME=VALUE"`
+    /// (submodule scope; slang applies it top-level by bare name).
+    /// Shrinks a parameterised design so its counters fit the bit-blast
+    /// cap during the baseline + mutant re-verify; blocks that need
+    /// `params` to verify at all could not previously be mutated via the
+    /// API. A malformed entry is a HARD `BadRequest`; yosys errors
+    /// downstream on a parameter it cannot apply — never a silent drop.
+    #[serde(default)]
+    pub params: Vec<String>,
 }
 
 /// The mutation targets available in a design (the `list` response payload).

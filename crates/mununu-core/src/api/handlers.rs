@@ -1418,6 +1418,32 @@ fn sv_mutate_handler_impl(request: SvMutateRequest) -> ApiResult<Json<SvMutateRe
     for f in &request.additional_sources {
         sources.push((f.name.clone(), f.content.clone()));
     }
+    // mununu#475 item 4 — --param API parity. Same parse shape as the CLI
+    // + as `sv verify-auto`'s params: `NAME=VALUE` or `MODULE.NAME=VALUE`,
+    // both sides non-empty. A malformed entry is a HARD BadRequest here;
+    // yosys errors downstream on a parameter it cannot apply.
+    let params: Vec<(String, String)> = request
+        .params
+        .iter()
+        .map(|e| {
+            let (lhs, val) = e.split_once('=').ok_or_else(|| ApiError::BadRequest {
+                message: format!(
+                    "malformed `params` entry '{e}': expected NAME=VALUE or MODULE.NAME=VALUE"
+                ),
+                details: None,
+            })?;
+            let (lhs, val) = (lhs.trim(), val.trim());
+            if lhs.is_empty() || val.is_empty() {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "malformed `params` entry '{e}': NAME and VALUE must both be non-empty"
+                    ),
+                    details: None,
+                });
+            }
+            Ok((lhs.to_string(), val.to_string()))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let yopts = YosysOptions {
         top: request.top.clone(),
         additional_sources: request
@@ -1431,6 +1457,7 @@ fn sv_mutate_handler_impl(request: SvMutateRequest) -> ApiResult<Json<SvMutateRe
         } else {
             SvFrontend::Auto
         },
+        params,
         ..Default::default()
     };
 
