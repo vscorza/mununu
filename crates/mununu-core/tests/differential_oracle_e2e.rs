@@ -1776,3 +1776,63 @@ fn e2e_sv_mutate_stick_flips_recoverability() {
         "the mutation must be caught by ≥1 property"
     );
 }
+
+// #468b off-by-one — a counter that wraps at 8 (`cnt == 8 → 0`). `AG (cnt != 9)`
+// HOLDS on the design as-lifted (cnt maxes at 8). `off-by-one:cnt` perturbs the
+// wrap bound `cnt == 8` to `cnt == 9`, so the counter now reaches 9 before wrapping
+// → the property FLIPS to Violated. Validates the targeting transform through the
+// real lift + verify.
+const WRAP_CTR_SV: &str = r#"module wrapctr (
+  input  logic       clk_i,
+  input  logic       rst_ni,
+  output logic [3:0] cnt_o
+);
+  logic [3:0] cnt;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)          cnt <= 4'd0;
+    else if (cnt == 4'd8) cnt <= 4'd0;
+    else                  cnt <= cnt + 4'd1;
+  end
+  assign cnt_o = cnt;
+endmodule
+"#;
+
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn e2e_sv_mutate_off_by_one_flips_a_threshold_property() {
+    use mununu_core::adapter::btor2::mutate::Mutation;
+    use mununu_core::adapter::slang::verify_auto::mutate_and_compare;
+
+    let src = format!("// @mununu_guarantee nu X. ((cnt != 9) and [] X)\n{WRAP_CTR_SV}");
+    let sources = [("wrapctr.sv".to_string(), src)];
+    let yopts = YosysOptions {
+        top: Some("wrapctr".to_string()),
+        use_sv2v: true,
+        ..Default::default()
+    };
+    let base_opts = VerifyAutoOptions {
+        exact_symbolic: true,
+        config_values: [("rst_ni".to_string(), 1u64)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let report = mutate_and_compare(
+        &sources,
+        &yopts,
+        &base_opts,
+        Mutation::parse("off-by-one:cnt").expect("parse off-by-one:cnt"),
+    )
+    .expect("mutate_and_compare runs baseline + mutant");
+
+    let flip = report
+        .properties
+        .iter()
+        .find(|p| p.baseline == "holds")
+        .expect("AG(cnt!=9) holds at baseline (cnt wraps at 8)");
+    assert!(
+        flip.flipped && flip.mutant == "violated",
+        "moving the wrap bound 8→9 must FLIP AG(cnt!=9) holds→violated; got baseline={} mutant={}",
+        flip.baseline,
+        flip.mutant
+    );
+}
