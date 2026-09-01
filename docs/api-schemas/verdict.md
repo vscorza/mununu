@@ -4,6 +4,14 @@
 >
 > **Source of truth:** [`crates/mununu-core/src/verdict.rs`](../../crates/mununu-core/src/verdict.rs) (types) + [`crates/mununu-core/src/api/models.rs`](../../crates/mununu-core/src/api/models.rs) (JSON views). This document mirrors those types; a divergence between this doc and the code is a `doc`-severity finding.
 >
+> **Machine-readable schemas** are shipped alongside this file:
+> [`sv-verify-auto-request.schema.json`](sv-verify-auto-request.schema.json) +
+> [`sv-verify-auto-response.schema.json`](sv-verify-auto-response.schema.json)
+> (JSON Schema Draft-07, derived from the Rust types via `schemars`). Consumers
+> should code against these for type-generation and validation; this document
+> covers the semantics the schema can't express. See [`README.md`](README.md)
+> for the consumer flow and drift-detector guarantee.
+>
 > **Audience:** downstream consumers that parse mununu's `POST /api/v1/sv/verify-auto` JSON responses — ROSF (subprocess `--profile industrial`), monono (direct CLI/API), any custom orchestrator.
 
 Mununu's verify surfaces (CLI, HTTP API, UI) all speak one verdict vocabulary. This document pins down the JSON wire format for the `sv verify-auto` response — the shape downstream tools should code against.

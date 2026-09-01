@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 // ============================================================================
 
 /// File content with optional name
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct FileContent {
     pub name: String,
     pub content: String,
@@ -1547,7 +1547,7 @@ pub struct TranslatedAssertionView {
 }
 
 /// An assertion outside the supported fragment (mirrors `UnsupportedAssertion`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct UnsupportedAssertionView {
     pub name: String,
     pub kind: Option<String>,
@@ -1568,7 +1568,7 @@ pub struct ShadowSignalView {
 /// Mirrors the CLI `mununu sv verify-auto`: extract the design's SVA, lift, and
 /// verify each property against the model with no sidecar. slang parses SV
 /// directly, but the verify lift uses sv2v + Yosys, so `top` / `use_sv2v` apply.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SvVerifyAutoRequest {
     /// SystemVerilog primary source content.
     pub source: String,
@@ -1687,7 +1687,7 @@ pub struct SvVerifyAutoRequest {
 }
 
 /// Response for `/api/v1/sv/verify-auto`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SvVerifyAutoResponse {
     pub properties: Vec<PropertyVerdictView>,
     /// Assertions that did not translate (reuses the extract-sva view shape;
@@ -1706,7 +1706,7 @@ pub struct SvVerifyAutoResponse {
 
 /// One provenance note (mirrors
 /// [`crate::adapter::slang::verify_auto::VerificationNote`]).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerificationNoteView {
     /// Machine-stable kebab category (e.g. `"config-concretization"`).
     pub kind: String,
@@ -1722,7 +1722,7 @@ pub struct VerificationNoteView {
 
 /// Model-level lift diagnostics (mirrors
 /// [`crate::adapter::slang::verify_auto::ModelDiagnostics`]).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ModelDiagnosticsView {
     /// Number of state register lines in the lifted model.
     pub state_register_count: usize,
@@ -1739,7 +1739,7 @@ pub struct ModelDiagnosticsView {
 }
 
 /// One property's auto-verification verdict (mirrors `PropertyVerdict`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct PropertyVerdictView {
     pub name: String,
     /// `"assert"` | `"assume"` | `"cover"`.
@@ -1759,7 +1759,7 @@ pub struct PropertyVerdictView {
 
 /// D1.8b — a stall-lasso counterexample for the API (mirrors `ExactCounterexample`):
 /// reset → `prefix` → repeating `cycle`, each state an ordered list of register cells.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CounterexampleView {
     /// States from the reset state up to (excluding) the cycle entry.
     pub prefix: Vec<Vec<CexCellView>>,
@@ -1773,7 +1773,7 @@ pub struct CounterexampleView {
 }
 
 /// One register's concrete value in a counterexample state.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CexCellView {
     pub register: String,
     pub value: u64,
