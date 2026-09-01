@@ -1303,6 +1303,52 @@ pub struct SvCheckFsmRequest {
     pub max_width: u32,
 }
 
+/// Request for `POST /api/v1/sv/lint` — the SV-direct partial-write preflight.
+/// Lifts SystemVerilog and reports every register whose partial-write lift the
+/// verifier cannot keep faithfully (monono#partsel), with no model checking.
+/// Surface peer of the CLI `mununu sv lint`.
+#[derive(Debug, Deserialize)]
+pub struct SvLintRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// Force the slang RTL front-end (`read_slang`). Requires the yosys-slang
+    /// plugin. Default `false`.
+    #[serde(default)]
+    pub use_slang: bool,
+}
+
+/// One `sv lint` finding — a named signal whose partial-write lift reaches an
+/// undriven (free-input) register bit, so a state predicate over it would be
+/// *refused* (skipped) by the verifier. Element of [`SvLintResponse`].
+#[derive(Debug, Serialize)]
+pub struct SvLintFinding {
+    /// The offending signal's symbol (register name or a combinational output of one).
+    pub signal: String,
+    /// `"register"` (the root — the register itself) | `"output"` (a downstream
+    /// combinational output that reads it).
+    pub kind: String,
+}
+
+/// Response for `POST /api/v1/sv/lint`.
+#[derive(Debug, Serialize)]
+pub struct SvLintResponse {
+    /// Number of named signals flagged (registers + downstream outputs).
+    pub signals_flagged: usize,
+    /// Number of the flagged signals that are state registers (the root findings).
+    pub registers_flagged: usize,
+    /// Per-signal findings (sorted by name).
+    pub findings: Vec<SvLintFinding>,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2

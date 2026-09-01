@@ -1472,6 +1472,14 @@ enum SvCommand {
     /// reach a value outside its enum (an unambiguous bug). Surface peer of
     /// `POST /api/v1/sv/check-fsm`.
     CheckFsm(SvCheckFsmArgs),
+    /// Lift SV and report — at CI time (~lift cost, no model checking) — every
+    /// register whose partial-write lift the verifier cannot keep faithfully
+    /// (monono#partsel): a plain-vector `q[hi:lo] <= d` whose unwritten bits the
+    /// front-end models as free inputs. These are exactly the registers a state
+    /// predicate would be *refused* on (skipped, never mis-decided) by the formal
+    /// gate — surfaced in ~0.1 s before the minutes-long verify. Read-only, changes
+    /// no verdict. Surface peer of `POST /api/v1/sv/lint`.
+    Lint(SvLintArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1924,6 +1932,15 @@ struct SvCheckFsmArgs {
     /// Max state-register width to treat as an FSM (wider = datapath/counter, skipped).
     #[arg(long, value_name = "BITS", default_value_t = mununu_core::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH)]
     max_width: u32,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu sv lint` — the CI-time partial-write preflight.
+#[derive(Args, Debug)]
+struct SvLintArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -5426,6 +5443,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::VerifyLivenessAll(args) => sv_verify_liveness_all(args),
         SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
         SvCommand::CheckFsm(args) => sv_check_fsm(args),
+        SvCommand::Lint(args) => sv_lint(args),
     }
 }
 
@@ -5645,6 +5663,48 @@ fn sv_check_fsm(args: SvCheckFsmArgs) -> Result<(), String> {
     print_json_summary(&summary)?;
 
     let worst = worst_verdict(findings.iter().map(|f| PropertyVerdict::as_str(f.verdict)));
+    ci_gate_exit(worst, args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu sv lint` — lift SV then report the partial-write registers the verifier
+/// cannot keep faithfully (monono#partsel). CI-time preflight; changes no verdict.
+/// A finding maps to the `violated` CI verdict, so the default `--fail-on violated`
+/// fails the build when the lift is unfaithful; `--fail-on none` makes it advisory.
+fn sv_lint(args: SvLintArgs) -> Result<(), String> {
+    use mununu_core::adapter::sv_verify::sv_lint_registers;
+
+    let file = args.lift.primary_display();
+    let findings = sv_lint_registers(&read_sv_lift(&args.lift)?)?;
+
+    let signals: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "signal": f.signal,
+                "kind": f.kind.as_str(),
+            })
+        })
+        .collect();
+    let registers_flagged = findings
+        .iter()
+        .filter(|f| f.kind == mununu_core::adapter::sv_verify::SvLintSignalKind::Register)
+        .count();
+    let summary = serde_json::json!({
+        "file": file,
+        "signals_flagged": findings.len(),
+        "registers_flagged": registers_flagged,
+        "findings": signals,
+    });
+    print_json_summary(&summary)?;
+
+    // A finding is the lint's `violated`; a clean run is `holds`. Reuses the shared
+    // CI gate so `--fail-on {violated|unknown|none}` behaves like the verify verbs.
+    let worst = if findings.is_empty() {
+        "holds"
+    } else {
+        "violated"
+    };
     ci_gate_exit(worst, args.ci.fail_on);
     Ok(())
 }

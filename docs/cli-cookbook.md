@@ -97,3 +97,19 @@ MUNUNU_CVC5_PATH=/opt/cvc5/bin/cvc5 mununu btor2 cegar --file design.btor2 --pre
 ```
 
 When `--predicate-source craig` is selected but CVC5 isn't found at runtime, mununu emits a structured warning + falls back to the WP heuristic automatically — the verification verdict is still computed; only the predicate-discovery mechanism is degraded. See [`docs/external-tools.md`](external-tools.md#cvc5) for full install instructions on macOS, Debian/Ubuntu, and the cross-platform GitHub release tarball.
+
+## Preflight a SystemVerilog design for unfaithful partial-write registers
+
+> Source of truth: [`sv_lint_registers`](../crates/mununu-core/src/adapter/sv_verify.rs#L228) — surface: (CLI+API+UI)
+
+`mununu sv lint` lifts a SystemVerilog design and reports — at CI time (~lift cost, **no** model checking, ~0.1 s) — every register whose partial-write lift the verifier cannot keep faithfully (a plain-vector `q[hi:lo] <= d` whose unwritten bits the front end models as free inputs). These are exactly the registers a state predicate would be *refused* on by the formal gate, surfaced *before* the minutes-long verify. It changes no verdict.
+
+```bash
+# Report the unfaithful partial-write registers; exit 2 if any (a CI gate).
+mununu --quiet sv lint rtl/mod.sv --frontend slang
+
+# Advisory (report-only, always exit 0):
+mununu --quiet sv lint rtl/mod.sv --frontend slang --fail-on none
+```
+
+The JSON on stdout lists each flagged `signal` with a `kind` of `"register"` (the root — the register itself) or `"output"` (a downstream combinational output of one). See [`docs/verifying-rtl.md`](verifying-rtl.md) for the soundness background (the monono#partsel guard).
