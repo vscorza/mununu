@@ -1479,6 +1479,13 @@ enum SvCommand {
     /// predicate would be *refused* on (skipped, never mis-decided) by the formal
     /// gate — surfaced in ~0.1 s before the minutes-long verify. Read-only, changes
     /// no verdict. Surface peer of `POST /api/v1/sv/lint`.
+    ///
+    /// Exit codes (per the `--fail-on` gate default): 0 = no findings; 2 = at
+    /// least one finding (a gate-friendly default so `sv lint` fits directly into
+    /// CI). A LIFT FAILURE (front-end error, missing file, etc.) exits 1 —
+    /// distinct from "found something". A batch scanner that wants to distinguish
+    /// "found a bad register" from "could not lift" should pass `--fail-on none`
+    /// and inspect the JSON/text output for findings (mununu#475 item 5).
     Lint(SvLintArgs),
     /// Apply a NAMED structural mutation to the design and re-verify, checking that
     /// the property verdicts FLIP (property adequacy). A flip confirms a property
@@ -1827,6 +1834,21 @@ struct SvLiftArgs {
     /// back a future API auto-top enhancement.
     #[arg(long = "design-dir", value_name = "DIR", conflicts_with = "file")]
     design_dir: Option<PathBuf>,
+    /// mununu#475 item 2 — additional path-component names to exclude from
+    /// `--design-dir` scans, on top of the hardcoded skip set
+    /// (`mutations` / `buggy` / `buggy_artifacts` / `tb` / `testbench` /
+    /// `sim` / `figures`). Match is case-insensitive against a single path
+    /// component (`--exclude faulty` skips every `.../faulty/...` subtree
+    /// but leaves `.../faulty_variant/...` alone). Repeatable. No-op without
+    /// `--design-dir`. Not a full glob syntax — a richer form is a future
+    /// extension when a case demands it.
+    ///
+    /// surface: CLI-only — like `--design-dir` and `--include-dir`, an
+    /// on-disk directory-scan filter has no analog on the API/UI (their
+    /// flat name-staging already lets the caller choose which sources to
+    /// upload).
+    #[arg(long = "exclude", value_name = "NAME")]
+    exclude: Vec<String>,
     /// Additional SV sources (packages, `include` targets), staged alongside the
     /// primary input. Repeatable.
     #[arg(long = "source", value_name = "FILE")]
@@ -1975,6 +1997,17 @@ struct SvMutateArgs {
     /// recoverability property to flip under `drop-reset`). Default `off`.
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
+    /// mununu#475 item 4 — override a module parameter BEFORE elaboration
+    /// (parity with `sv verify-auto`'s `--param`). Format `NAME=VALUE`
+    /// (top-module scope) or `MODULE.NAME=VALUE` (submodule scope; slang
+    /// applies it top-level by bare name). Repeatable. Shrinks a
+    /// parameterised design so its counters fit the bit-blast cap during
+    /// the baseline + mutant re-verify; blocks that need `--param` to
+    /// verify at all could not previously be mutated. A malformed `--param`
+    /// is a HARD error; yosys errors downstream on a parameter it cannot
+    /// apply — never a silent drop.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    params: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -5489,7 +5522,7 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
     // E6 — `--design-dir`: discover + auto-assemble a multi-file design.
     if let Some(dir) = &args.design_dir {
         use mununu_core::adapter::yosys::source_manifest;
-        let files = source_manifest::discover_sv_files(dir)?;
+        let files = source_manifest::discover_sv_files(dir, &args.exclude)?;
         let design_name = dir.file_name().and_then(|s| s.to_str());
         let a = source_manifest::assemble_sv_design(&files, design_name);
         // explicit --top overrides the detected top; --include-dir adds to detected dirs.
@@ -5768,12 +5801,33 @@ fn sv_mutate(args: SvMutateArgs) -> Result<(), String> {
         .unwrap_or_else(|| "top.sv".to_string());
     let mut sources: Vec<(String, String)> = vec![(primary_name, lift.source.clone())];
     sources.extend(lift.additional_sources.iter().cloned());
+    // mununu#475 item 4 — --param parity with `sv verify-auto`. Matches the parsing
+    // shape at the verify-auto handler (`NAME=VALUE` or `MODULE.NAME=VALUE`, both
+    // sides non-empty). A malformed --param is a HARD error here; yosys errors
+    // downstream on a parameter it cannot apply.
+    let params: Vec<(String, String)> = args
+        .params
+        .iter()
+        .map(|e| {
+            let (lhs, val) = e.split_once('=').ok_or_else(|| {
+                format!("malformed --param '{e}': expected NAME=VALUE or MODULE.NAME=VALUE")
+            })?;
+            let (lhs, val) = (lhs.trim(), val.trim());
+            if lhs.is_empty() || val.is_empty() {
+                return Err(format!(
+                    "malformed --param '{e}': NAME and VALUE must both be non-empty"
+                ));
+            }
+            Ok((lhs.to_string(), val.to_string()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let yopts = YosysOptions {
         top: lift.top.clone(),
         additional_sources: lift.additional_sources.clone(),
         use_sv2v: lift.use_sv2v,
         extra_include_dirs: lift.include_dirs.clone(),
         frontend: lift.frontend,
+        params,
         ..Default::default()
     };
 

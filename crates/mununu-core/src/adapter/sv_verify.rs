@@ -244,16 +244,32 @@ fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, Strin
     // can match on: State + Op(symbol) → a register (the partsel alias `a_q` is a
     // `uext`/`concat` Op carrying the register's name), Output(symbol) → a
     // combinational output. `Register` wins when a name appears as both.
+    //
+    // mununu#475 item 1 — SKIP Op-node symbols containing `.`. Yosys/slang
+    // mangle **function-argument** names as `<function>.<arg>` (e.g.
+    // `ctrl_code.c`, `ones8.v` in monono's `tmds_encoder.sv`). These emit as
+    // Op nodes with a dotted symbol whose cone happens to reach an anonymous
+    // input (the function-scope input placeholder), so the raw filter below
+    // false-positives them as partial-write registers. Register aliases the
+    // lint IS supposed to catch (`a_q` from `q[hi:lo] <= d`) never carry
+    // dotted names, so the heuristic is targeted. State-node names may
+    // contain dots (hierarchical `top.sub.reg_q`) and are not filtered here —
+    // real registers should still be reported.
     let mut kinds: std::collections::BTreeMap<String, SvLintSignalKind> =
         std::collections::BTreeMap::new();
     for line in &file.lines {
         let (name, kind) = match &line.node {
             Node::State {
                 symbol: Some(s), ..
-            }
-            | Node::Op {
-                symbol: Some(s), ..
             } => (s, SvLintSignalKind::Register),
+            Node::Op {
+                symbol: Some(s), ..
+            } => {
+                if s.contains('.') {
+                    continue;
+                }
+                (s, SvLintSignalKind::Register)
+            }
             Node::Output {
                 symbol: Some(s), ..
             } => (s, SvLintSignalKind::Output),
@@ -421,6 +437,40 @@ mod tests {
         assert!(
             lint_undriven_partial_writes("not btor2 at all").is_err(),
             "a malformed BTOR2 body must surface a parse error, not an empty pass"
+        );
+    }
+
+    /// mununu#475 item 1 — a function argument's `<function>.<arg>` mangled
+    /// name (e.g. monono's `ctrl_code.c`, `ones8.v` in `tmds_encoder.sv`)
+    /// emits as an `Op` node whose cone reaches a function-scope anonymous
+    /// input; the raw `signal_reaches_anonymous_input` check would
+    /// false-positive it as a partial-write register. The `.` heuristic
+    /// filters these out. Fixture: two Op-symbol nodes — one dotted (a
+    /// function-arg alias, must NOT be flagged) and one plain (a legitimate
+    /// partsel alias, MUST be flagged).
+    #[test]
+    fn lint_skips_function_arg_dotted_op_symbols() {
+        // - Anonymous input (nid 2) — the "havoc" that both Op signals read.
+        // - `a_q` (nid 3, Op with plain symbol, reads the anonymous input via
+        //   nid 4) — a legitimate partsel-alias shape → MUST be flagged.
+        // - `ones8.v` (nid 5, Op with dotted symbol, same shape) — the
+        //   function-arg case that used to false-positive → MUST NOT be flagged.
+        const FN_ARG_LIFT: &str = r#"1 sort bitvec 1
+2 input 1
+3 and 1 2 2 a_q
+4 output 3 a_q_out
+5 and 1 2 2 ones8.v
+6 output 5 ones8_out
+"#;
+        let findings = lint_undriven_partial_writes(FN_ARG_LIFT).expect("lint parses the BTOR2");
+        let names: Vec<&str> = findings.iter().map(|f| f.signal.as_str()).collect();
+        assert!(
+            names.contains(&"a_q"),
+            "the plain partsel-alias `a_q` must still be flagged: {findings:?}"
+        );
+        assert!(
+            !names.contains(&"ones8.v"),
+            "the function-arg `ones8.v` must NOT be flagged (mununu#475 item 1): {findings:?}"
         );
     }
 
