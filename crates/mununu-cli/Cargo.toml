@@ -25,6 +25,9 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 bitvec = "1.0"
 
+[dev-dependencies]
+tempfile = "3.24"
+
 [features]
 default = []
 # `smt` feature removed in Phase A.4 step 4.2 — Z3 is now mandatory in

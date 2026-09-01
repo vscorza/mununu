@@ -450,6 +450,20 @@ case demands it). The reporter's whole-tree workflow —
 `mununu sv lint --design-dir <root> --exclude faulty` — is now reachable
 without adding to the hardcoded list.
 
+**`--search-path <DIR>` for single-file cross-directory submodules** (2026-08,
+mununu#475 item 3). A single-file input that instantiates a submodule from a
+sibling directory (`mem_sched.sv` → `slot_arbiter` from a peer dir — 53/109
+unliftable files in monono's tree) previously errored with `unknown module`.
+`--search-path <DIR>` recursively discovers every `.v` / `.sv` under DIR and
+stages them alongside the primary input, so cross-directory instantiations
+resolve without hand-listing every `--source`. Deduplicates against the
+primary file and any explicit `--source` entries by canonical path, and
+suppresses short-name collisions (a search-path file with the same filename
+as the primary or a staged source is silently skipped rather than emit two
+modules of the same name to yosys). The same `--exclude` list filters the
+scan. Repeatable. Composable with `--design-dir` — a primary block plus
+sibling libraries — for a design + peer-utility layout.
+
 ## Are the properties adequate? `sv mutate`
 
 > Source of truth: [`mutate_and_compare`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L1824) — surface: (CLI+API+UI)

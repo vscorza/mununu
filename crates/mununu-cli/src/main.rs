@@ -1849,6 +1849,24 @@ struct SvLiftArgs {
     /// upload).
     #[arg(long = "exclude", value_name = "NAME")]
     exclude: Vec<String>,
+    /// mununu#475 item 3 — additional module search directories for
+    /// single-file lifts: recursively scans DIR for `.v` / `.sv` sources
+    /// and adds them alongside the primary input, so a single-file input
+    /// that instantiates a submodule from a sibling directory
+    /// (`mem_sched.sv` → `slot_arbiter` from a peer dir, 53/109 unliftable
+    /// files in monono's tree) resolves without hand-listing every
+    /// `--source`. The same `--exclude` list filters the scan. Deduplicates
+    /// against the primary file and any explicit `--source` entries by
+    /// canonical path (a search-path that contains the primary file will
+    /// not double-add it). Repeatable. Also composable with `--design-dir`
+    /// — a primary design + sibling libraries.
+    ///
+    /// surface: CLI-only — like `--design-dir` / `--include-dir` /
+    /// `--exclude`, an on-disk directory scan has no analog on the
+    /// API/UI (their flat name-staging already lets the caller stage
+    /// whichever sources they want).
+    #[arg(long = "search-path", value_name = "DIR")]
+    search_paths: Vec<PathBuf>,
     /// Additional SV sources (packages, `include` targets), staged alongside the
     /// primary input. Repeatable.
     #[arg(long = "source", value_name = "FILE")]
@@ -5548,9 +5566,35 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
             .cloned()
             .chain(a.include_dirs)
             .collect();
+        // mununu#475 item 3 — --search-path composes with --design-dir: a
+        // primary block from design-dir + sibling libraries discovered
+        // under each search-path. Dedup against everything already staged.
+        let mut additional_sources = a.additional;
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for dir in &args.search_paths {
+            let files = source_manifest::discover_sv_files(dir, &args.exclude)?;
+            for (p, content) in files {
+                if let Ok(c) = p.canonicalize()
+                    && !seen.insert(c)
+                {
+                    continue;
+                }
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("source.sv")
+                    .to_string();
+                // Avoid a name collision with an already-staged source (rare;
+                // additive collisions have no lift value).
+                if additional_sources.iter().any(|(n, _)| n == &name) {
+                    continue;
+                }
+                additional_sources.push((name, content));
+            }
+        }
         return Ok(mununu_core::adapter::sv_verify::SvLift {
             source: a.primary.1,
-            additional_sources: a.additional,
+            additional_sources,
             top,
             use_sv2v: args.preprocess_sv2v,
             include_dirs,
@@ -5564,7 +5608,18 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
     let source = std::fs::read_to_string(file)
         .map_err(|e| format!("Failed to read SV '{}': {e}", file.display()))?;
     let mut additional_sources = Vec::new();
+    // Dedup by canonical path so a source listed via both --source and
+    // --search-path (or already the primary file) is not double-added.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if let Ok(c) = file.canonicalize() {
+        seen.insert(c);
+    }
     for p in &args.sources {
+        if let Ok(c) = p.canonicalize()
+            && !seen.insert(c)
+        {
+            continue;
+        }
         let content = std::fs::read_to_string(p)
             .map_err(|e| format!("Failed to read '{}': {e}", p.display()))?;
         let name = p
@@ -5573,6 +5628,44 @@ fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::Sv
             .unwrap_or("source.sv")
             .to_string();
         additional_sources.push((name, content));
+    }
+    // mununu#475 item 3 — --search-path: discover .sv/.v under each named
+    // directory (honouring --exclude, matching --design-dir's semantics)
+    // and add to additional_sources. Dedup TWICE: first by canonical path
+    // (the same file appearing via both --source and search-path), then
+    // by short filename (a search-path file that name-collides with the
+    // primary or an explicit source is a distinct file but would trip a
+    // "duplicate module" error under yosys — skip it, honest additive-only
+    // behaviour). The design-dir branch above applies the same filename
+    // check for the same reason.
+    for dir in &args.search_paths {
+        use mununu_core::adapter::yosys::source_manifest;
+        let files = source_manifest::discover_sv_files(dir, &args.exclude)?;
+        for (p, content) in files {
+            if let Ok(c) = p.canonicalize()
+                && !seen.insert(c)
+            {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("source.sv")
+                .to_string();
+            // Suppress name collisions with the primary (its file_name) or
+            // any already-staged additional source. A rare-but-possible case
+            // is a search-path directory that mirrors the primary's own
+            // filename — better to silently prefer the primary than emit two
+            // modules of the same name to yosys.
+            let primary_name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name == primary_name || additional_sources.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            additional_sources.push((name, content));
+        }
     }
     Ok(mununu_core::adapter::sv_verify::SvLift {
         source,
@@ -8161,5 +8254,189 @@ mod controller_ctxdsl_tests {
         assert!(dsl.contains("transition "), "{dsl}");
         // The emitted controller CTXDSL is valid, re-loadable syntax.
         parse(&dsl).expect("emitted controller ctxdsl parses");
+    }
+}
+
+#[cfg(test)]
+mod sv_lift_search_path_tests {
+    //! mununu#475 item 3 — `--search-path <DIR>` discovers and stages every
+    //! `.v` / `.sv` under DIR alongside the primary file, so a single-file
+    //! lift with cross-directory submodule instantiations resolves without
+    //! the caller hand-listing every `--source`. Deduplicates against the
+    //! primary and explicit `--source` entries by canonical path.
+    use super::{SvFrontendArg, SvLiftArgs, read_sv_lift};
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn args(
+        file: Option<PathBuf>,
+        sources: Vec<PathBuf>,
+        search_paths: Vec<PathBuf>,
+        exclude: Vec<String>,
+    ) -> SvLiftArgs {
+        SvLiftArgs {
+            file,
+            design_dir: None,
+            exclude,
+            search_paths,
+            sources,
+            top: None,
+            preprocess_sv2v: false,
+            include_dirs: Vec::new(),
+            frontend: SvFrontendArg::Auto,
+        }
+    }
+
+    #[test]
+    fn search_path_discovers_cross_directory_submodules() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Reporter's shape: mem_sched.sv in one dir, slot_arbiter.sv in a peer dir.
+        for (rel, body) in [
+            ("mem_sched/mem_sched.sv", "module mem_sched; endmodule\n"),
+            ("lib/slot_arbiter.sv", "module slot_arbiter; endmodule\n"),
+            ("lib/util.sv", "module util; endmodule\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let a = args(
+            Some(root.join("mem_sched/mem_sched.sv")),
+            Vec::new(),
+            vec![root.join("lib")],
+            Vec::new(),
+        );
+        let lift = read_sv_lift(&a).expect("read_sv_lift with --search-path");
+        let names: Vec<&str> = lift
+            .additional_sources
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            names.contains(&"slot_arbiter.sv"),
+            "search-path should stage cross-dir modules: {names:?}"
+        );
+        assert!(
+            names.contains(&"util.sv"),
+            "search-path scans DIR recursively: {names:?}"
+        );
+    }
+
+    #[test]
+    fn search_path_dedupes_against_primary_and_source_entries() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        for (rel, body) in [
+            ("primary.sv", "module top; endmodule\n"),
+            ("explicit.sv", "module explicit; endmodule\n"),
+            ("libdir/primary.sv", "module dup_top; endmodule\n"),
+            ("libdir/explicit.sv", "module dup_explicit; endmodule\n"),
+            ("libdir/unique.sv", "module unique; endmodule\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        // Primary + one explicit --source; search-path libdir also contains
+        // a file named `primary.sv` and one named `explicit.sv` — those are
+        // DIFFERENT files on disk (different content), so canonical-path
+        // dedup keeps both because they have distinct paths. The dedup only
+        // fires if a search-path file IS the same file (same canonical path)
+        // as the primary or an explicit source.
+        let a = args(
+            Some(root.join("primary.sv")),
+            vec![root.join("explicit.sv")],
+            vec![root.join("libdir")],
+            Vec::new(),
+        );
+        let lift = read_sv_lift(&a).expect("read_sv_lift with --search-path + --source");
+        // Now the same test but with libdir ALSO listing the primary file as a symlink /
+        // duplicate. We use the primary itself via search-path to force a canonical-path
+        // collision.
+        let a2 = args(
+            Some(root.join("primary.sv")),
+            vec![root.join("explicit.sv")],
+            vec![root.to_path_buf()],
+            Vec::new(),
+        );
+        let lift2 = read_sv_lift(&a2).expect("read_sv_lift with root search-path");
+        // The primary `primary.sv` and the explicit `explicit.sv` must not appear
+        // twice — dedup by canonical path suppresses them from the search-path scan.
+        let primary_count = lift2
+            .additional_sources
+            .iter()
+            .filter(|(n, _)| n == "primary.sv")
+            .count();
+        let explicit_count = lift2
+            .additional_sources
+            .iter()
+            .filter(|(n, _)| n == "explicit.sv")
+            .count();
+        assert_eq!(
+            primary_count,
+            0,
+            "the primary file must NOT appear in additional_sources: {:?}",
+            lift2
+                .additional_sources
+                .iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            explicit_count,
+            1,
+            "the explicit --source must appear exactly once: {:?}",
+            lift2
+                .additional_sources
+                .iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        );
+        // Sanity: the first lift found the libdir extras (different files).
+        let names: Vec<&str> = lift
+            .additional_sources
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            names.contains(&"unique.sv"),
+            "libdir/unique.sv should be present: {names:?}"
+        );
+    }
+
+    #[test]
+    fn search_path_honours_exclude() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        for (rel, body) in [
+            ("primary.sv", "module top; endmodule\n"),
+            ("lib/util.sv", "module util; endmodule\n"),
+            ("lib/faulty/bad.sv", "module bad; endmodule\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let a = args(
+            Some(root.join("primary.sv")),
+            Vec::new(),
+            vec![root.join("lib")],
+            vec!["faulty".to_string()],
+        );
+        let lift = read_sv_lift(&a).expect("read_sv_lift with --search-path --exclude");
+        let names: Vec<&str> = lift
+            .additional_sources
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            names.contains(&"util.sv"),
+            "util.sv should stage: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad.sv"),
+            "--exclude faulty must also filter search-path scans: {names:?}"
+        );
     }
 }
