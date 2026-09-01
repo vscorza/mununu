@@ -7789,6 +7789,56 @@ mod tests {
         );
     }
 
+    /// mununu#475 follow-up (item 3 of the shadow-synth follow-up list) —
+    /// multi-atom `|=>` antecedent. `(valid_and_ready && valid_and_ack) |=> (q == 0)`
+    /// where both atoms are COMBINATIONAL-OF-INPUTS (the typical monono `wb_mem_client`
+    /// shape multiplied by two) and `q` is a spare state pinned to 0. The detector
+    /// now walks into the `And` under the antecedent-side `Not` and returns BOTH
+    /// atoms; shadow-synth synthesises TWO shadow registers
+    /// (`_mununu_antshadow_0`, `_mununu_antshadow_1`), one per atom; the rewritten
+    /// formula uses both shadows and the property decides. Pre-follow-up this
+    /// would have Skipped with the transitive refusal (multi-atom antecedent was
+    /// out-of-scope).
+    ///
+    /// **Bare-primary-input atoms in a multi-atom antecedent are still refused**
+    /// (per `RefusalReason::IsPrimaryInput`) — the author-confirmation case
+    /// remains a safety measure even at the leaf level; the caller can rewrite
+    /// `valid |=> C` as `valid_gated = valid` + `valid_gated |=> C` if that's
+    /// truly the intent.
+    #[test]
+    fn shadow_synth_flips_multi_atom_antecedent_to_decided() {
+        // `valid_and_ready = valid && ready` and `valid_and_ack = valid && ack`
+        // — both combinational-of-inputs Outputs (yosys-style Output form,
+        // matches the monono `mem_rvalid_mine` pattern). `q` is a spare state
+        // whose next is const 0 → `q == 0` always Holds.
+        const BTOR2: &str = r#"
+1 sort bitvec 1
+2 input 1 valid
+3 input 1 ready
+4 input 1 ack
+5 state 1 q
+6 const 1 0
+7 init 1 5 6
+8 and 1 2 3
+9 output 8 valid_and_ready
+10 and 1 2 4
+11 output 10 valid_and_ack
+12 next 1 5 6
+"#;
+        let formula = crate::mu_calculus::parser::parse(
+            "nu X. ((not (valid_and_ready and valid_and_ack) or [] (q == 0)) and [] X)",
+        )
+        .expect("formula");
+        let verdict = exact_symbolic_verdict(BTOR2, &formula)
+            .expect("multi-atom shadow-synth on an SVA `|=>` shape should decide, not refuse");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Holds,
+            "with shadow-synth on both leaves, `(valid_and_ready && valid_and_ack) |=> (q == 0)` \
+             where q'=0 always Holds",
+        );
+    }
+
     /// P3 — the trap-path witness for a `Violated` `AG EF (st==0)` recoverability property.
     /// `st` cycles 0→1→2→0, but `esc` drives it to the TERMINAL trap `st==3` (self-loop), from
     /// which `st==0` is unreachable — so `AG EF (st==0)` is Violated, and the witness is a
