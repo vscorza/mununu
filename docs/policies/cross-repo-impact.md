@@ -73,7 +73,7 @@ Prior surface changes shipped without briefings, and consumers discovered the im
 ## What this policy is NOT
 
 - **Not a versioning policy.** Semver / release tagging is a separate discipline (currently: mununu is 0.4.x, all releases treated as breaking).
-- **Not a schema-freeze policy.** Consumers should still expect additive schema changes on `AutoVerifyReport` etc.; the briefing tells them when a change is additive (safe to ignore) vs breaking (must migrate).
+- **Not a schema-freeze policy.** Consumers should still expect additive schema changes on `SvVerifyAutoResponse` etc.; the briefing tells them when a change is additive (safe to ignore) vs breaking (must migrate). The pinned wire format lives at [`docs/api-schemas/verdict.md`](../api-schemas/verdict.md) — that is the durable reference; briefings document *transitions* against it.
 - **Not a "communicate every change" policy.** Internal refactors, test additions, and documentation-only changes do not fire it. The policy targets the small set of changes that actually cross the mununu boundary.
 - **Not a substitute for the mununu wiki or `docs/verifying-rtl.md`.** The wiki documents behaviour steadily; briefings document *transitions*.
 
