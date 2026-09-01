@@ -305,8 +305,9 @@ impl BddBitBlaster {
         if total_bits > cap {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
-                 (> {cap}) after cone-of-influence restriction (R-F5.6) — the \
-                 property's cone is too wide to bit-blast; use `--engine explicit`"
+                 (> {cap}) after cone-of-influence restriction (R-F5.6) — abstained on the BIT CAP; \
+                 the property's cone is too wide to bit-blast; raise MUNUNU_BDD_MAX_BITS, or use \
+                 `--engine explicit`"
             ));
         }
 
@@ -478,8 +479,9 @@ impl BddBitBlaster {
             Err(_) => {
                 return Err(
                     "exact bit-blaster: BDD arena exhausted during build (a wide op overran \
-                            the node budget in one apply) — the cone does not compress to a \
-                            tractable BDD; use `--engine explicit`"
+                            the node budget in one apply) — abstained on the NODE budget; the cone \
+                            does not compress to a tractable BDD; raise MUNUNU_BDD_ARENA_NODES, or \
+                            use `--engine explicit`"
                         .into(),
                 );
             }
@@ -1679,8 +1681,9 @@ impl AbstractRelation {
 #[inline]
 fn oom<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<T, String> {
     r.map_err(|_e| {
-        "symbolic bit-blaster: BDD arena exhausted (OxiDD OutOfMemory) — the cone does not compress \
-         to a tractable BDD; use `--engine explicit`"
+        "symbolic bit-blaster: BDD arena exhausted (OxiDD OutOfMemory) — abstained on the NODE \
+         budget; the cone does not compress to a tractable BDD; raise MUNUNU_BDD_ARENA_NODES, or \
+         use `--engine explicit`"
             .to_string()
     })
 }
@@ -2122,8 +2125,9 @@ impl BddBitBlaster {
             .with_manager_shared(|m| m.approx_num_inner_nodes());
         if live > self.node_budget {
             return Err(format!(
-                "symbolic bit-blaster: BDD node budget exceeded ({live} > {} live nodes) — the \
-                 property's cone does not compress to a tractable BDD; use `--engine explicit`",
+                "abstained on the NODE budget ({live} of {} live BDD nodes) — the property's cone \
+                 does not compress to a tractable BDD; raise MUNUNU_BDD_ARENA_NODES (which scales \
+                 the node budget), or use `--engine explicit`",
                 self.node_budget
             ));
         }
@@ -2584,8 +2588,9 @@ impl ExactModel {
             self.iters.set(n);
             if n > self.iter_budget {
                 return Err(format!(
-                    "symbolic bit-blaster: fixpoint iteration budget exceeded ({n} > {}) — the \
-                     property's reachable diameter is too large to bit-blast; use `--engine explicit`",
+                    "symbolic bit-blaster: abstained on the ITERATION budget ({n} > {}) — the \
+                     property's reachable diameter is too large to bit-blast; raise \
+                     MUNUNU_BDD_ITER_BUDGET, or use `--engine explicit`",
                     self.iter_budget
                 ));
             }
@@ -2602,9 +2607,10 @@ impl ExactModel {
                 && std::time::Instant::now() > dl
             {
                 return Err(format!(
-                    "symbolic bit-blaster: exact time budget exceeded (fixpoint still iterating at \
-                     {n} steps) — the property's reachable diameter is too large to bit-blast in \
-                     the wall-clock budget; use `--engine explicit`"
+                    "symbolic bit-blaster: abstained on the WALL-CLOCK budget (fixpoint still \
+                     iterating at {n} steps) — the property's reachable diameter is too large to \
+                     decide in the time budget; raise MUNUNU_BDD_TIME_BUDGET_MS (default 10000 ms; \
+                     0 disables), or use `--engine explicit`"
                 ));
             }
             bindings.insert(var, x.clone());
@@ -3243,7 +3249,8 @@ fn verdict_with_witness_catching(
     .unwrap_or_else(|_| {
         Err(
             "symbolic bit-blaster: BDD arena overflow while building the transition relation \
-             (the cone does not compress to a tractable BDD); use `--engine explicit`"
+             — abstained on the NODE budget (the cone does not compress to a tractable BDD); \
+             raise MUNUNU_BDD_ARENA_NODES, or use `--engine explicit`"
                 .to_string(),
         )
     })
@@ -7212,6 +7219,13 @@ mod tests {
             err.contains("register+input bits") && err.contains("300"),
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
+        );
+        // #467 — the abstention names WHICH budget was hit and the KNOB to raise, so
+        // a consumer acts without blind trial-and-error across the three budgets.
+        assert!(
+            err.contains("BIT CAP") && err.contains("MUNUNU_BDD_MAX_BITS"),
+            "the abstention must name the budget (BIT CAP) + its knob \
+             (MUNUNU_BDD_MAX_BITS); got: {err}"
         );
     }
 

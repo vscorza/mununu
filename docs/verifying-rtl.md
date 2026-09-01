@@ -151,6 +151,15 @@ rather than crashing the run — the other properties still report. Shrink a wid
 parameter (`--param BW_WIDTH=4`) so the counters fit, or fall back to
 `--engine explicit`. This is a size threshold, not a malformed input.
 
+The exact engine has **four** independent budgets, and an abstention **names which
+one it hit and the knob to raise** — `BIT CAP` (`MUNUNU_BDD_MAX_BITS`), `NODE`
+budget (`MUNUNU_BDD_ARENA_NODES`, which scales the OxiDD arena), `ITERATION`
+budget (`MUNUNU_BDD_ITER_BUDGET`, the μ/ν fixpoint step cap), and `WALL-CLOCK`
+(`MUNUNU_BDD_TIME_BUDGET_MS`, default 10 s). Bit count cannot see the reachable
+*diameter*, so a cone that fits the bit cap can still abstain on the iteration or
+wall-clock budget — the message distinguishes the four so the remedy is not blind
+trial-and-error.
+
 > Source of truth: [`bitblast_oom_skip_note`](../crates/mununu-core/src/planner/mod.rs) — surface: (CLI+API+UI)
 
 ### Pinning a config input: `--config-value`
