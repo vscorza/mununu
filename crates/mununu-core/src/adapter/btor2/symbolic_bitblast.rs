@@ -3264,6 +3264,42 @@ fn exact_symbolic_verdict_with_witness_inner(
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
 
+    // mununu#476 — antecedent shadow-register synthesis. If the formula matches
+    // the canonical SVA `|=>` shape (Or(Not(Predicate(A)), Modal{Box, _})),
+    // synthesise a shadow state register for every antecedent atom `A` whose
+    // combinational cone reaches primary inputs. The augmented BTOR2 file +
+    // rewritten formula are then handed to the rest of this fn. Atoms that
+    // cannot be shadowed (see `RefusalReason`) fall through to the Phase A
+    // refusal below. See `docs/design/antecedent-shadow-synthesis.md` for the
+    // full design + soundness argument. `MUNUNU_NO_ANTECEDENT_SHADOW=1` opts out
+    // (differential-oracle / debug use).
+    let (file, rewritten_formula) = {
+        let opt_out = std::env::var("MUNUNU_NO_ANTECEDENT_SHADOW").is_ok();
+        let antecedents = crate::mu_calculus::detect_pipeimplies_antecedent_atoms(formula);
+        if !opt_out && !antecedents.is_empty() {
+            let synth = crate::adapter::btor2::antecedent_shadow::synthesize_shadows(
+                &file,
+                &antecedents,
+                crate::adapter::btor2::antecedent_shadow::ShadowSynthOpts::default(),
+            );
+            if synth.shadows.is_empty() {
+                (file, None)
+            } else {
+                let rewritten = crate::mu_calculus::substitute_predicates(formula, &synth.renames);
+                tracing::info!(
+                    n_shadows = synth.shadows.len(),
+                    "antecedent shadow-synth: rewrote {} input-derived antecedent atom(s) into shadow registers ({} atoms fell through to fallback refusal)",
+                    synth.shadows.len(),
+                    synth.refused.len(),
+                );
+                (synth.augmented, Some(rewritten))
+            }
+        } else {
+            (file, None)
+        }
+    };
+    let formula: &Formula = rewritten_formula.as_ref().unwrap_or(formula);
+
     // Register-name resolution: a user-visible name (`bit_cnt_q`) maps to the
     // canonical state-cell name the bit-blast binds against (`bit_cnt_d` after
     // yosys async2sync/flatten aliasing). Use the SOUND (Strict) alias resolution,
@@ -3393,6 +3429,66 @@ fn exact_symbolic_verdict_with_witness_inner(
              consequent and would report an unsound verdict. Use the default `explicit` \
              cube engine, or lift the antecedent through a shadow register."
         ));
+    }
+
+    // mununu#476 — transitive combinational fan-in guard. When the atom name is NOT
+    // itself a primary input but its combinational cone REACHES primary inputs (stopping
+    // at register boundaries), pinning the atom's value pins a function of those inputs
+    // — the same decoupling problem as pinning an input directly. Without this, a
+    // combinational-of-input signal like `y = a && (b == K)` used in an SVA `|=>`
+    // antecedent yields a definite `Violated (1 cell)` on correct RTL (see monono's
+    // `wb_mem_client`: `mem_rvalid_mine = mem_rvalid && (mem_rid == CLIENT_ID)`).
+    // Reuses [`crate::adapter::btor2::parser::cone_inputs`], which walks the
+    // combinational cone and stops at `Node::State` — so a combinational-of-STATE
+    // signal (which the previous refusal comment explicitly permits) is NOT flagged.
+    //
+    // Name-to-NID resolution has to cover THREE symbol sources:
+    //   1. Input / State symbols (via `collect_symbols`, Pass 1)
+    //   2. Op-symbol aliases that `collect_symbols` attaches to their driving state
+    //      (Pass 2 — Yosys's `uext _ _ 0 NAME` alias pattern)
+    //   3. Output-node symbols pointing at a combinational signal — NOT covered by
+    //      `collect_symbols` because they carry no state-alias intent. This is exactly
+    //      the case the guard needs to catch (a combinational-of-input `Output`).
+    let mut name_to_nid: std::collections::HashMap<String, crate::adapter::btor2::ast::Nid> =
+        crate::adapter::btor2::parser::collect_symbols(&file)
+            .into_iter()
+            .map(|(nid, name)| (name, nid))
+            .collect();
+    for line in &file.lines {
+        if let crate::adapter::btor2::ast::Node::Output {
+            symbol: Some(s),
+            signal,
+        } = &line.node
+        {
+            // An Output symbol refers to the underlying signal, not to the Output line's
+            // own NID. Use it only if there isn't already an Input/State mapping for the
+            // same name (Input/State takes precedence for the same-name edge case).
+            name_to_nid.entry(s.clone()).or_insert(signal.nid());
+        }
+    }
+    for reg in &seed_regs {
+        // Skip atoms already flagged by the exact-name refusal above.
+        if input_leaf_names.contains(reg) {
+            continue;
+        }
+        let Some(&nid) = name_to_nid.get(reg) else {
+            continue;
+        };
+        let derived_inputs = crate::adapter::btor2::parser::cone_inputs(&file, nid);
+        if !derived_inputs.is_empty() {
+            let inputs = derived_inputs
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "exact MC: atom `{reg}` is combinationally driven by primary input(s) {inputs}. \
+                 The exact-symbolic engine leaves inputs free/quantified, so a temporal property \
+                 whose antecedent depends on inputs decouples the antecedent from its consequent \
+                 and would report an unsound verdict. Use the default `explicit` cube engine, or \
+                 lift the antecedent through a shadow register."
+            ));
+        }
     }
 
     // monono#partsel — the same soundness posture for an atom that binds to a
@@ -7579,6 +7675,117 @@ mod tests {
         assert!(
             err.contains("primary input") && err.contains("clr"),
             "diagnostic should name the offending input `clr`: {err}"
+        );
+    }
+
+    /// mununu#476 — a NAMED combinational signal whose cone reaches primary inputs
+    /// (without crossing a register boundary) is refused **when the formula does not
+    /// match the `|=>` shape** (bare `EF`, `AF`, etc.). This preserves soundness for
+    /// arbitrary user-authored mu-calc formulas whose semantics are not the SVA `|=>`
+    /// obligation. When the formula DOES match `|=>`, shadow-synthesis takes over
+    /// and the property decides (see
+    /// [`shadow_synth_flips_derived_input_antecedent_to_decided`]).
+    ///
+    /// Fixture mirrors monono's `wb_mem_client`: `mem_rvalid_mine = mem_rvalid && got`
+    /// where both `mem_rvalid` and `got` are primary inputs.
+    ///
+    /// Contrast [`exact_symbolic_refuses_primary_input_atom`] (name IS an input) and
+    /// [`predicate_binds_combinational_output`] (combinational of STATE — admitted).
+    #[test]
+    fn exact_symbolic_refuses_derived_input_atom() {
+        // `mem_rvalid_mine = mem_rvalid && got` — a named combinational Output whose
+        // cone reaches two primary inputs, no state. `q` is a spare latch so the model
+        // has state; the formula never reads it. Uses the `Node::Output` form (matching
+        // `predicate_binds_combinational_output` above) rather than an Op inline symbol,
+        // because Op-inline symbols are consumed as state aliases by `collect_symbols`.
+        const DERIVED_INPUT_BTOR2: &str = r#"
+1 sort bitvec 1
+2 input 1 mem_rvalid
+3 input 1 got
+4 state 1 q
+5 const 1 0
+6 init 1 4 5
+7 and 1 2 3
+8 output 7 mem_rvalid_mine
+9 next 1 4 2
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. (mem_rvalid_mine or <> Y)").expect("formula");
+        let err = exact_symbolic_verdict(DERIVED_INPUT_BTOR2, &formula).expect_err(
+            "an atom over a combinational signal reaching primary inputs must be refused, \
+             not decided",
+        );
+        assert!(
+            err.contains("combinationally driven by primary input"),
+            "diagnostic should name the transitive-fan-in case: {err}"
+        );
+        assert!(
+            err.contains("mem_rvalid_mine"),
+            "diagnostic should name the offending atom `mem_rvalid_mine`: {err}"
+        );
+        assert!(
+            err.contains("mem_rvalid") && err.contains("got"),
+            "diagnostic should list every source primary input (mem_rvalid, got): {err}"
+        );
+    }
+
+    /// mununu#476 — Option C. The same monono `wb_mem_client` shape (an atom
+    /// combinationally driven by primary inputs) DECIDES when the surrounding
+    /// formula matches the canonical SVA `|=>` lift shape
+    /// `nu X. ((¬A ∨ □B) ∧ □X)`: the engine detects the shape, synthesises
+    /// a shadow state cell that samples `A` per cycle, rewrites the atom to
+    /// the shadow, and evaluates on the augmented model. This is the fix that
+    /// closes the coverage gap the Phase A refusal left open.
+    ///
+    /// The BTOR2 sets `q' = 0` unconditionally, so `[] (q == 0)` always Holds
+    /// and the whole property Holds after shadow-synth. Pre-Option C this
+    /// property would have been Skipped (via the Phase A refusal on
+    /// `mem_rvalid_mine`); post-Option C it Holds.
+    ///
+    /// Contrast [`exact_symbolic_refuses_derived_input_atom`] (same atom, but a
+    /// bare `mu Y. (a or <> Y)` — no `|=>` shape → refusal path still fires).
+    #[test]
+    fn shadow_synth_flips_derived_input_antecedent_to_decided() {
+        // Same combinational-of-inputs shape as monono's `wb_mem_client`, plus
+        // a spare state `q` whose next is const 0 (so `q == 0` always holds).
+        const BTOR2: &str = r#"
+1 sort bitvec 1
+2 input 1 mem_rvalid
+3 input 1 got
+4 state 1 q
+5 const 1 0
+6 init 1 4 5
+7 and 1 2 3
+8 output 7 mem_rvalid_mine
+9 next 1 4 5
+"#;
+        // Canonical SVA `mem_rvalid_mine |=> (q == 0)` lift shape.
+        let formula = crate::mu_calculus::parser::parse(
+            "nu X. ((not mem_rvalid_mine or [] (q == 0)) and [] X)",
+        )
+        .expect("formula");
+        let verdict = exact_symbolic_verdict(BTOR2, &formula)
+            .expect("shadow-synth on an SVA `|=>` shape should decide, not refuse");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Holds,
+            "with shadow-synth, `mem_rvalid_mine |=> (q == 0)` where q'=0 always Holds",
+        );
+
+        // Opt-out (MUNUNU_NO_ANTECEDENT_SHADOW=1) restores the Phase A refusal
+        // even for `|=>` shapes — the differential-oracle / debug knob.
+        // SAFETY: single-threaded test; env-var mutation is scoped to this call.
+        unsafe {
+            std::env::set_var("MUNUNU_NO_ANTECEDENT_SHADOW", "1");
+        }
+        let err = exact_symbolic_verdict(BTOR2, &formula)
+            .expect_err("opt-out must revert to the Phase A transitive-fan-in refusal");
+        unsafe {
+            std::env::remove_var("MUNUNU_NO_ANTECEDENT_SHADOW");
+        }
+        assert!(
+            err.contains("combinationally driven by primary input"),
+            "opt-out refusal should still be the Phase A message: {err}"
         );
     }
 

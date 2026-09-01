@@ -176,6 +176,61 @@ lifted model (misspelled, or a state/output/optimized-away name) is rejected aga
 the model's real inputs. Every applied pin — including one that coincides with an
 auto-detected reset pin — is echoed in the `config-concretization` note.
 
+### SVA `|=>` with input-derived antecedents: automatic shadow-synth
+
+> Source of truth: [`antecedent_shadow`](../crates/mununu-core/src/adapter/btor2/antecedent_shadow.rs) + [`detect_pipeimplies_antecedent_atoms`](../crates/mununu-core/src/mu_calculus/mod.rs) — surface: (CLI+API+UI, engine-internal, no user flag required)
+
+SVA `A |=> C` whose antecedent `A` reads primary inputs — directly OR through a
+combinational chain (`mem_rvalid_mine = mem_rvalid && (mem_rid == CLIENT_ID)`,
+`valid_and_ready = valid && ready`, address decoders, enable stacks) — is the
+common shape in real RTL. The exact-symbolic engine leaves inputs FREE per
+modality step, so pinning an input-derived antecedent decouples the antecedent
+copy from the transition copy of the same physical signal. Left alone, the
+engine would return a spurious verdict on correct RTL (`Violated (1 cell)` on
+monono's `wb_mem_client` was the mununu#476 report).
+
+**Automatic fix — antecedent shadow-register synthesis.** At verify time the
+engine detects the canonical `|=>` lift shape `nu X. ((¬A ∨ □B) ∧ □X)` in the
+mu-calc formula and, for every antecedent `A` whose combinational cone reaches
+primary inputs, synthesises a **shadow state cell** `_mununu_antshadow_<N>` in
+the BTOR2:
+
+- `init = 0` — SVA `|=>` semantics say cycle 0 has no prior antecedent, so the
+  obligation is trivially satisfied at reset.
+- `next = A` — the shadow samples `A` each cycle, so at cycle N+1 it carries
+  `A@N`.
+
+The antecedent atom is rewritten to reference the shadow; the exact engine
+evaluates on the augmented model. Verdicts that were previously `Skipped`
+(under the earlier transitive refusal) now decide correctly. Standard
+SVA-to-BMC compilation technique (SymbiYosys / JasperGold / EBMC do the
+equivalent). Full design + soundness argument:
+[`docs/design/antecedent-shadow-synthesis.md`](design/antecedent-shadow-synthesis.md).
+
+**Fallback conditions — a refusal, not an unsound verdict.** Five cases fall
+through to the earlier Phase A refusal (definite `Skipped`, never a wrong
+answer):
+
+- Non-Boolean antecedent (`|=>` should be Boolean; wider is a language misuse).
+- Array/memory in the antecedent's cone (havoc defeats the shadow).
+- The antecedent atom is **itself** a primary input (rare, author-confirmation
+  case — restate as `AG(prev(A) → C)` if truly desired).
+- Cone reaches an anonymous free input from a partial-write havoc
+  (a different soundness posture; see `signal_reaches_anonymous_input`).
+- Multi-atom antecedents like `(a && b) |=> c` (initial scope caught the
+  single-atom case; extension to Boolean-tree antecedents is a follow-up).
+
+**Opt-out** — the `MUNUNU_NO_ANTECEDENT_SHADOW=1` environment variable
+disables shadow-synth even for `|=>` shapes, reverting to the Phase A refusal.
+This is a debug / differential-oracle knob (used to cross-check shadow-synth
+verdicts against the predicate-cube engine's independent handling); production
+use should leave it unset.
+
+**Non-`|=>` formulas are unaffected.** A hand-authored `mu Y. (a or <> Y)`
+(bare `EF a`) whose atom happens to be input-derived does NOT match the
+detector and still hits the refusal — the shadow rewrite is only sound for the
+`|=>` shape. Direct `btor2 verify` callers with such formulas are unchanged.
+
 ---
 
 ## Driving it from an external agent (e.g. an agent writing RTL)
