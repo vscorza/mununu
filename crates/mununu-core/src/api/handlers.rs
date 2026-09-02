@@ -842,6 +842,71 @@ fn btor2_verify_liveness_all_handler_impl(
     }))
 }
 
+/// mununu#477 Option B — decide `(⋀ⱼ GF fairⱼ) → AG(request → AF grant)`
+/// (`POST /api/v1/btor2/verify-liveness-under-fairness`) via the Emerson–Lei
+/// fair-cycle l2s + the reachability portfolio. Surface peer of the CLI
+/// `mununu btor2 verify-liveness-under-fairness`. A malformed atom is a
+/// `BadRequest`; empty `fairness` recovers `verify-liveness` exactly.
+pub async fn btor2_verify_liveness_under_fairness_handler(
+    Json(request): Json<Btor2VerifyLivenessUnderFairnessRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    blocking(move || btor2_verify_liveness_under_fairness_handler_impl(request)).await
+}
+
+fn btor2_verify_liveness_under_fairness_handler_impl(
+    request: Btor2VerifyLivenessUnderFairnessRequest,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    use crate::adapter::liveness_rescue::{
+        parse_fairness_atoms, parse_response_atom, response_liveness_rescue_under_fairness,
+    };
+
+    let bad_req = |message: String| ApiError::BadRequest {
+        message,
+        details: None,
+    };
+    let ante = parse_response_atom(&request.request).map_err(bad_req)?;
+    let cons = parse_response_atom(&request.grant).map_err(bad_req)?;
+    let fairness = parse_fairness_atoms(&request.fairness).map_err(bad_req)?;
+
+    let (verdict, outcome) =
+        response_liveness_rescue_under_fairness(&request.content, &ante, &cons, &fairness, false)
+            .ok_or_else(|| {
+            bad_req(
+            "could not build the fair-cycle liveness monitor — an atom likely binds no signal in \
+             the design"
+                .to_string(),
+        )
+        })?;
+
+    let property = if request.fairness.is_empty() {
+        format!("AG(({}) -> AF ({}))", request.request, request.grant)
+    } else {
+        let fair_and = request
+            .fairness
+            .iter()
+            .map(|f| format!("GF ({f})"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        format!(
+            "({fair_and}) -> AG(({}) -> AF ({}))",
+            request.request, request.grant
+        )
+    };
+
+    Ok(Json(Btor2VerifyLivenessResponse {
+        verdict: crate::verdict::PropertyVerdict::from(verdict)
+            .as_str()
+            .to_string(),
+        property,
+        decided_by: outcome
+            .reachable_by
+            .iter()
+            .chain(outcome.unreachable_by.iter())
+            .map(|s| s.to_string())
+            .collect(),
+    }))
+}
+
 /// Decide recoverability `AG EF target` (`POST /api/v1/btor2/verify-recoverability`)
 /// — "from every reachable state, can the design get back to `target`?", the
 /// branching property SVA cannot state. Surface peer of the CLI

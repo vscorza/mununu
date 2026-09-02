@@ -32,6 +32,39 @@
 //! `b`-free lasso through a pending request) and **complete** (a real violation has
 //! a suffix cycle on which `pending` stays 1 and `b` never holds, which the
 //! nondeterministic `save` can snapshot).
+//!
+//! # Fair-cycle extension (mununu#477 Option B)
+//!
+//! [`emit_response_l2s_monitor_under_fairness`] is the sibling that decides
+//! `(⋀_i GF fair_i) → AG(a → AF b)` — response-liveness UNDER a conjunctive
+//! justice assumption on primary-input (or combinational) atoms. It adds one
+//! `fair_i_seen` latch per fairness constraint (each mirroring `b_seen`'s
+//! definition exactly, with `fair_i` in `b`'s slot: was `fair_i` observed
+//! anywhere on the snapshotted cycle?) and conjuncts them into `bad`:
+//!
+//! ```text
+//! bad = looped ∧ ¬b_seen ∧ ⋀_i fair_i_seen
+//! ```
+//!
+//! **Soundness (bad reachable ⇒ genuine violation):** a reachable `bad` state
+//! has `looped` (snapshotted state repeats — a real cycle exists), `¬b_seen`
+//! (no `b` on the cycle segment), each `fair_i_seen` (each `fair_i` fires at
+//! least once on the cycle). The infinite unrolling `stem · cycle^ω` then
+//! satisfies each `GF fair_i` (fires once per cycle iteration ⇒ infinitely
+//! often) and violates `AG(a → AF b)` (the pending request stays outstanding
+//! forever since `b` never holds after the snapshot).
+//!
+//! **Completeness (violation ⇒ bad reachable):** if `π` violates
+//! `(⋀ GF fair_i) → AG(a → AF b)`, then `π` satisfies each `GF fair_i` and has
+//! a suffix cycle carrying pending-a with no b. The nondeterministic `save` can
+//! snapshot at the cycle-entry state; each `fair_i` fires somewhere on the
+//! subsequent cycle by `GF fair_i`; `b_seen` never latches by the pending-a
+//! assumption. Standard finite-state lasso closure gives `looped`. Hence `bad`
+//! is reachable. This is Emerson–Lei fair-cycle detection composed with the
+//! l2s save/snapshot argument (already trusted for the fairness-free case).
+//!
+//! Zero fairness atoms recovers the plain [`emit_response_l2s_monitor`]
+//! semantics exactly (the empty conjunction is `one`).
 
 use crate::adapter::btor2::ast::{Nid, Node};
 use crate::adapter::btor2::bad_monitor::{
@@ -98,11 +131,33 @@ fn emit_atom(
 /// Append the liveness-to-safety `bad` monitor for `AG(ante → AF cons)` to `content`.
 ///
 /// See the module docs for the construction. Returns an error when an atom does not
-/// resolve to a signal.
+/// resolve to a signal. Byte-for-byte equivalent to
+/// [`emit_response_l2s_monitor_under_fairness`] with an empty `fairness_atoms` slice.
 pub fn emit_response_l2s_monitor(
     content: &str,
     ante: (&str, CmpOp, u128),
     cons: (&str, CmpOp, u128),
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    emit_response_l2s_monitor_under_fairness(content, ante, cons, &[], reset_pinned)
+}
+
+/// mununu#477 Option B — append the fair-cycle l2s `bad` monitor for
+/// `(⋀_i GF fair_i) → AG(ante → AF cons)` to `content`.
+///
+/// See the module-level "Fair-cycle extension" section for the construction and the
+/// soundness / completeness argument. Adds one `fair_i_seen` latch per fairness atom
+/// (each mirroring `b_seen`'s definition exactly, with `fair_i` in `b`'s slot) and
+/// sets `bad = looped ∧ ¬b_seen ∧ ⋀_i fair_i_seen`. Empty `fairness_atoms` recovers
+/// [`emit_response_l2s_monitor`] byte-for-byte.
+///
+/// Returns an error when any atom (ante, cons, or a fairness atom) does not resolve
+/// to a signal.
+pub fn emit_response_l2s_monitor_under_fairness(
+    content: &str,
+    ante: (&str, CmpOp, u128),
+    cons: (&str, CmpOp, u128),
+    fairness_atoms: &[(&str, CmpOp, u128)],
     reset_pinned: bool,
 ) -> Result<String, AdapterError> {
     let file = parser::parse(content).map_err(|mut e| {
@@ -181,11 +236,50 @@ pub fn emit_response_l2s_monitor(
     let next_bseen = e.push(format!("ite {bool_sort} {save_en} {b} {inner}"));
     e.push(format!("next {bool_sort} {b_seen} {next_bseen}"));
 
-    // bad = looped && !b_seen — a b-free closed loop carrying a pending request.
+    // Fair-cycle extension: one fair_i_seen per fairness atom (mirrors b_seen).
+    // Skipped entirely when fairness_atoms is empty — keeps the plain
+    // `emit_response_l2s_monitor` emission byte-for-byte unchanged.
+    let mut fair_seen_terms: Vec<Nid> = Vec::with_capacity(fairness_atoms.len());
+    for (i, fair) in fairness_atoms.iter().enumerate() {
+        let f = emit_atom(
+            &file,
+            &mut e,
+            bool_sort,
+            *fair,
+            reset_pinned,
+            &format!("fairness_atom_{i}"),
+        )?;
+        let f_seen = e.push(format!("state {bool_sort} mununu_l2s_fair{i}_seen"));
+        e.push(format!("init {bool_sort} {f_seen} {zero1}"));
+        let f_seen_or_f = e.push(format!("or {bool_sort} {f_seen} {f}"));
+        let f_inner = e.push(format!("ite {bool_sort} {saved} {f_seen_or_f} {zero1}"));
+        let f_next = e.push(format!("ite {bool_sort} {save_en} {f} {f_inner}"));
+        e.push(format!("next {bool_sort} {f_seen} {f_next}"));
+        fair_seen_terms.push(f_seen);
+    }
+
+    // bad = looped && !b_seen (&& ⋀_i fair_i_seen when fairness_atoms non-empty).
+    // A b-free closed loop carrying a pending request AND — under fairness — each
+    // justice constraint observed at least once on the cycle. The FINAL `and`
+    // carries the BAD_COND_SYMBOL for provenance-stability with the plain monitor.
     let not_bseen = e.push(format!("not {bool_sort} {b_seen}"));
-    let bad_cond = e.push(format!(
-        "and {bool_sort} {looped} {not_bseen} {BAD_COND_SYMBOL}"
-    ));
+    let bad_cond = if fair_seen_terms.is_empty() {
+        // Byte-equivalent to the pre-extension emission: one two-way `and` with
+        // the symbol name.
+        e.push(format!(
+            "and {bool_sort} {looped} {not_bseen} {BAD_COND_SYMBOL}"
+        ))
+    } else {
+        let core_and = e.push(format!("and {bool_sort} {looped} {not_bseen}"));
+        let (last, rest) = fair_seen_terms
+            .split_last()
+            .expect("non-empty checked above");
+        let mut acc = core_and;
+        for &t in rest {
+            acc = e.push(format!("and {bool_sort} {acc} {t}"));
+        }
+        e.push(format!("and {bool_sort} {acc} {last} {BAD_COND_SYMBOL}"))
+    };
     e.push(format!("bad {bad_cond}"));
 
     Ok(format!("{}\n{}\n", content.trim_end(), e.lines.join("\n")))
@@ -260,6 +354,88 @@ mod tests {
 6 next 1 3 2
 7 output 3 grant
 ";
+
+    /// mununu#477 Option B — the empty-fairness path of the fair-cycle emitter is
+    /// byte-for-byte identical to the plain emitter. Guards against silent NID
+    /// drift on the existing `verify-liveness` verb.
+    #[test]
+    fn empty_fairness_matches_plain_emitter_byte_for_byte() {
+        let plain = emit_response_l2s_monitor(
+            RESPONDER,
+            ("req", CmpOp::Eq, 1),
+            ("st", CmpOp::Eq, 1),
+            false,
+        )
+        .expect("plain");
+        let fair_empty = emit_response_l2s_monitor_under_fairness(
+            RESPONDER,
+            ("req", CmpOp::Eq, 1),
+            ("st", CmpOp::Eq, 1),
+            &[],
+            false,
+        )
+        .expect("empty fair");
+        assert_eq!(
+            plain, fair_empty,
+            "empty-fairness path must be byte-for-byte identical to the plain emitter"
+        );
+    }
+
+    /// mununu#477 Option B — a non-empty fairness list adds `fair_i_seen` latches
+    /// and folds them into `bad`. Structural check on the emitted monitor.
+    #[test]
+    fn fairness_atoms_add_fair_seen_latches_and_extend_bad() {
+        let out = emit_response_l2s_monitor_under_fairness(
+            RESPONDER,
+            ("req", CmpOp::Eq, 1),
+            ("st", CmpOp::Eq, 1),
+            &[("req", CmpOp::Eq, 0)],
+            false,
+        )
+        .expect("emit");
+        assert!(
+            out.contains("mununu_l2s_fair0_seen"),
+            "fair0_seen latch present: {out}"
+        );
+        // The bad line still names the BAD_COND_SYMBOL on its final and.
+        let file = parser::parse(&out).expect("emitted BTOR2 re-parses");
+        assert!(
+            file.lines
+                .iter()
+                .any(|l| matches!(l.node, Node::Bad { .. })),
+            "a bad line is present"
+        );
+    }
+
+    /// mununu#477 Option B — multiple fairness atoms produce one latch per atom
+    /// and chain into `bad` via a left-associative `and` fold.
+    #[test]
+    fn multiple_fairness_atoms_produce_one_latch_each() {
+        let out = emit_response_l2s_monitor_under_fairness(
+            RESPONDER,
+            ("req", CmpOp::Eq, 1),
+            ("st", CmpOp::Eq, 1),
+            &[("req", CmpOp::Eq, 0), ("req", CmpOp::Eq, 1)],
+            false,
+        )
+        .expect("emit");
+        assert!(out.contains("mununu_l2s_fair0_seen"));
+        assert!(out.contains("mununu_l2s_fair1_seen"));
+    }
+
+    /// mununu#477 Option B — a fairness atom that binds no signal errors just like
+    /// an ante / cons atom that binds no signal.
+    #[test]
+    fn unresolvable_fairness_atom_errors() {
+        let e = emit_response_l2s_monitor_under_fairness(
+            RESPONDER,
+            ("req", CmpOp::Eq, 1),
+            ("st", CmpOp::Eq, 1),
+            &[("nonexistent_fair_signal", CmpOp::Eq, 1)],
+            false,
+        );
+        assert!(e.is_err(), "unbound fairness atom must error");
+    }
 
     #[test]
     fn binds_registered_output_grant() {

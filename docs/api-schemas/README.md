@@ -22,6 +22,7 @@ Each `*.schema.json` file is a JSON Schema (Draft-07) derived directly from the 
 | [`btor2-verify-liveness-request.schema.json`](btor2-verify-liveness-request.schema.json) | `POST /api/v1/btor2/verify-liveness` | Request body |
 | [`btor2-verify-liveness-response.schema.json`](btor2-verify-liveness-response.schema.json) | `POST /api/v1/btor2/verify-liveness` (also `-all`) | Response body |
 | [`btor2-verify-liveness-all-request.schema.json`](btor2-verify-liveness-all-request.schema.json) | `POST /api/v1/btor2/verify-liveness-all` | Request body |
+| [`btor2-verify-liveness-under-fairness-request.schema.json`](btor2-verify-liveness-under-fairness-request.schema.json) | `POST /api/v1/btor2/verify-liveness-under-fairness` | Request body (response = `btor2-verify-liveness-response.schema.json`) |
 | [`btor2-verify-recoverability-request.schema.json`](btor2-verify-recoverability-request.schema.json) | `POST /api/v1/btor2/verify-recoverability` | Request body |
 | [`btor2-verify-recoverability-response.schema.json`](btor2-verify-recoverability-response.schema.json) | `POST /api/v1/btor2/verify-recoverability` | Response body |
 | [`btor2-check-fsm-request.schema.json`](btor2-check-fsm-request.schema.json) | `POST /api/v1/btor2/check-fsm` | Request body |

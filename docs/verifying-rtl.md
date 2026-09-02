@@ -62,6 +62,25 @@ Cross-checked against the exact engine.
 mununu btor2 verify-liveness design.btor2 --request "st == 1" --grant "st == 2"
 ```
 
+### `btor2 verify-liveness-under-fairness` — response liveness under a `GF` fairness assumption (mununu#477)
+
+> Source of truth: [`response_liveness_rescue_under_fairness`](../crates/mununu-core/src/adapter/liveness_rescue.rs#L313) — surface: (CLI+API+UI)
+
+Decides `(⋀ⱼ GF fairⱼ) → AG(request → AF grant)` via the Emerson–Lei extension of the plain l2s: one `fairⱼ_seen` latch per fairness atom (each mirroring the existing `b_seen`), conjuncted into `bad = looped ∧ ¬b_seen ∧ ⋀ⱼ fairⱼ_seen`. A reachable `bad` ⇒ a lasso exists that satisfies every fairness constraint AND leaves a request forever ungranted ⇒ VIOLATED. Empty `--fairness` recovers `verify-liveness` exactly, byte-for-byte on the emitted monitor. Sound + complete for the response shape (a useless fairness atom env satisfies trivially does NOT rescue a genuinely starving design — the `fair_gated_is_not_rescued_by_useless_fairness` soundness control validates this).
+
+Use when a block cannot own its liveness on its own — its grant comes from an arbiter it does not control — and you can express the arbiter's obligation as a `GF <signal>` on a primary input. See [`design/emerson-lei-fair-cycle.md`](design/emerson-lei-fair-cycle.md) for the construction and soundness argument (module-level docs in [`crates/mununu-core/src/adapter/btor2/l2s_monitor.rs`](../crates/mununu-core/src/adapter/btor2/l2s_monitor.rs)).
+
+```bash
+mununu btor2 verify-liveness-under-fairness design.btor2 \
+    --request "req == 1" --grant "ack == 1" \
+    --fairness "grant_cpu == 1"
+
+# Multiple fairness constraints — conjunctive `GF fair_1 ∧ GF fair_2` — repeat --fairness.
+mununu btor2 verify-liveness-under-fairness design.btor2 \
+    --request "req == 1" --grant "ack == 1" \
+    --fairness "fair_1 == 1" --fairness "fair_2 == 1"
+```
+
 ### `btor2 verify-recoverability` — recoverability `AG EF good`
 
 > Source of truth: [`verify_recoverability`](../crates/mununu-core/src/adapter/recoverability.rs#L46) — surface: (CLI+API+UI)

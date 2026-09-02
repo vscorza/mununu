@@ -126,6 +126,13 @@ fn create_router() -> Router {
             "/api/v1/btor2/verify-liveness-all",
             post(handlers::btor2_verify_liveness_all_handler),
         )
+        // mununu#477 Option B — response-liveness UNDER a conjunctive `GF` fairness
+        // assumption on primary-input (or state) atoms, via the Emerson–Lei fair-cycle
+        // l2s + the portfolio. Surface peer of `mununu btor2 verify-liveness-under-fairness`.
+        .route(
+            "/api/v1/btor2/verify-liveness-under-fairness",
+            post(handlers::btor2_verify_liveness_under_fairness_handler),
+        )
         // P2 recoverability — AG EF good ("can it always get back?"), the branching
         // property SVA cannot state. Surface peer of `mununu btor2 verify-recoverability`.
         .route(

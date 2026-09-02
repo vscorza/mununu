@@ -11,6 +11,7 @@ The BTOR2-direct property verbs (`verify`, `verify-liveness`, `verify-liveness-a
 | `btor2 verify` / `sv verify` | Safety (`bad` unreachable) | `Btor2VerifyResponse` | Per-engine breakdown, soundness-alarm flag |
 | `btor2 verify-liveness` / `sv verify-liveness` | Response `AG(a → AF b)` | `Btor2VerifyLivenessResponse` | Reduced-property echo, deciding engines |
 | `btor2 verify-liveness-all` / `sv verify-liveness-all` | Conjunctive `⋀ᵢ AG(aᵢ → AF bᵢ)` | `Btor2VerifyLivenessResponse` | Same as `-liveness` — one merged verdict |
+| `btor2 verify-liveness-under-fairness` (mununu#477) | Response under fairness `(⋀ⱼ GF fairⱼ) → AG(a → AF b)` | `Btor2VerifyLivenessResponse` | Same shape as `-liveness`; empty `fairness` reduces to `-liveness` exactly |
 | `btor2 verify-recoverability` / `sv verify-recoverability` | Recoverability `AG EF good` | `Btor2VerifyRecoverabilityResponse` | Optional `VerdictRefinement` tree (vacuous / config-partition / holds-under / ⊥-hint) |
 | `btor2 check-fsm` / `sv check-fsm` | Auto-scan of illegal FSM encodings | `Btor2CheckFsmResponse` | Per-register findings + counts |
 
@@ -34,6 +35,36 @@ Runs every available sound reach-portfolio engine (native BMC / k-induction, McM
 - `verdict` — the merged canonical answer.
 - `reachable_by` / `unreachable_by` — the deciding engines. An `unreachable_by` list of length ≥ 1 is a sound safety proof; a `reachable_by` list of length ≥ 1 is a real counterexample.
 - `contradiction` — TRUE only when two sound engines disagree. **Treat this as a soundness alarm**, not a verdict-selection hint: raise it to a human and cross-check the input BTOR2 rather than picking a side.
+
+## `POST /btor2/verify-liveness-under-fairness` — response properties under a fairness assumption (mununu#477 Option B)
+
+Schema: [`btor2-verify-liveness-under-fairness-request.schema.json`](btor2-verify-liveness-under-fairness-request.schema.json) (response reuses `btor2-verify-liveness-response.schema.json`)
+
+Decides `(⋀ⱼ GF fairⱼ) → AG(request → AF grant)` via the Emerson–Lei fair-cycle extension of the plain l2s. The BTOR2 monitor gains one `fairⱼ_seen` latch per fairness atom (each mirroring the existing `b_seen`); `bad = looped ∧ ¬b_seen ∧ ⋀ⱼ fairⱼ_seen`. A reachable `bad` ⇒ a lasso exists that satisfies EVERY fairness constraint AND leaves a request forever ungranted ⇒ VIOLATED. An unreachable `bad` ⇒ HOLDS. Empty `fairness` recovers `verify-liveness` exactly.
+
+Request example:
+
+```json
+{
+  "content": "<btor2 source>",
+  "request": "req == 1",
+  "grant": "ack == 1",
+  "fairness": ["grant_cpu == 1"]
+}
+```
+
+Response:
+
+```json
+{
+  "verdict": "holds",
+  "property": "(GF (grant_cpu == 1)) -> AG((req == 1) -> AF (ack == 1))",
+  "decided_by": ["native_kind"]
+}
+```
+
+- `property` echoes the fully-quantified formula for provenance (empty fairness → the plain `AG(...) -> AF(...)` shape).
+- Soundness guarantee: the fair-cycle l2s is sound + complete for the response shape (see [`crates/mununu-core/src/adapter/btor2/l2s_monitor.rs`](../../crates/mununu-core/src/adapter/btor2/l2s_monitor.rs) module docs for the construction and Emerson–Lei argument). A useless fairness atom that env satisfies trivially (e.g. `GF (dead_input == 0)` where `dead_input` is not wired to anything) does NOT rescue a genuinely-starving design — validated by the `fair_gated_is_not_rescued_by_useless_fairness` soundness control.
 
 ## `POST /btor2/verify-liveness` and `-liveness-all` — response properties
 

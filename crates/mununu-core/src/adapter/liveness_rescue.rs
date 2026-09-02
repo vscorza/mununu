@@ -65,7 +65,9 @@
 //! the mununu-sva toolchain, per the [`crate::adapter::reach_rescue`] no-target
 //! lesson).
 
-use crate::adapter::btor2::l2s_monitor::emit_response_l2s_monitor;
+use crate::adapter::btor2::l2s_monitor::{
+    emit_response_l2s_monitor, emit_response_l2s_monitor_under_fairness,
+};
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
 use crate::adapter::reach_portfolio::{ReachOutcome, ReachVerdict, decide_reach_portfolio};
@@ -308,6 +310,57 @@ pub fn response_liveness_rescue_atoms(
         ReachVerdict::Unknown | ReachVerdict::Contradiction => LivenessVerdict::Inconclusive,
     };
     Some((verdict, outcome))
+}
+
+/// mununu#477 Option B — decide `(⋀_j GF fair_j) → AG(ante → AF cons)` via the
+/// fair-cycle l2s (Emerson–Lei extension of Biere–Artho–Schuppan). Same contract
+/// as [`response_liveness_rescue_atoms`] plus a slice of primary-input / state
+/// fairness atoms; an empty `fairness_atoms` slice recovers
+/// [`response_liveness_rescue_atoms`] exactly.
+///
+/// The construction — one `fair_j_seen` latch per fairness atom, mirroring the
+/// existing `b_seen`; `bad = looped ∧ ¬b_seen ∧ ⋀_j fair_j_seen` — is documented
+/// in [`emit_response_l2s_monitor_under_fairness`] with the soundness /
+/// completeness argument.
+///
+/// Returns `None` only when the l2s monitor cannot be built (an atom binds no
+/// signal). On `Some`, the second component is the raw [`ReachOutcome`] (which
+/// engines decided) for diagnostics / a witness note.
+pub fn response_liveness_rescue_under_fairness(
+    design_btor2: &str,
+    ante: &Atom,
+    cons: &Atom,
+    fairness_atoms: &[Atom],
+    reset_pinned: bool,
+) -> Option<(LivenessVerdict, ReachOutcome)> {
+    let fair_tuples: Vec<(&str, CmpOp, u128)> = fairness_atoms
+        .iter()
+        .map(|a| (a.signal.as_str(), a.op, a.value))
+        .collect();
+    let monitored = emit_response_l2s_monitor_under_fairness(
+        design_btor2,
+        (&ante.signal, ante.op, ante.value),
+        (&cons.signal, cons.op, cons.value),
+        &fair_tuples,
+        reset_pinned,
+    )
+    .ok()?;
+    let file = parser::parse(&monitored).ok()?;
+    let outcome = decide_reach_portfolio(&file);
+    let verdict = match outcome.verdict {
+        ReachVerdict::Unreachable => LivenessVerdict::Holds,
+        ReachVerdict::Reachable => LivenessVerdict::Violated,
+        ReachVerdict::Unknown | ReachVerdict::Contradiction => LivenessVerdict::Inconclusive,
+    };
+    Some((verdict, outcome))
+}
+
+/// Parse repeatable `"REG op VALUE"` fairness-atom strings (the
+/// `verify-liveness-under-fairness` surface) into [`Atom`]s. Reuses
+/// [`parse_response_atom`] so the grammar matches the request / grant atoms
+/// exactly; each entry must be a single register-comparison.
+pub fn parse_fairness_atoms(specs: &[String]) -> Result<Vec<Atom>, String> {
+    specs.iter().map(|s| parse_response_atom(s)).collect()
 }
 
 /// Decide a **conjunction** of response-liveness properties `⋀_i AG(a_i → AF b_i)`
