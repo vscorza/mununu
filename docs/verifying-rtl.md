@@ -104,6 +104,29 @@ path (validated on real OpenTitan `csrng` RTL — see `recoverability-vs-sva.md`
 
 ---
 
+### `sv verify-auto` fair-cycle bridge — `// @mununu_assume GF <atom>` (mununu#477)
+
+> Source of truth: [`escalate_bottom`](../crates/mununu-core/src/adapter/slang/verify_auto.rs) — surface: (CLI+API+UI)
+
+A `// @mununu_assume GF <REG op VALUE>` inline annotation is **auto-applied to any response-shape guarantee** (`AG(a → AF b)`) in the same source. The SV verify-auto orchestration parses the `GF <atom>` into a typed fairness atom during annotation scanning; when a response-shape guarantee's cube-abstraction verdict is ⊥, the ⊥-escalation router dispatches through [`response_liveness_rescue_under_fairness`](../crates/mununu-core/src/adapter/liveness_rescue.rs) (the fair-cycle l2s primitive described above) instead of the plain `response_liveness_rescue`. A definite `holds` under fairness means the guarantee holds against every environment schedule satisfying the assumption infinitely often; a definite `violated` is a reachable lasso satisfying the assumption that still leaves the request forever ungranted.
+
+Multiple `// @mununu_assume GF <atom>` in one source accumulate as a conjunction `(⋀ⱼ GF fairⱼ)`. The scanner records the applied assume in the `annotation-properties` verification note; each fair-cycle rescue emits a `fair-cycle-rescue` note naming the assumption(s) applied.
+
+Assumes that don't fit `GF <REG op VALUE>` — a state predicate, a non-response guarantee shape, or coupled multi-guarantee fairness — remain recorded rather than auto-applied. Route those through `mununu btor2 verify-liveness-under-fairness` on the emitted BTOR2, or model in CTXDSL where the GR(1) game engine handles multi-pair coupled fairness directly.
+
+```systemverilog
+// @mununu_assume GF grant_cpu == 1
+// @mununu_guarantee nu Z. ((!(req == 1) || mu Y. ((ack == 1) || [] Y)) && [] Z)
+module wb_mem_client(...);
+    // ...
+endmodule
+```
+
+```bash
+# The guarantee is decided under GF(grant_cpu == 1) automatically:
+mununu sv verify-auto wb_mem_client.sv
+```
+
 ## No-sidecar SystemVerilog verification: `sv verify-auto`
 
 > Source of truth: [`verify_auto`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L1537) — surface: (CLI+API+UI)

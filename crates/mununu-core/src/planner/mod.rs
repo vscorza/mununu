@@ -254,8 +254,9 @@ pub fn replan(
     design_btor2: &str,
     reset_pinned: bool,
     opts: &VerifyAutoOptions,
+    fairness_atoms: &[crate::adapter::liveness_rescue::Atom],
 ) -> Vec<VerificationNote> {
-    escalate_bottom(report, design_btor2, reset_pinned, opts)
+    escalate_bottom(report, design_btor2, reset_pinned, opts, fairness_atoms)
 }
 
 /// A **composed** recoverability plan — the point of a *planner*: mechanisms combine. It runs the

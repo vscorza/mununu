@@ -1231,14 +1231,23 @@ struct AnnotationScan {
     /// `@mununu_guarantee <mu-calculus>` properties that parsed, as
     /// `TranslatedAssertion`s ready to merge into `extraction.translated`.
     guarantees: Vec<crate::adapter::slang::translate::TranslatedAssertion>,
-    /// `@mununu_assume <body>` bodies (verbatim) — recorded for provenance. A
+    /// `@mununu_assume <body>` bodies (verbatim) that were NOT recognised as
+    /// typed fairness / config assumes — recorded for provenance. A
     /// `<signal> = <value>` assume is applied by this path via config
-    /// concretization; a temporal `GF …` fairness assume is recorded rather
-    /// than auto-applied — the SV verify-auto lift does not yet route it to
-    /// the fairness-constrained engine. Fairness-constrained model checking
-    /// IS shipped (CTXDSL + GR(1); `btor2 game --objective recurrence`); see
-    /// mununu#477 for the bridge tracking.
+    /// concretization (typed elsewhere). A `GF <atom>` fairness assume is
+    /// parsed into [`Self::fairness_assumes`] and auto-applied via the
+    /// fair-cycle l2s (mununu#477 Option B PR 2); a body that fails to parse
+    /// as either falls through to this string bucket unchanged.
     assumes: Vec<String>,
+    /// `@mununu_assume GF <atom>` bodies parsed into typed
+    /// [`crate::adapter::liveness_rescue::Atom`]s. When non-empty, the SV
+    /// verify-auto dispatch routes response-shape guarantees (`AG(a → AF b)`)
+    /// through [`crate::adapter::liveness_rescue::response_liveness_rescue_under_fairness`]
+    /// (the Emerson–Lei fair-cycle l2s) instead of the plain
+    /// [`crate::adapter::liveness_rescue::response_liveness_rescue`]. Bodies
+    /// that name `GF` but whose atom fails to parse are surfaced in
+    /// [`Self::skipped`], never silently dropped.
+    fairness_assumes: Vec<crate::adapter::liveness_rescue::Atom>,
     /// `@mununu_guarantee` bodies that did NOT parse — surfaced, never silently
     /// dropped.
     skipped: Vec<String>,
@@ -1288,7 +1297,29 @@ fn scan_annotation_properties(sources: &[(String, String)]) -> AnnotationScan {
                         )),
                     }
                 }
-                MununuTag::Assume => scan.assumes.push(ann.value.trim().to_string()),
+                MununuTag::Assume => {
+                    let body = ann.value.trim();
+                    // mununu#477 Option B — parse `GF <atom>` into a typed fairness assume.
+                    // The atom must be a single register-comparison (`REG op VALUE`),
+                    // matching the fair-cycle primitive's atom shape exactly. Anything
+                    // else falls through to the untyped string bucket unchanged (the
+                    // config-concretization path already picks up `<sig> = <val>`).
+                    if let Some(atom_str) = body
+                        .strip_prefix("GF ")
+                        .or_else(|| body.strip_prefix("GF\t"))
+                    {
+                        let atom_str = atom_str.trim();
+                        match crate::adapter::liveness_rescue::parse_response_atom(atom_str) {
+                            Ok(atom) => scan.fairness_assumes.push(atom),
+                            Err(e) => scan.skipped.push(format!(
+                                "@mununu_assume GF `{atom_str}` did not parse as a \
+                                 register-comparison atom: {e}"
+                            )),
+                        }
+                    } else {
+                        scan.assumes.push(body.to_string());
+                    }
+                }
                 MununuTag::Predicate => {
                     let body = ann.value.trim();
                     // A bare identifier (`sig` ≡ `sig == 1`) is admitted like a bare
@@ -1316,7 +1347,11 @@ fn scan_annotation_properties(sources: &[(String, String)]) -> AnnotationScan {
 /// seen, and any guarantee bodies that failed to parse (surfaced, never dropped).
 /// `None` when the source carried no `@mununu` property annotations.
 fn annotation_note(scan: &AnnotationScan) -> Option<VerificationNote> {
-    if scan.guarantees.is_empty() && scan.assumes.is_empty() && scan.skipped.is_empty() {
+    if scan.guarantees.is_empty()
+        && scan.assumes.is_empty()
+        && scan.fairness_assumes.is_empty()
+        && scan.skipped.is_empty()
+    {
         return None;
     }
     let mut items = Vec::new();
@@ -1325,6 +1360,21 @@ fn annotation_note(scan: &AnnotationScan) -> Option<VerificationNote> {
     }
     for a in &scan.assumes {
         items.push(format!("assume: {a}"));
+    }
+    for a in &scan.fairness_assumes {
+        items.push(format!(
+            "assume: GF ({} {} {}) — auto-applied via fair-cycle l2s (mununu#477)",
+            a.signal,
+            match a.op {
+                crate::adapter::btor2::predicate_expr::CmpOp::Eq => "==",
+                crate::adapter::btor2::predicate_expr::CmpOp::Ne => "!=",
+                crate::adapter::btor2::predicate_expr::CmpOp::Lt => "<",
+                crate::adapter::btor2::predicate_expr::CmpOp::Le => "<=",
+                crate::adapter::btor2::predicate_expr::CmpOp::Gt => ">",
+                crate::adapter::btor2::predicate_expr::CmpOp::Ge => ">=",
+            },
+            a.value,
+        ));
     }
     for s in &scan.skipped {
         items.push(format!("skipped: {s}"));
@@ -1353,17 +1403,21 @@ fn annotation_note(scan: &AnnotationScan) -> Option<VerificationNote> {
         detail:
             "`@mununu_guarantee <mu-calculus>` / `@mununu_assume <body>` annotations carry the \
                  mununu-exclusive properties an author adds beyond the design's own SVA (e.g. \
-                 assume-guarantee liveness the SVA fragment cannot express). Guarantee bodies are \
-                 mu-calculus formulas parsed by the same parser as the translated SVA and verified \
-                 through the same pipeline. `@mununu_assume` of the form `<signal> = <value>` is \
-                 applied by this path via config concretization. A temporal (`GF …`) fairness \
-                 assume is recorded here rather than auto-applied — the SV verify-auto lift does \
-                 not yet route it to the fairness-constrained engine. Fairness-constrained model \
-                 checking IS shipped: `mununu sv emit-btor2` + `mununu btor2 game --objective \
-                 recurrence` (single-pair GR(1)) decides `(GF assume) → (GF guarantee)` on the \
-                 lifted design, and CTXDSL's GR(1) game engine `(⋀ GF envᵢ) → (⋀ GF sysⱼ)` \
-                 discharges multi-pair assume-guarantee liveness directly. See mununu#477 for \
-                 the SV-path auto-routing bridge."
+                 assume-guarantee liveness the SVA fragment cannot express). Guarantee bodies \
+                 are mu-calculus formulas parsed by the same parser as the translated SVA and \
+                 verified through the same pipeline. `@mununu_assume` of the form \
+                 `<signal> = <value>` is applied by this path via config concretization. A \
+                 temporal `GF <REG op VALUE>` fairness assume is auto-applied for \
+                 response-shape guarantees (`AG(a → AF b)`) via the Emerson–Lei fair-cycle l2s \
+                 (mununu#477 Option B) — each `GF` assume adds a `fair_seen` monitor latch, \
+                 and a `holds` verdict under fairness means the guarantee holds against every \
+                 environment schedule satisfying the assumption infinitely often. For \
+                 assumptions that do not fit `GF <REG op VALUE>` — a state predicate, a \
+                 non-response guarantee shape, or a multi-guarantee-coupled fairness — the \
+                 assume is recorded here; use `mununu btor2 verify-liveness-under-fairness` \
+                 on the emitted BTOR2 or model in CTXDSL where the GR(1) game engine \
+                 `(⋀ GF envᵢ) → (⋀ GF sysⱼ)` discharges multi-pair assume-guarantee liveness \
+                 directly."
                 .into(),
         items,
     })
@@ -2946,7 +3000,13 @@ pub(crate) fn verify_auto_impl(
     // `rescue_bottom_*` opt and only fires on its recognized shape. (P2.1b routes the
     // re-plan entry through the planner, delegating the edge-application to the existing
     // rescue subsystem — verdict-equivalent; P2.1c adds the soundness plan-invariants.)
-    let rescue_notes = crate::planner::replan(&mut report, &btor2, reset_pinned, opts);
+    let rescue_notes = crate::planner::replan(
+        &mut report,
+        &btor2,
+        reset_pinned,
+        opts,
+        &ann_scan.fairness_assumes,
+    );
 
     // Lever (b) — exact-symbolic rescue for cube-SKIPPED properties. The predicate cube
     // cannot seed an ATOM-LESS modal formula (no-deadlock `nu X.(<> true && [] X)`, a pure
@@ -3011,10 +3071,12 @@ pub(crate) fn escalate_bottom(
     design_btor2: &str,
     reset_pinned: bool,
     opts: &VerifyAutoOptions,
+    fairness_atoms: &[crate::adapter::liveness_rescue::Atom],
 ) -> Vec<VerificationNote> {
     use crate::adapter::btor2::predicate_expr::CmpOp;
     use crate::adapter::liveness_rescue::{
-        LivenessVerdict, reduce_ag_ef_target, response_liveness_rescue,
+        LivenessVerdict, reduce_ag_ef_target, reduce_response_af, response_liveness_rescue,
+        response_liveness_rescue_under_fairness,
     };
     use crate::adapter::reach_rescue::{RescueVerdict, reach_portfolio_rescue};
     use crate::adapter::recoverability::{verify_recoverability, verify_recoverability_scalable};
@@ -3067,7 +3129,47 @@ pub(crate) fn escalate_bottom(
             }
             PropertyClass::Liveness => {
                 let mut handled = false;
+                // mununu#477 Option B — if `GF <atom>` fairness assumes are present AND
+                // this guarantee reduces to response shape, route through the fair-cycle
+                // l2s primitive `(⋀ⱼ GF fairⱼ) → AG(a → AF b)` (Emerson–Lei). Empty
+                // fairness ⇒ falls through to the plain rescue below, unchanged.
                 if opts.rescue_bottom_liveness
+                    && !fairness_atoms.is_empty()
+                    && let Some(r) = reduce_response_af(&formula)
+                    && let Some((verdict, reach)) = response_liveness_rescue_under_fairness(
+                        design_btor2,
+                        &r.ante,
+                        &r.cons,
+                        fairness_atoms,
+                        reset_pinned,
+                    )
+                {
+                    handled = true;
+                    let engines = engines_of(&reach);
+                    match verdict {
+                        LivenessVerdict::Holds => {
+                            prop.outcome = VerifyOutcome::Holds;
+                            notes.push(fair_cycle_rescue_note(
+                                &prop.name,
+                                "HOLDS",
+                                &engines,
+                                fairness_atoms,
+                            ));
+                        }
+                        LivenessVerdict::Violated => {
+                            prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                            notes.push(fair_cycle_rescue_note(
+                                &prop.name,
+                                "VIOLATED",
+                                &engines,
+                                fairness_atoms,
+                            ));
+                        }
+                        LivenessVerdict::Inconclusive => {}
+                    }
+                }
+                if !handled
+                    && opts.rescue_bottom_liveness
                     && let Some((verdict, reach)) =
                         response_liveness_rescue(design_btor2, &formula, reset_pinned)
                 {
@@ -3322,6 +3424,56 @@ fn recoverability_bot_reason_note(
     }
 }
 
+/// mununu#477 Option B — provenance note for a box-AF liveness property the
+/// fair-cycle l2s (Emerson–Lei extension) decided under a conjunctive `GF` fairness
+/// assumption on primary-input atoms. Names the assumption(s) applied.
+fn fair_cycle_rescue_note(
+    name: &str,
+    verdict: &str,
+    engines: &[&str],
+    fairness_atoms: &[crate::adapter::liveness_rescue::Atom],
+) -> VerificationNote {
+    use crate::adapter::btor2::predicate_expr::CmpOp;
+    let fair_render: Vec<String> = fairness_atoms
+        .iter()
+        .map(|a| {
+            let op = match a.op {
+                CmpOp::Eq => "==",
+                CmpOp::Ne => "!=",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+            };
+            format!("GF ({} {} {})", a.signal, op, a.value)
+        })
+        .collect();
+    let fair_conj = fair_render.join(" && ");
+    VerificationNote {
+        kind: "fair-cycle-rescue".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{name}`: the cube abstraction left ⊥; the fair-cycle l2s (Emerson–Lei) \
+             decided it {verdict} under {fair_conj} (engine(s): {})",
+            if engines.is_empty() {
+                "—".to_string()
+            } else {
+                engines.join(", ")
+            }
+        ),
+        detail: "The box-response liveness ⊥ (`AG(a → AF b)`) was decided under the \
+                 conjunctive fairness assumption (mununu#477 Option B) via the Emerson–Lei \
+                 fair-cycle l2s: the standard l2s pending / snapshot construction plus one \
+                 `fair_seen` monitor latch per `GF` atom, all conjuncted into `bad`. A `holds` \
+                 verdict means the guarantee holds against every environment schedule \
+                 satisfying every fairness assume infinitely often; a `violated` verdict is \
+                 a reachable lasso satisfying every fairness constraint that leaves the \
+                 request forever ungranted."
+            .into(),
+        items: Vec::new(),
+    }
+}
+
 /// A provenance note for a box-AF liveness property the l2s reduction + reachability
 /// portfolio rescued from `⊥`.
 fn liveness_rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote {
@@ -3567,7 +3719,13 @@ mod tests {
             ..Default::default()
         };
 
-        let notes = escalate_bottom(&mut report, DESIGN, false, &VerifyAutoOptions::default());
+        let notes = escalate_bottom(
+            &mut report,
+            DESIGN,
+            false,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "the ⊥ safety property should be rescued to HOLDS, got {:?}",
@@ -3599,7 +3757,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let notes = escalate_bottom(&mut report, COUNTER, false, &VerifyAutoOptions::default());
+        let notes = escalate_bottom(
+            &mut report,
+            COUNTER,
+            false,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Violated { .. }),
             "the ⊥ safety property should be rescued to VIOLATED, got {:?}",
@@ -3737,7 +3901,7 @@ mod tests {
             rescue_bottom_recoverability: false,
             ..VerifyAutoOptions::default()
         };
-        let notes = escalate_bottom(&mut report, DESIGN, false, &opts);
+        let notes = escalate_bottom(&mut report, DESIGN, false, &opts, &[]);
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
             "a νμ ⊥ must be left untouched by the safety arm (2-valued reachability can't \
@@ -3788,6 +3952,7 @@ mod tests {
             RESPONDER_LIVE,
             false,
             &VerifyAutoOptions::default(),
+            &[],
         );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
@@ -3797,6 +3962,145 @@ mod tests {
         assert!(
             notes.iter().any(|n| n.kind == "liveness-rescue"),
             "a liveness-rescue provenance note should be recorded"
+        );
+    }
+
+    // mununu#477 Option B — a fair-cycle rescue fixture. `next(pending) = (pending || req) && !ack`
+    // and `next(ack) = fair && pending`: without a `GF fair` assumption env holds fair=0 forever
+    // and starves ack; under `GF(fair == 1)` every pending req eventually meets a fair cycle.
+    const FAIR_GATED: &str = "\
+1 sort bitvec 1
+2 input 1 req
+3 input 1 fair
+4 state 1 pending
+5 zero 1
+6 init 1 4 5
+7 state 1 ack
+8 init 1 7 5
+9 or 1 4 2
+10 not 1 7
+11 and 1 9 10
+12 next 1 4 11
+13 and 1 3 4
+14 next 1 7 13
+";
+
+    /// mununu#477 Option B — `AG(req → AF ack)` on FAIR_GATED is VIOLATED without any
+    /// fairness (env starves fair forever). Baseline for the fair-cycle test below.
+    #[test]
+    fn escalate_bottom_fair_cycle_baseline_violated_without_fairness() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "req_ack".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Z. ((!(req == 1) || mu Y. ((ack == 1) || [] Y)) && [] Z)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let _notes = escalate_bottom(
+            &mut report,
+            FAIR_GATED,
+            false,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Violated { .. }),
+            "without a fairness assumption env can starve fair=0 forever, so the response is \
+             VIOLATED; got {:?}",
+            report.properties[0].outcome
+        );
+    }
+
+    /// mununu#477 Option B — the same property on the same design HOLDS under
+    /// `GF(fair == 1)`: the fair-cycle bridge routes to
+    /// `response_liveness_rescue_under_fairness` when the annotation scanner has
+    /// a typed `fairness_assumes` list. This is the load-bearing test for the SV
+    /// verify-auto bridge — the ticket's `wb_mem_client`-shape case reduced to
+    /// the BTOR2 layer this escalation runs on.
+    #[test]
+    fn escalate_bottom_fair_cycle_rescues_response_under_gf_fair() {
+        use crate::adapter::btor2::predicate_expr::CmpOp;
+        use crate::adapter::liveness_rescue::Atom;
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "req_ack".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Z. ((!(req == 1) || mu Y. ((ack == 1) || [] Y)) && [] Z)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let fair = [Atom {
+            signal: "fair".to_string(),
+            op: CmpOp::Eq,
+            value: 1,
+        }];
+        let notes = escalate_bottom(
+            &mut report,
+            FAIR_GATED,
+            false,
+            &VerifyAutoOptions::default(),
+            &fair,
+        );
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "under GF(fair == 1), the fair-cycle bridge must decide the response HOLDS; \
+             got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "fair-cycle-rescue"),
+            "a fair-cycle-rescue provenance note should be recorded (found: {:?})",
+            notes.iter().map(|n| &n.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            notes.iter().any(|n| n.summary.contains("GF (fair == 1)")),
+            "the note must name the fairness assumption applied"
+        );
+    }
+
+    /// mununu#477 Option B — a `GF <atom>` assume paired with a non-response guarantee
+    /// (a νμ recoverability) does NOT go through the fair-cycle bridge (the primitive is
+    /// response-specific). The escalation must leave the non-response verdict untouched
+    /// rather than mis-route it — soundness guard.
+    #[test]
+    fn escalate_bottom_fair_cycle_does_not_route_non_response_guarantees() {
+        use crate::adapter::btor2::predicate_expr::CmpOp;
+        use crate::adapter::liveness_rescue::Atom;
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                // A νμ recoverability (`AG(a → EF b)`), NOT the box-AF shape the primitive expects.
+                formula: "nu Z. ((!(req == 1) || mu Y. ((ack == 1) || <> Y)) && [] Z)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let fair = [Atom {
+            signal: "fair".to_string(),
+            op: CmpOp::Eq,
+            value: 1,
+        }];
+        let notes = escalate_bottom(
+            &mut report,
+            FAIR_GATED,
+            false,
+            &VerifyAutoOptions::default(),
+            &fair,
+        );
+        assert!(
+            !notes.iter().any(|n| n.kind == "fair-cycle-rescue"),
+            "the fair-cycle bridge must not fire on a non-response guarantee shape; found: {:?}",
+            notes.iter().map(|n| &n.kind).collect::<Vec<_>>()
         );
     }
 
@@ -3821,6 +4125,7 @@ mod tests {
             RESPONDER_LIVE,
             false,
             &VerifyAutoOptions::default(),
+            &[],
         );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
@@ -3851,6 +4156,7 @@ mod tests {
             RESPONDER_LIVE,
             false,
             &VerifyAutoOptions::default(),
+            &[],
         );
         // The router dispatches the νμ ⊥ to the cube + smt-hyper-must path, which now DECIDES it
         // `Holds`: the N1-first-increment property-directed seeding (good register's other control
@@ -3889,7 +4195,13 @@ mod tests {
             ..Default::default()
         };
         // reset_pinned = true → the ③a exact-first routing is enabled (A.6 sound).
-        let notes = escalate_bottom(&mut report, COUNTER, true, &VerifyAutoOptions::default());
+        let notes = escalate_bottom(
+            &mut report,
+            COUNTER,
+            true,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "reset-pinned recoverability ⊥ must be rescued to Holds via exact+COI, got {:?}",
@@ -4194,10 +4506,70 @@ module uart_tx(); endmodule"#;
         let scan = scan_annotation_properties(&src(sv));
         assert!(scan.guarantees.is_empty());
         assert_eq!(scan.assumes, vec!["tick_baud_x16 = 1".to_string()]);
+        assert!(scan.fairness_assumes.is_empty());
         assert!(annotation_note(&scan).is_some());
 
         let plain = scan_annotation_properties(&src("module m(); endmodule"));
         assert!(annotation_note(&plain).is_none());
+    }
+
+    /// mununu#477 Option B — `// @mununu_assume GF <REG op VALUE>` bodies are parsed
+    /// into typed [`crate::adapter::liveness_rescue::Atom`]s on [`AnnotationScan::fairness_assumes`],
+    /// NOT into the untyped `assumes` string bucket. The scanner is the entry point
+    /// for the fair-cycle bridge.
+    #[test]
+    fn h5_gr1_fairness_assume_parses_into_typed_atom() {
+        use crate::adapter::btor2::predicate_expr::CmpOp;
+        let sv = "// @mununu_assume GF grant_cpu == 1\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(
+            scan.assumes.is_empty(),
+            "typed fairness must not spill into `assumes`"
+        );
+        assert_eq!(scan.fairness_assumes.len(), 1);
+        assert_eq!(scan.fairness_assumes[0].signal, "grant_cpu");
+        assert_eq!(scan.fairness_assumes[0].op, CmpOp::Eq);
+        assert_eq!(scan.fairness_assumes[0].value, 1);
+    }
+
+    /// mununu#477 Option B — multiple `GF` assumes accumulate; the fair-cycle
+    /// bridge treats them as a conjunction `⋀ GF fairⱼ`.
+    #[test]
+    fn h5_gr1_fairness_assume_multiple_accumulate() {
+        let sv = "// @mununu_assume GF fair_1 == 1\n\
+                  // @mununu_assume GF fair_2 != 0\n\
+                  module m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(scan.assumes.is_empty());
+        assert_eq!(scan.fairness_assumes.len(), 2);
+        assert_eq!(scan.fairness_assumes[0].signal, "fair_1");
+        assert_eq!(scan.fairness_assumes[1].signal, "fair_2");
+    }
+
+    /// mununu#477 Option B — a `GF` body whose atom does not parse as a
+    /// register-comparison is surfaced in `skipped`, never silently dropped.
+    /// Sound-by-refusal: unrecognized fairness never affects a verdict.
+    #[test]
+    fn h5_gr1_fairness_assume_malformed_atom_is_skipped() {
+        let sv = "// @mununu_assume GF not_a_valid_atom_shape !!! bogus\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(scan.fairness_assumes.is_empty());
+        assert!(
+            scan.skipped.iter().any(|s| s.contains("GF")),
+            "malformed GF body must surface in `skipped`: {:?}",
+            scan.skipped
+        );
+    }
+
+    /// mununu#477 Option B — a plain `@mununu_assume <signal> = <value>` (no `GF`
+    /// prefix) still routes to the untyped `assumes` bucket for the existing
+    /// config-concretization path. Regression guard.
+    #[test]
+    fn h5_gr1_non_fairness_assume_stays_in_string_bucket() {
+        let sv = "// @mununu_assume clk_en = 1\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(scan.fairness_assumes.is_empty());
+        assert_eq!(scan.assumes, vec!["clk_en = 1".to_string()]);
     }
 
     #[test]
