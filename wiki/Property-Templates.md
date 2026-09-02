@@ -49,8 +49,12 @@ Shorthand → mu-calculus is the [Mu-Calculus Reference](Mu-Calculus-Reference.m
 `AG EF p = nu Y.((mu X.(p || <> X)) && [] Y)`, `AG(a → EF b) = nu Z.((!(a) || mu Y.(b || <> Y)) && [] Z)`.
 
 **Soundness default — use `EF` (reachable), not `AF` (inevitable).** `AF`/box-`AF` is sound only where no free
-input (a kick, a clock-stretch, a competing request, a bus-cycle drop) can stall the antecedent path forever;
-`GF` fairness is not assumable. When unsure, `EF`.
+input (a kick, a clock-stretch, a competing request, a bus-cycle drop) can stall the antecedent path forever.
+On the `sv verify-auto` flagship path, a `GF` fairness assumption is currently *recorded* rather than
+auto-applied — the SV lift does not yet route it to the fairness-constrained engine. Fairness IS supported
+today via `mununu btor2 game --objective recurrence` (single-pair GR(1) on the emitted BTOR2) and via
+CTXDSL's GR(1) game engine `(⋀ GF envᵢ) → (⋀ GF sysⱼ)`; see mununu#477 for the SV-path bridge tracking.
+When unsure and staying on `sv verify-auto`, prefer `EF`.
 
 | class | trigger | patterns (shorthand, `<slots>` = observable signals) |
 |---|---|---|
