@@ -209,6 +209,7 @@ The full example is in `tutorial/examples/04_cross_domain.ctxdsl`.
 - **Skip labels are only needed for synchronous composition.** In asynchronous mode, members are not required to step, so self-loop skip labels are unnecessary.
 - **Hierarchical composition is order-sensitive.** Inner compositions must be declared before the outer composition that references them.
 - **Formulas can target any level.** You can write mu-calculus properties over individual automata, inner compositions, or the outermost system -- just set the `over` field accordingly.
+- **A shared label the component cannot take is a label the environment cannot emit — silently.** In synchronous composition, if only one side declares a transition on a shared label, the composed system can only fire it when *both* sides are ready. From the component's point of view this makes an unmodelled state look like "the environment does not act here" — but in the real system the environment *does* act; the event just gets dropped by the component. That is a common protocol-modelling footgun: an omitted transition constrains the environment rather than the component, and a liveness property that should have failed will hold vacuously. If the environment can act anyway and you lose the event, model the loss explicitly — a self-loop or a discard transition on the receiving side is the difference between *cannot happen* (a spec claim) and *happens and is lost* (a real bug). Filed against a real monono debug in mununu#477.
 
 ## KMTS Composition — Modality Merge (post-R.1)
 

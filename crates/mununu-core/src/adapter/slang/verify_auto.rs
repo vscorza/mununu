@@ -1232,9 +1232,12 @@ struct AnnotationScan {
     /// `TranslatedAssertion`s ready to merge into `extraction.translated`.
     guarantees: Vec<crate::adapter::slang::translate::TranslatedAssertion>,
     /// `@mununu_assume <body>` bodies (verbatim) — recorded for provenance. A
-    /// `<signal> = <value>` assume can be applied via the existing config
-    /// concretization; a temporal `GF ...` fairness assume is documented future
-    /// work (mununu has no native fairness-constrained model checking).
+    /// `<signal> = <value>` assume is applied by this path via config
+    /// concretization; a temporal `GF …` fairness assume is recorded rather
+    /// than auto-applied — the SV verify-auto lift does not yet route it to
+    /// the fairness-constrained engine. Fairness-constrained model checking
+    /// IS shipped (CTXDSL + GR(1); `btor2 game --objective recurrence`); see
+    /// mununu#477 for the bridge tracking.
     assumes: Vec<String>,
     /// `@mununu_guarantee` bodies that did NOT parse — surfaced, never silently
     /// dropped.
@@ -1336,21 +1339,32 @@ fn annotation_note(scan: &AnnotationScan) -> Option<VerificationNote> {
         summary: format!(
             "{} `@mununu_guarantee` propert{} verified alongside the design's SVA{}.",
             scan.guarantees.len(),
-            if scan.guarantees.len() == 1 { "y" } else { "ies" },
+            if scan.guarantees.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
             if scan.skipped.is_empty() {
                 String::new()
             } else {
                 format!("; {} unparsable, skipped", scan.skipped.len())
             }
         ),
-        detail: "`@mununu_guarantee <mu-calculus>` / `@mununu_assume <body>` annotations carry the \
+        detail:
+            "`@mununu_guarantee <mu-calculus>` / `@mununu_assume <body>` annotations carry the \
                  mununu-exclusive properties an author adds beyond the design's own SVA (e.g. \
                  assume-guarantee liveness the SVA fragment cannot express). Guarantee bodies are \
                  mu-calculus formulas parsed by the same parser as the translated SVA and verified \
-                 through the same pipeline. `@mununu_assume` of the form `<signal> = <value>` can be \
-                 applied via config concretization; a temporal (`GF …`) fairness assume is not yet \
-                 checkable (no native fairness-constrained model checking) and is recorded here."
-            .into(),
+                 through the same pipeline. `@mununu_assume` of the form `<signal> = <value>` is \
+                 applied by this path via config concretization. A temporal (`GF …`) fairness \
+                 assume is recorded here rather than auto-applied — the SV verify-auto lift does \
+                 not yet route it to the fairness-constrained engine. Fairness-constrained model \
+                 checking IS shipped: `mununu sv emit-btor2` + `mununu btor2 game --objective \
+                 recurrence` (single-pair GR(1)) decides `(GF assume) → (GF guarantee)` on the \
+                 lifted design, and CTXDSL's GR(1) game engine `(⋀ GF envᵢ) → (⋀ GF sysⱼ)` \
+                 discharges multi-pair assume-guarantee liveness directly. See mununu#477 for \
+                 the SV-path auto-routing bridge."
+                .into(),
         items,
     })
 }
