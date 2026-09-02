@@ -50,11 +50,14 @@ Shorthand → mu-calculus is the [Mu-Calculus Reference](Mu-Calculus-Reference.m
 
 **Soundness default — use `EF` (reachable), not `AF` (inevitable).** `AF`/box-`AF` is sound only where no free
 input (a kick, a clock-stretch, a competing request, a bus-cycle drop) can stall the antecedent path forever.
-On the `sv verify-auto` flagship path, a `GF` fairness assumption is currently *recorded* rather than
-auto-applied — the SV lift does not yet route it to the fairness-constrained engine. Fairness IS supported
-today via `mununu btor2 game --objective recurrence` (single-pair GR(1) on the emitted BTOR2) and via
-CTXDSL's GR(1) game engine `(⋀ GF envᵢ) → (⋀ GF sysⱼ)`; see mununu#477 for the SV-path bridge tracking.
-When unsure and staying on `sv verify-auto`, prefer `EF`.
+On the `sv verify-auto` flagship path, a `// @mununu_assume GF <REG op VALUE>` assumption is **auto-applied
+to any response-shape guarantee** (`AG(a → AF b)`) via the Emerson–Lei fair-cycle l2s (mununu#477 Option B):
+each `GF` assume adds a `fair_seen` monitor latch, and a `holds` verdict under fairness means the guarantee
+holds against every environment schedule satisfying the assumption infinitely often. For assumptions that
+don't fit `GF <REG op VALUE>` — a state predicate, a non-response guarantee, or coupled multi-guarantee
+fairness — use `mununu btor2 verify-liveness-under-fairness` on the emitted BTOR2, or model in CTXDSL where
+the GR(1) game engine `(⋀ GF envᵢ) → (⋀ GF sysⱼ)` discharges multi-pair assume-guarantee liveness directly.
+When unsure and staying on `sv verify-auto` without a matching `@mununu_assume GF`, prefer `EF`.
 
 | class | trigger | patterns (shorthand, `<slots>` = observable signals) |
 |---|---|---|
