@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FileContent": {
+      "description": "File content with optional name",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The SV → BTOR2 lift inputs shared by the SV-direct verb endpoints (`/api/v1/sv/verify`, `/sv/verify-liveness`, `/sv/verify-recoverability`). These lift the module (sv2v + Yosys) and then decide the corresponding BTOR2 property, returning the same `Btor2Verify*Response` shapes — one call, no `emit-btor2` step.",
+  "properties": {
+    "additional_sources": {
+      "default": [],
+      "description": "Additional SV sources (packages / includes).",
+      "items": {
+        "$ref": "#/definitions/FileContent"
+      },
+      "type": "array"
+    },
+    "source": {
+      "description": "SystemVerilog primary source content.",
+      "type": "string"
+    },
+    "top": {
+      "default": null,
+      "description": "Top module for the lift (auto-detect when omitted).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "use_slang": {
+      "default": false,
+      "description": "Force the slang RTL front-end (`read_slang`) for modern-SV constructs yosys/sv2v reject (`while` loops, `import pkg::*;`). Requires the yosys-slang plugin. Default `false`.",
+      "type": "boolean"
+    },
+    "use_sv2v": {
+      "default": false,
+      "description": "Run sv2v before Yosys (modern SV). Default `false`.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "source"
+  ],
+  "title": "SvVerifyRequest",
+  "type": "object"
+}

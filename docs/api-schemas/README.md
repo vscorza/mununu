@@ -6,12 +6,40 @@ Each `*.schema.json` file is a JSON Schema (Draft-07) derived directly from the 
 
 ## Files
 
+### The flagship (BTOR2-free SV entry)
+
 | File | Endpoint | Direction |
 |------|----------|-----------|
 | [`sv-verify-auto-request.schema.json`](sv-verify-auto-request.schema.json) | `POST /api/v1/sv/verify-auto` | Request body |
 | [`sv-verify-auto-response.schema.json`](sv-verify-auto-response.schema.json) | `POST /api/v1/sv/verify-auto` | Response body |
 
-More endpoints will land in additive PRs (BTOR2-direct verbs, synth endpoints) — see the roadmap in `docs/consumer-briefings/`.
+### BTOR2-direct property verbs
+
+| File | Endpoint | Direction |
+|------|----------|-----------|
+| [`btor2-verify-request.schema.json`](btor2-verify-request.schema.json) | `POST /api/v1/btor2/verify` | Request body |
+| [`btor2-verify-response.schema.json`](btor2-verify-response.schema.json) | `POST /api/v1/btor2/verify` | Response body |
+| [`btor2-verify-liveness-request.schema.json`](btor2-verify-liveness-request.schema.json) | `POST /api/v1/btor2/verify-liveness` | Request body |
+| [`btor2-verify-liveness-response.schema.json`](btor2-verify-liveness-response.schema.json) | `POST /api/v1/btor2/verify-liveness` (also `-all`) | Response body |
+| [`btor2-verify-liveness-all-request.schema.json`](btor2-verify-liveness-all-request.schema.json) | `POST /api/v1/btor2/verify-liveness-all` | Request body |
+| [`btor2-verify-recoverability-request.schema.json`](btor2-verify-recoverability-request.schema.json) | `POST /api/v1/btor2/verify-recoverability` | Request body |
+| [`btor2-verify-recoverability-response.schema.json`](btor2-verify-recoverability-response.schema.json) | `POST /api/v1/btor2/verify-recoverability` | Response body |
+| [`btor2-check-fsm-request.schema.json`](btor2-check-fsm-request.schema.json) | `POST /api/v1/btor2/check-fsm` | Request body |
+| [`btor2-check-fsm-response.schema.json`](btor2-check-fsm-response.schema.json) | `POST /api/v1/btor2/check-fsm` | Response body |
+
+### SV-wrapped verbs (lift SV → BTOR2, then decide — response shape is the BTOR2 sibling)
+
+| File | Endpoint | Direction | Response schema |
+|------|----------|-----------|-----------------|
+| [`sv-verify-request.schema.json`](sv-verify-request.schema.json) | `POST /api/v1/sv/verify` | Request body | `btor2-verify-response.schema.json` |
+| [`sv-verify-liveness-request.schema.json`](sv-verify-liveness-request.schema.json) | `POST /api/v1/sv/verify-liveness` | Request body | `btor2-verify-liveness-response.schema.json` |
+| [`sv-verify-liveness-all-request.schema.json`](sv-verify-liveness-all-request.schema.json) | `POST /api/v1/sv/verify-liveness-all` | Request body | `btor2-verify-liveness-response.schema.json` |
+| [`sv-verify-recoverability-request.schema.json`](sv-verify-recoverability-request.schema.json) | `POST /api/v1/sv/verify-recoverability` | Request body | `btor2-verify-recoverability-response.schema.json` |
+| [`sv-check-fsm-request.schema.json`](sv-check-fsm-request.schema.json) | `POST /api/v1/sv/check-fsm` | Request body | `btor2-check-fsm-response.schema.json` |
+
+More endpoints will land in additive PRs (CEGAR + synth) — see the roadmap in `docs/consumer-briefings/`.
+
+Narrative companion: [`verify-verbs.md`](verify-verbs.md) walks the BTOR2 + SV verb responses field-by-field and explains where each verb sits on the safety / liveness / recoverability / FSM axes.
 
 ## Consumer flow
 

@@ -27,7 +27,13 @@
 
 use schemars::schema_for;
 
-use super::models::{SvVerifyAutoRequest, SvVerifyAutoResponse};
+use super::models::{
+    Btor2CheckFsmRequest, Btor2CheckFsmResponse, Btor2VerifyLivenessAllRequest,
+    Btor2VerifyLivenessRequest, Btor2VerifyLivenessResponse, Btor2VerifyRecoverabilityRequest,
+    Btor2VerifyRecoverabilityResponse, Btor2VerifyRequest, Btor2VerifyResponse, SvCheckFsmRequest,
+    SvVerifyAutoRequest, SvVerifyAutoResponse, SvVerifyLivenessAllRequest, SvVerifyLivenessRequest,
+    SvVerifyRecoverabilityRequest, SvVerifyRequest,
+};
 
 /// JSON Schema (Draft 2019-09) for `POST /api/v1/sv/verify-auto` request bodies.
 pub fn sv_verify_auto_request_schema() -> serde_json::Value {
@@ -39,6 +45,96 @@ pub fn sv_verify_auto_request_schema() -> serde_json::Value {
 pub fn sv_verify_auto_response_schema() -> serde_json::Value {
     serde_json::to_value(schema_for!(SvVerifyAutoResponse))
         .expect("SvVerifyAutoResponse schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify` request bodies.
+pub fn btor2_verify_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyRequest))
+        .expect("Btor2VerifyRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify` responses. Also the response shape
+/// for `POST /api/v1/sv/verify` (SV → BTOR2 lift then decide).
+pub fn btor2_verify_response_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyResponse))
+        .expect("Btor2VerifyResponse schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-liveness` request bodies.
+pub fn btor2_verify_liveness_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyLivenessRequest))
+        .expect("Btor2VerifyLivenessRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-liveness` responses. Also the response
+/// shape for `/btor2/verify-liveness-all`, `/sv/verify-liveness`, and
+/// `/sv/verify-liveness-all`.
+pub fn btor2_verify_liveness_response_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyLivenessResponse))
+        .expect("Btor2VerifyLivenessResponse schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-liveness-all` request bodies.
+pub fn btor2_verify_liveness_all_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyLivenessAllRequest))
+        .expect("Btor2VerifyLivenessAllRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-recoverability` request bodies.
+pub fn btor2_verify_recoverability_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyRecoverabilityRequest))
+        .expect("Btor2VerifyRecoverabilityRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-recoverability` responses. Also the
+/// response shape for `POST /api/v1/sv/verify-recoverability`. Includes the
+/// optional structured [`crate::verdict::VerdictRefinement`] tree.
+pub fn btor2_verify_recoverability_response_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyRecoverabilityResponse))
+        .expect("Btor2VerifyRecoverabilityResponse schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/check-fsm` request bodies.
+pub fn btor2_check_fsm_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2CheckFsmRequest))
+        .expect("Btor2CheckFsmRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/check-fsm` responses. Also the response
+/// shape for `POST /api/v1/sv/check-fsm`.
+pub fn btor2_check_fsm_response_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2CheckFsmResponse))
+        .expect("Btor2CheckFsmResponse schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/sv/verify` request bodies (SV lift + BTOR2 verify).
+pub fn sv_verify_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(SvVerifyRequest))
+        .expect("SvVerifyRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/sv/verify-liveness` request bodies.
+pub fn sv_verify_liveness_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(SvVerifyLivenessRequest))
+        .expect("SvVerifyLivenessRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/sv/verify-liveness-all` request bodies.
+pub fn sv_verify_liveness_all_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(SvVerifyLivenessAllRequest))
+        .expect("SvVerifyLivenessAllRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/sv/verify-recoverability` request bodies.
+pub fn sv_verify_recoverability_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(SvVerifyRecoverabilityRequest))
+        .expect("SvVerifyRecoverabilityRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/sv/check-fsm` request bodies.
+pub fn sv_check_fsm_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(SvCheckFsmRequest))
+        .expect("SvCheckFsmRequest schema must serialise as JSON")
 }
 
 #[cfg(test)]
@@ -155,6 +251,118 @@ mod tests {
         drift_check(
             "docs/api-schemas/sv-verify-auto-response.schema.json",
             &sv_verify_auto_response_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_request() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-request.schema.json",
+            &btor2_verify_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_response() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-response.schema.json",
+            &btor2_verify_response_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_liveness_request() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-liveness-request.schema.json",
+            &btor2_verify_liveness_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_liveness_response() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-liveness-response.schema.json",
+            &btor2_verify_liveness_response_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_liveness_all_request() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-liveness-all-request.schema.json",
+            &btor2_verify_liveness_all_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_recoverability_request() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-recoverability-request.schema.json",
+            &btor2_verify_recoverability_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_recoverability_response() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-recoverability-response.schema.json",
+            &btor2_verify_recoverability_response_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_check_fsm_request() {
+        drift_check(
+            "docs/api-schemas/btor2-check-fsm-request.schema.json",
+            &btor2_check_fsm_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_check_fsm_response() {
+        drift_check(
+            "docs/api-schemas/btor2-check-fsm-response.schema.json",
+            &btor2_check_fsm_response_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_sv_verify_request() {
+        drift_check(
+            "docs/api-schemas/sv-verify-request.schema.json",
+            &sv_verify_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_sv_verify_liveness_request() {
+        drift_check(
+            "docs/api-schemas/sv-verify-liveness-request.schema.json",
+            &sv_verify_liveness_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_sv_verify_liveness_all_request() {
+        drift_check(
+            "docs/api-schemas/sv-verify-liveness-all-request.schema.json",
+            &sv_verify_liveness_all_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_sv_verify_recoverability_request() {
+        drift_check(
+            "docs/api-schemas/sv-verify-recoverability-request.schema.json",
+            &sv_verify_recoverability_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_sv_check_fsm_request() {
+        drift_check(
+            "docs/api-schemas/sv-check-fsm-request.schema.json",
+            &sv_check_fsm_request_schema(),
         );
     }
 }

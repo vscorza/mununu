@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Response for `POST /api/v1/btor2/verify-liveness`. Mirrors [`crate::adapter::liveness_rescue::LivenessVerdict`].",
+  "properties": {
+    "decided_by": {
+      "description": "Portfolio engines that decided the reduced `bad`-reachability query.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "property": {
+      "description": "The reduced property, echoed for provenance: `AG((<request>) -> AF (<grant>))`.",
+      "type": "string"
+    },
+    "verdict": {
+      "description": "Canonical property verdict — `\"holds\"` | `\"violated\"` | `\"unknown\"`, via [`crate::verdict::PropertyVerdict`].",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decided_by",
+    "property",
+    "verdict"
+  ],
+  "title": "Btor2VerifyLivenessResponse",
+  "type": "object"
+}

@@ -1,0 +1,361 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AssumptionKind": {
+      "description": "The shape of a discovered environment assumption.",
+      "oneOf": [
+        {
+          "description": "An input held at a constant value (`en = 1`).",
+          "enum": [
+            "InputHold"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A CONJUNCTION of environment-input holds (`ack == 1 && escalate == 0`) — the minimal set of environment inputs that must be constrained for a two-player game to become realizable, when no single hold suffices (the design has multiple independent adversarial blockers).",
+          "enum": [
+            "InputConjunction"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A finite input schedule (a command sequence).",
+          "enum": [
+            "InputSchedule"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "\"Reset is eventually asserted.\"",
+          "enum": [
+            "ResetEventually"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A synthesized positional environment strategy (1-player: the environment owns all inputs).",
+          "enum": [
+            "EnvStrategy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A LIVENESS / fairness environment assumption `GF(in == v)` — the environment input holds `v` INFINITELY OFTEN — under which an unrealizable RECURRENCE (Büchi) game `GF good` becomes realizable (`GF a → GF good`, the GR(1) 1-pair objective). Distinct from `InputHold` (a SAFETY hold `G(a)`): fairness is strictly weaker (the environment may violate `a` finitely often).",
+          "enum": [
+            "InputFairness"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A CONJUNCTION of fairness assumptions `GF(e_1 == v_1) ∧ … ∧ GF(e_k == v_k)` — the minimal set of environment liveness assumptions under which an unrealizable RECURRENCE game becomes realizable (`(⋀_i GF a_i) → GF good`, the MULTI-pair GR(1) objective), when no SINGLE fairness assumption suffices (multiple independent liveness blockers). The fairness analog of `InputConjunction`.",
+          "enum": [
+            "InputFairnessConjunction"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ConfigPartition": {
+      "description": "See [`VerdictRefinement::config_partition`]. The property's verdict partitioned over the config leaves the recovery rides on. Sound per cell (each is a concrete pinned model decided by exact-symbolic); `exhaustive` is true ONLY when the enumerated config set is the complete reachable set. (Populated in Phase 1.)",
+      "properties": {
+        "config_atoms": {
+          "description": "The config leaves case-split on: `(name, width)`.",
+          "items": {
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "engine": {
+          "description": "The deciding engine, for provenance (e.g. `\"exact-symbolic per-config pin\"`).",
+          "type": "string"
+        },
+        "exhaustive": {
+          "description": "True iff the enumerated config set is the COMPLETE reachable config set (else the partition is over the enumerated/reachable subset only).",
+          "type": "boolean"
+        },
+        "holds": {
+          "description": "Config valuations for which the property HOLDS.",
+          "items": {
+            "items": {
+              "items": [
+                {
+                  "type": "string"
+                },
+                {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              ],
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "unknown": {
+          "description": "… for which it stayed ⊥ even pinned.",
+          "items": {
+            "items": {
+              "items": [
+                {
+                  "type": "string"
+                },
+                {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              ],
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "vacuous": {
+          "description": "… for which the target is vacuous (never reached under that config).",
+          "items": {
+            "items": {
+              "items": [
+                {
+                  "type": "string"
+                },
+                {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              ],
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "violated": {
+          "description": "… for which it is VIOLATED.",
+          "items": {
+            "items": {
+              "items": [
+                {
+                  "type": "string"
+                },
+                {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              ],
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "config_atoms",
+        "engine",
+        "exhaustive",
+        "holds",
+        "unknown",
+        "vacuous",
+        "violated"
+      ],
+      "type": "object"
+    },
+    "DiscoveredAssumption": {
+      "description": "See [`VerdictRefinement::holds_under`]. A CONDITIONAL result: the property holds under `phi`. (Populated in Phase 2.)",
+      "properties": {
+        "engine": {
+          "description": "The engine that discovered it, for provenance.",
+          "type": "string"
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AssumptionKind"
+            }
+          ],
+          "description": "The assumption's shape."
+        },
+        "non_vacuous": {
+          "description": "True iff `good` is genuinely reached under `phi` (the non-vacuity gate passed).",
+          "type": "boolean"
+        },
+        "phi": {
+          "description": "A human-readable predicate over named inputs (Phase 2b may carry a typed schedule/strategy).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "engine",
+        "kind",
+        "non_vacuous",
+        "phi"
+      ],
+      "type": "object"
+    },
+    "RecoverabilityBotDiagnosis": {
+      "description": "A best-effort, SOUND-hint explanation of WHY an `AG EF good` recoverability property stayed ⊥ — so a ⊥ becomes ACTIONABLE (\"what would it take to decide this?\") instead of a bare \"don't know\". Purely a diagnostic: it NEVER produces or changes a verdict. Localizes the structural obstacles in the good's recovery cone that the predicate abstraction cannot cross.",
+      "properties": {
+        "uncertified_counters": {
+          "description": "Down-counters that GATE the recovery (in the good's cone, not read by the good) whose descent is NOT ranking-certified — a fairness-gated reload or a non-affine descent: `(name, width)`. Deciding needs a ranking certificate or a fairness assumption.",
+          "items": {
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "wide_influences": {
+          "description": "Wide state / inputs (NOT a small FSM, NOT a certified counter) whose value flows into the recovery target: `(name, width)`. The recovery value rides that wide state, so the verdict is data/config-scoped (a specific config may HOLD, another VIOLATE) — the predicate cube cannot enumerate it. Constrain those inputs, or the ⊥ is the honest config-independent answer.",
+          "items": {
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "uncertified_counters",
+        "wide_influences"
+      ],
+      "type": "object"
+    },
+    "VacuityWitness": {
+      "description": "See [`VerdictRefinement::vacuous`]. The recovery target is never reached.",
+      "properties": {
+        "good_unreachable": {
+          "description": "`good` is unreachable from the initial state (a sound reachability-portfolio `Unreachable`).",
+          "type": "boolean"
+        },
+        "note": {
+          "description": "A one-line, user-facing explanation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "good_unreachable",
+        "note"
+      ],
+      "type": "object"
+    },
+    "VerdictRefinement": {
+      "description": "A structured elaboration of a [`PropertyVerdict`], carried ALONGSIDE the canonical verdict — never replacing it. `None`/empty on the common path. This is how a bare `⊥`/`violated` becomes an *actionable* result: which configs hold, under what assumption it would hold, or that the target is simply never reachable. It follows the same contract as the cube-cell / countertrace detail Track I already carries: **a refinement is a diagnostic and NEVER changes the canonical verdict** — a config-scoped or assumption-scoped result keeps the canonical verdict `Unknown` (the honest unconditional answer; an assumption is not monotone for `AG EF`, so it cannot soundly transfer).\n\nPhases (see `.claude/plans/refined-verdicts-assumption-discovery.md`): Phase 0 populates [`Self::vacuous`] + [`Self::bot_diagnosis`]; Phase 1 populates [`Self::config_partition`]; Phase 2 populates [`Self::holds_under`].",
+      "properties": {
+        "bot_diagnosis": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RecoverabilityBotDiagnosis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The best-effort structural \"why ⊥ / what would decide it\" hint (promoted from the standalone [`crate::adapter::recoverability::diagnose_recoverability_bot`])."
+        },
+        "config_partition": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigPartition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A config-scoped partition: the property depends on config values (Phase 1 / capability A)."
+        },
+        "holds_under": {
+          "description": "Environment assumption(s) under which the property holds (Phase 2 / capability B). Each is a CONDITIONAL result (`HoldsUnder(φ)`) — the canonical verdict stays `Unknown`.",
+          "items": {
+            "$ref": "#/definitions/DiscoveredAssumption"
+          },
+          "type": "array"
+        },
+        "vacuous": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VacuityWitness"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recovery target is never reachable from the initial state — `AG EF(good)` is degenerate (the target is never entered), so the plain verdict is misleading. A SOUND witness (the reachability portfolio proved `good` unreachable; only emitted when that proof is sound — i.e. not on free-init state, per `ReachVerdict::Unreachable`)."
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Response for `POST /api/v1/btor2/verify-recoverability`.",
+  "properties": {
+    "property": {
+      "description": "The decided property, echoed for provenance: `AG EF (<target>)`.",
+      "type": "string"
+    },
+    "refinement": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/VerdictRefinement"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The structured refinement, when `refine` was requested and it produced one. `None` otherwise. Diagnostic detail carried ALONGSIDE the verdict — never changes it."
+    },
+    "verdict": {
+      "description": "Canonical property verdict — `\"holds\"` (every reachable state can reach `target`) | `\"violated\"` (a reachable trap cannot) | `\"unknown\"` (over the exact engine's cap; try the cube + `smt-hyper-must` path), via [`crate::verdict::PropertyVerdict`].",
+      "type": "string"
+    }
+  },
+  "required": [
+    "property",
+    "verdict"
+  ],
+  "title": "Btor2VerifyRecoverabilityResponse",
+  "type": "object"
+}

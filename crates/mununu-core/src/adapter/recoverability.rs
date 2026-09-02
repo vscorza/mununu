@@ -2200,6 +2200,7 @@ fn verify_recoverability_counter_abstracted(
 /// Purely a diagnostic: it NEVER produces or changes a verdict. Localizes the structural obstacles in
 /// the good's recovery cone that the predicate abstraction cannot cross.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(schemars::JsonSchema))]
 pub struct RecoverabilityBotDiagnosis {
     /// Down-counters that GATE the recovery (in the good's cone, not read by the good) whose descent
     /// is NOT ranking-certified — a fairness-gated reload or a non-affine descent: `(name, width)`.
