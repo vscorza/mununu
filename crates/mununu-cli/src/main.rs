@@ -268,6 +268,18 @@ enum Btor2Command {
     /// lasso), else `unknown` if any is, else `holds`. Surface peer of
     /// `POST /api/v1/btor2/verify-liveness-all`.
     VerifyLivenessAll(Btor2VerifyLivenessAllArgs),
+    /// Decide the response-liveness property `AG(request → AF grant)` UNDER a
+    /// conjunction of environment fairness assumptions `⋀ⱼ GF fairⱼ`
+    /// (mununu#477 Option B).
+    ///
+    /// The Emerson–Lei fair-cycle extension of `verify-liveness`: adds one
+    /// `fairⱼ_seen` latch per fairness atom and requires each on the closed
+    /// loop, so `bad` fires only on a lasso that satisfies EVERY fairness
+    /// constraint AND leaves a request forever ungranted. Empty `--fairness`
+    /// recovers `verify-liveness` exactly. `--request` / `--grant` / each
+    /// `--fairness` is a single register-comparison atom (`"grant_cpu == 1"`).
+    /// Surface peer of `POST /api/v1/btor2/verify-liveness-under-fairness`.
+    VerifyLivenessUnderFairness(Btor2VerifyLivenessUnderFairnessArgs),
     /// Decide recoverability `AG EF good` — the branching property SVA cannot state.
     ///
     /// "From every reachable state, can the design still get back to a `good`
@@ -721,6 +733,29 @@ struct Btor2VerifyLivenessAllArgs {
     /// `⋀ AG(ANTE → AF CONS)`. At least one required.
     #[arg(long = "response", value_name = "ANTE => CONS", required = true)]
     responses: Vec<String>,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu btor2 verify-liveness-under-fairness` — the fair-cycle
+/// l2s (Emerson–Lei) extension of `verify-liveness` (mununu#477 Option B).
+#[derive(Args, Debug)]
+struct Btor2VerifyLivenessUnderFairnessArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// The request atom — a register comparison, e.g. `"req == 1"`.
+    #[arg(long, value_name = "ATOM")]
+    request: String,
+    /// The grant atom that must eventually follow on every path, e.g. `"ack == 1"`.
+    #[arg(long, value_name = "ATOM")]
+    grant: String,
+    /// A fairness atom `GF <atom>` — a single register-comparison atom whose
+    /// satisfaction is assumed to hold infinitely often on every path considered.
+    /// Repeatable; the verdict is the response under the conjunction
+    /// `⋀ⱼ GF fairⱼ`. Empty recovers `verify-liveness` exactly.
+    #[arg(long = "fairness", value_name = "ATOM")]
+    fairness: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2856,6 +2891,9 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::SpacerCheck(args) => btor2_spacer_check(args),
         Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
         Btor2Command::VerifyLivenessAll(args) => btor2_verify_liveness_all(args),
+        Btor2Command::VerifyLivenessUnderFairness(args) => {
+            btor2_verify_liveness_under_fairness(args)
+        }
         Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
         Btor2Command::VerifySafety(args) => btor2_verify_safety(args),
         Btor2Command::CheckFsm(args) => btor2_check_fsm(args),
@@ -3165,6 +3203,64 @@ fn btor2_verify_liveness_all(args: Btor2VerifyLivenessAllArgs) -> Result<(), Str
         "property": response_conjunction_property(&args.responses),
         "verdict": PropertyVerdict::from(verdict).as_str(),
         "responses": per_response_decided_by(&args.responses, &outcomes),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu btor2 verify-liveness-under-fairness` (mununu#477 Option B) — decide
+/// `(⋀ GF fair) → AG(request → AF grant)` via the fair-cycle l2s (Emerson–Lei)
+/// plus the reachability portfolio, printing the verdict as JSON. Surface peer
+/// of `POST /api/v1/btor2/verify-liveness-under-fairness`.
+fn btor2_verify_liveness_under_fairness(
+    args: Btor2VerifyLivenessUnderFairnessArgs,
+) -> Result<(), String> {
+    use mununu_core::adapter::liveness_rescue::{
+        parse_fairness_atoms, parse_response_atom, response_liveness_rescue_under_fairness,
+    };
+    use mununu_core::verdict::PropertyVerdict;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let request = parse_response_atom(&args.request)?;
+    let grant = parse_response_atom(&args.grant)?;
+    let fairness = parse_fairness_atoms(&args.fairness)?;
+
+    let (verdict, outcome) =
+        response_liveness_rescue_under_fairness(&content, &request, &grant, &fairness, false)
+            .ok_or_else(|| {
+                format!(
+                    "could not build the fair-cycle liveness monitor for '{}' — an atom likely \
+                     binds no signal",
+                    args.file.display()
+                )
+            })?;
+
+    let property = if args.fairness.is_empty() {
+        format!("AG(({}) -> AF ({}))", args.request, args.grant)
+    } else {
+        let fair_and = args
+            .fairness
+            .iter()
+            .map(|f| format!("GF ({f})"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        format!(
+            "({fair_and}) -> AG(({}) -> AF ({}))",
+            args.request, args.grant
+        )
+    };
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "property": property,
+        "verdict": PropertyVerdict::from(verdict).as_str(),
+        "fairness": args.fairness,
+        "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
+            .collect::<Vec<_>>(),
     });
     println!(
         "{}",

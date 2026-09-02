@@ -992,6 +992,28 @@ pub struct Btor2VerifyLivenessAllRequest {
     pub responses: Vec<String>,
 }
 
+/// Request for the fair-cycle response-liveness endpoint
+/// (`POST /api/v1/btor2/verify-liveness-under-fairness`, mununu#477 Option B).
+/// Mirrors the CLI `mununu btor2 verify-liveness-under-fairness`: decides
+/// `(⋀ GF fair) → AG(request → AF grant)` via the Emerson–Lei fair-cycle l2s
+/// (see [`crate::adapter::btor2::l2s_monitor::emit_response_l2s_monitor_under_fairness`])
+/// plus the reachability portfolio. Empty `fairness` recovers
+/// [`Btor2VerifyLivenessRequest`] exactly. Reuses [`Btor2VerifyLivenessResponse`] for the reply.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct Btor2VerifyLivenessUnderFairnessRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// The request atom (`"REG op VALUE"`).
+    pub request: String,
+    /// The grant atom that must eventually follow on every path.
+    pub grant: String,
+    /// Fairness atoms — each a `"REG op VALUE"` register-comparison atom whose
+    /// satisfaction is assumed to hold infinitely often on every path
+    /// considered. Empty recovers the plain `verify-liveness` semantics.
+    #[serde(default)]
+    pub fairness: Vec<String>,
+}
+
 /// Request for the recoverability endpoint
 /// (`POST /api/v1/btor2/verify-recoverability`). Mirrors the CLI
 /// `mununu btor2 verify-recoverability`: decides `AG EF target` — "from every

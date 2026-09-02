@@ -29,7 +29,8 @@ use schemars::schema_for;
 
 use super::models::{
     Btor2CheckFsmRequest, Btor2CheckFsmResponse, Btor2VerifyLivenessAllRequest,
-    Btor2VerifyLivenessRequest, Btor2VerifyLivenessResponse, Btor2VerifyRecoverabilityRequest,
+    Btor2VerifyLivenessRequest, Btor2VerifyLivenessResponse,
+    Btor2VerifyLivenessUnderFairnessRequest, Btor2VerifyRecoverabilityRequest,
     Btor2VerifyRecoverabilityResponse, Btor2VerifyRequest, Btor2VerifyResponse, SvCheckFsmRequest,
     SvVerifyAutoRequest, SvVerifyAutoResponse, SvVerifyLivenessAllRequest, SvVerifyLivenessRequest,
     SvVerifyRecoverabilityRequest, SvVerifyRequest,
@@ -78,6 +79,14 @@ pub fn btor2_verify_liveness_response_schema() -> serde_json::Value {
 pub fn btor2_verify_liveness_all_request_schema() -> serde_json::Value {
     serde_json::to_value(schema_for!(Btor2VerifyLivenessAllRequest))
         .expect("Btor2VerifyLivenessAllRequest schema must serialise as JSON")
+}
+
+/// JSON Schema for `POST /api/v1/btor2/verify-liveness-under-fairness` request
+/// bodies (mununu#477 Option B). Response shape is the shared
+/// [`Btor2VerifyLivenessResponse`].
+pub fn btor2_verify_liveness_under_fairness_request_schema() -> serde_json::Value {
+    serde_json::to_value(schema_for!(Btor2VerifyLivenessUnderFairnessRequest))
+        .expect("Btor2VerifyLivenessUnderFairnessRequest schema must serialise as JSON")
 }
 
 /// JSON Schema for `POST /api/v1/btor2/verify-recoverability` request bodies.
@@ -291,6 +300,14 @@ mod tests {
         drift_check(
             "docs/api-schemas/btor2-verify-liveness-all-request.schema.json",
             &btor2_verify_liveness_all_request_schema(),
+        );
+    }
+
+    #[test]
+    fn api_schema_drift_btor2_verify_liveness_under_fairness_request() {
+        drift_check(
+            "docs/api-schemas/btor2-verify-liveness-under-fairness-request.schema.json",
+            &btor2_verify_liveness_under_fairness_request_schema(),
         );
     }
 
