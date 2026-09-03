@@ -204,6 +204,27 @@ trial-and-error.
 
 > Source of truth: [`bitblast_oom_skip_note`](../crates/mununu-core/src/planner/mod.rs) — surface: (CLI+API+UI)
 
+### Process-wide memory ceiling: `MUNUNU_MAX_PROCESS_MEMORY_BYTES` (mununu#490)
+
+> Source of truth: [`adapter::memory_budget::check_process_memory_budget`](../crates/mununu-core/src/adapter/memory_budget.rs) — surface: (CLI+API+UI, env var — process-global)
+
+The four exact-engine budgets above (`BIT_CAP` / `NODE` / `ITERATION` / `WALL-CLOCK`) protect the exact engine's own fixpoint. They do NOT stop the default Rust allocator from calling `abort()` (exit 134) on a failed allocation, which crashes the whole process and takes every property in the same invocation down with it. A verify-lane consumer then sees a crash instead of an `unknown` verdict, so a run that would have decided N-1 properties reports none.
+
+`MUNUNU_MAX_PROCESS_MEMORY_BYTES` is a **caller-configurable process-RSS ceiling** that mununu polls itself between properties and at each `escalate_bottom` step. When the ceiling is exceeded, the current + remaining properties abstain (`unknown`) with a `memory-budget-exceeded` verification note, and prior verdicts are preserved. This trades an OS-level `abort()` for a graceful degradation, so a downstream gate can distinguish "ran out of memory" from "the engine did not decide."
+
+Default unset ⇒ disabled (no ceiling; current behaviour). Set to a byte count to enable:
+
+```bash
+# Cap at 24 GiB:
+MUNUNU_MAX_PROCESS_MEMORY_BYTES=25769803776 mununu sv verify-auto design.sv
+```
+
+**Recommended setting:** 70-80% of the process's real memory limit (`ulimit -m`, container `--memory`), leaving headroom for allocator overhead + non-mununu memory. Sizing too tight causes spurious abstentions on properties that would have decided; sizing too loose lets the process abort before the ceiling fires.
+
+**Coarse granularity.** The check fires BETWEEN checkpoints (per property + per escalation step). It does NOT catch an allocation that fails within a single BDD blast between checkpoints — a single property's blowup can still crash the process. The ceiling is a graceful-degradation lever for the multi-property `sv verify-auto` lane, not an absolute crash guarantee.
+
+**Complementary to `--config-value`.** The bit cap counts kept cone bits AFTER COI and AFTER pinning, so `--config-value SIG=V` shrinks the real problem and often keeps a property under the memory ceiling that would otherwise trip it. `@mununu_predicate` hints do NOT — they seed cube dimensions, and an alternating νμ formula is decided by the exact engine which does not use them.
+
 ### Pinning a config input: `--config-value`
 
 > Source of truth: [`partition_config_pins`](../crates/mununu-core/src/adapter/slang/verify_auto.rs) — surface: (CLI+API+UI)
