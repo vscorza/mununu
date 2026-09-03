@@ -2606,7 +2606,38 @@ pub(crate) fn verify_auto_impl(
         std::collections::BTreeSet::new();
 
     // 4. Per property: seed → CEGAR → verdict.
+    //
+    // mununu#490 — a `MUNUNU_MAX_PROCESS_MEMORY_BYTES` ceiling is checked BEFORE each
+    // property so a run against a starving process abstains gracefully instead of
+    // aborting inside the next allocation. Once the ceiling is exceeded, mark THIS
+    // property and every remaining one as Unknown{ memory-budget-exceeded } — the
+    // process cannot honestly claim to have decided them — and push a
+    // `memory-budget-exceeded` verification note. Verdicts already recorded stay.
+    let mut memory_budget_hit: Option<crate::adapter::memory_budget::MemoryBudgetExceeded> = None;
     for t in &extraction.translated {
+        if memory_budget_hit.is_some() {
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: t.formula.clone(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 0 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            });
+            continue;
+        }
+        if let Err(hit) = crate::adapter::memory_budget::check_process_memory_budget() {
+            memory_budget_hit = Some(hit);
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: t.formula.clone(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 0 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            });
+            continue;
+        }
         // H.J.b — substitute the concretized config inputs (`cfg_* → const`) so a
         // relational-with-wide-input atom becomes a decidable state-vs-constant
         // comparison. The substituted string is BOTH parsed and reported (the
@@ -3040,6 +3071,35 @@ pub(crate) fn verify_auto_impl(
     if let Some(n) = annotation_note(&ann_scan) {
         report.notes.push(n);
     }
+    // mununu#490 — a process-memory ceiling was configured AND we hit it before
+    // finishing every property. Surface the abstention as a first-class note so a
+    // downstream gate sees "this run was truncated by the ceiling" rather than
+    // interpreting the trailing `Unknown` outcomes as engine-level unknowns.
+    if let Some(hit) = memory_budget_hit {
+        report.notes.push(VerificationNote {
+            kind: "memory-budget-exceeded".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "process memory ceiling reached ({} B in use, ceiling {} B via \
+                 `{}`); the remaining properties abstained rather than aborting the process",
+                hit.current_rss_bytes,
+                hit.limit_bytes,
+                crate::adapter::memory_budget::MEMORY_BUDGET_ENV,
+            ),
+            detail: "mununu#490 — `MUNUNU_MAX_PROCESS_MEMORY_BYTES` is a self-imposed \
+                     process-RSS ceiling. When the ceiling is exceeded between properties, the \
+                     current property and every remaining one abstain (`unknown`) with this \
+                     note attached, and prior verdicts are preserved. This trades an OS-level \
+                     `abort()` (exit 134) for a graceful degradation, so a downstream gate can \
+                     distinguish 'ran out of memory' from 'the engine did not decide'. It does \
+                     NOT catch an allocation that fails BETWEEN checkpoints — a single BDD \
+                     blowup can still crash the process. Recommended setting: 70-80% of the \
+                     process's real memory limit (`ulimit -m`, container `--memory`), leaving \
+                     headroom for allocator overhead + non-mununu memory."
+                .into(),
+            items: Vec::new(),
+        });
+    }
     report.notes.extend(rescue_notes);
     report.notes.extend(exact_skip_notes);
     // The cost-annotated plan telemetry (`plan-cost` / `plan-accuracy`) is NO LONGER computed here:
@@ -3087,6 +3147,14 @@ pub(crate) fn escalate_bottom(
     for prop in report.properties.iter_mut() {
         if !matches!(prop.outcome, VerifyOutcome::Unknown { .. }) {
             continue;
+        }
+        // mununu#490 — same ceiling guard as the main per-property loop: if the
+        // process is out of memory, abstaining here is strictly safer than starting
+        // an escalation that may abort mid-BDD-blast. The main loop's Unknown
+        // outcomes stay; we simply skip the remaining escalation attempts. Break
+        // rather than continue: the ceiling only rises during the loop.
+        if crate::adapter::memory_budget::check_process_memory_budget().is_err() {
+            break;
         }
         let Ok(formula) = mu_parser::parse(&prop.formula) else {
             continue;

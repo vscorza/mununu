@@ -51,6 +51,7 @@ pub mod gr1_synth;
 pub mod ir;
 pub mod langgraph;
 pub mod liveness_rescue;
+pub mod memory_budget;
 pub mod microcode;
 pub mod partition;
 pub mod pono;

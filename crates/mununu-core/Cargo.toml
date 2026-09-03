@@ -54,6 +54,15 @@ toml = "0.8"
 # installed, so the cost is negligible for library callers.
 tracing = "0.1"
 
+# Process-memory RSS reader — used by the mununu#490 self-imposed memory
+# ceiling (`MUNUNU_MAX_PROCESS_MEMORY_BYTES`). Small, purpose-built,
+# cross-platform (macOS / linux / windows), no unsafe surface in mununu. The
+# ceiling turns an OS-level `abort()` on allocator failure into a graceful
+# `unknown` verdict at per-property + per-engine-entry granularity — mirrors
+# the existing `MUNUNU_BDD_*` budget vocabulary in CLAUDE.md. Not
+# feature-gated: the check is a no-op when the env var is unset.
+memory-stats = "1"
+
 # VCD parser — used by §Phase 9 R-S6 (VCD trace mining). Reads
 # IEEE-1364 Value Change Dump files produced by Verilator / VCS /
 # QuestaSim / Icarus regression suites; mininu mines them for
