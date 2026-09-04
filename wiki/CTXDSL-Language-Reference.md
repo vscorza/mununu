@@ -244,7 +244,7 @@ Three behaviours are load-bearing and easy to get wrong:
 
 Bound every variable with a guard on the transition that increments it; an unbounded variable enumerates until it hits the state cap.
 
-See [`docs/ctxdsl-modelling-guide.md`](../docs/ctxdsl-modelling-guide.md) for the full list, each entry verified against the shipped binary, plus the checklist for trusting a hand-authored model.
+See [`docs/ctxdsl-modelling-guide.md`](https://github.com/vscorza/mununu/blob/main/docs/ctxdsl-modelling-guide.md) for the full list, each entry verified against the shipped binary, plus the checklist for trusting a hand-authored model.
 
 ### Transitions
 
