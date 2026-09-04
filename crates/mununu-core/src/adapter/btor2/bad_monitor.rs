@@ -539,23 +539,63 @@ pub fn emit_ag_boolean_invariant_monitor(
                 Ok(n)
             }
             MuNode::Not(inner) => {
-                let a = compile(formula, *inner, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let a = compile(
+                    formula,
+                    *inner,
+                    file,
+                    reset_pinned,
+                    bool_sort,
+                    next_nid,
+                    appended,
+                )?;
                 let n = *next_nid;
                 *next_nid += 1;
                 appended.push(format!("{n} not {bool_sort} {a}"));
                 Ok(n)
             }
             MuNode::And(l, r) => {
-                let a = compile(formula, *l, file, reset_pinned, bool_sort, next_nid, appended)?;
-                let b = compile(formula, *r, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let a = compile(
+                    formula,
+                    *l,
+                    file,
+                    reset_pinned,
+                    bool_sort,
+                    next_nid,
+                    appended,
+                )?;
+                let b = compile(
+                    formula,
+                    *r,
+                    file,
+                    reset_pinned,
+                    bool_sort,
+                    next_nid,
+                    appended,
+                )?;
                 let n = *next_nid;
                 *next_nid += 1;
                 appended.push(format!("{n} and {bool_sort} {a} {b}"));
                 Ok(n)
             }
             MuNode::Or(l, r) => {
-                let a = compile(formula, *l, file, reset_pinned, bool_sort, next_nid, appended)?;
-                let b = compile(formula, *r, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let a = compile(
+                    formula,
+                    *l,
+                    file,
+                    reset_pinned,
+                    bool_sort,
+                    next_nid,
+                    appended,
+                )?;
+                let b = compile(
+                    formula,
+                    *r,
+                    file,
+                    reset_pinned,
+                    bool_sort,
+                    next_nid,
+                    appended,
+                )?;
                 let n = *next_nid;
                 *next_nid += 1;
                 appended.push(format!("{n} or {bool_sort} {a} {b}"));
@@ -601,8 +641,15 @@ pub fn emit_ag_boolean_invariant_monitor(
         }
     }
 
-    let inv_expr =
-        compile(formula, root, &file, reset_pinned, bool_sort, &mut next_nid, &mut appended)?;
+    let inv_expr = compile(
+        formula,
+        root,
+        &file,
+        reset_pinned,
+        bool_sort,
+        &mut next_nid,
+        &mut appended,
+    )?;
 
     // bad = !(compound); the final NOT carries BAD_COND_SYMBOL.
     let bad_cond = next_nid;
