@@ -481,6 +481,141 @@ pub fn emit_latched_predicate_state_named(
     Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
 }
 
+/// mununu#492 — append a `bad` monitor for `AG (COMPOUND)` where `COMPOUND` is a
+/// boolean expression tree over `And`/`Or`/`Not`/`True`/`False`/`Predicate` mu-calc
+/// nodes; each `Predicate` leaf resolves via state cell → output net → primary input.
+///
+/// Widens [`emit_ag_state_atom_monitor`] to (a) compound boolean invariants, and
+/// (b) atoms bound to primary inputs (essential for zero-state models where every
+/// atom is input-only). The bad line is `bad = !(compound_expr)`; the final NOT
+/// node carries [`BAD_COND_SYMBOL`].
+///
+/// Signal-resolution fallback is state → output → **input**: the primary-input
+/// fallback is what zero-state models need. Under safety-monitor semantics this
+/// is sound — a `bad` reachable under some input assignment IS a real
+/// counterexample (the SVA property is `AG(compound)` universally-quantified over
+/// inputs), no different from a witness on a stateful design where the counterexample
+/// is `(state_trajectory, input_schedule)`.
+pub fn emit_ag_boolean_invariant_monitor(
+    content: &str,
+    formula: &crate::mu_calculus::Formula,
+    root: crate::mu_calculus::NodeId,
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    use crate::adapter::btor2::predicate_expr::{PredicateExpr, parse_predicate_expr};
+    use crate::mu_calculus::Node as MuNode;
+
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut appended: Vec<String> = Vec::new();
+    let bool_sort = find_or_make_bool_sort(&file, &mut next_nid, &mut appended);
+
+    // Walk the mu-calc subtree rooted at `id`; emit BTOR2 nodes; return the
+    // NID of the compiled boolean expression (1-bit).
+    fn compile(
+        formula: &crate::mu_calculus::Formula,
+        id: crate::mu_calculus::NodeId,
+        file: &crate::adapter::btor2::ast::Btor2File,
+        reset_pinned: bool,
+        bool_sort: Nid,
+        next_nid: &mut Nid,
+        appended: &mut Vec<String>,
+    ) -> Result<Nid, AdapterError> {
+        match formula.node(id) {
+            MuNode::True => {
+                let n = *next_nid;
+                *next_nid += 1;
+                appended.push(format!("{n} constd {bool_sort} 1"));
+                Ok(n)
+            }
+            MuNode::False => {
+                let n = *next_nid;
+                *next_nid += 1;
+                appended.push(format!("{n} constd {bool_sort} 0"));
+                Ok(n)
+            }
+            MuNode::Not(inner) => {
+                let a = compile(formula, *inner, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let n = *next_nid;
+                *next_nid += 1;
+                appended.push(format!("{n} not {bool_sort} {a}"));
+                Ok(n)
+            }
+            MuNode::And(l, r) => {
+                let a = compile(formula, *l, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let b = compile(formula, *r, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let n = *next_nid;
+                *next_nid += 1;
+                appended.push(format!("{n} and {bool_sort} {a} {b}"));
+                Ok(n)
+            }
+            MuNode::Or(l, r) => {
+                let a = compile(formula, *l, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let b = compile(formula, *r, file, reset_pinned, bool_sort, next_nid, appended)?;
+                let n = *next_nid;
+                *next_nid += 1;
+                appended.push(format!("{n} or {bool_sort} {a} {b}"));
+                Ok(n)
+            }
+            MuNode::Predicate(atom) => match parse_predicate_expr(atom) {
+                Ok(PredicateExpr::Cmp {
+                    register,
+                    op,
+                    value,
+                }) => {
+                    let (sig_nid, sig_sort) = state_nid_and_sort(file, &register, reset_pinned)
+                        .or_else(|| output_nid_and_sort(file, &register))
+                        .or_else(|| input_nid_and_sort(file, &register))
+                        .ok_or_else(|| {
+                            err(format!(
+                                "adapter/btor2/bad_monitor: leaf atom `{register}` does not \
+                                 resolve to a state cell, output port, or primary input"
+                            ))
+                        })?;
+                    let const_nid = *next_nid;
+                    *next_nid += 1;
+                    appended.push(format!("{const_nid} constd {sig_sort} {value}"));
+                    let cmp_kw = btor2_cmp_keyword(op);
+                    let n = *next_nid;
+                    *next_nid += 1;
+                    appended.push(format!("{n} {cmp_kw} {bool_sort} {sig_nid} {const_nid}"));
+                    Ok(n)
+                }
+                Ok(_) => Err(err(format!(
+                    "adapter/btor2/bad_monitor: leaf atom `{atom}` uses a relational / addend / \
+                     select shape not supported by the compound monitor"
+                ))),
+                Err(e) => Err(err(format!(
+                    "adapter/btor2/bad_monitor: leaf atom `{atom}` did not parse as a predicate \
+                     expression: {e:?}"
+                ))),
+            },
+            other => Err(err(format!(
+                "adapter/btor2/bad_monitor: compound safety monitor accepts \
+                 And/Or/Not/True/False/Predicate only; found {other:?}"
+            ))),
+        }
+    }
+
+    let inv_expr =
+        compile(formula, root, &file, reset_pinned, bool_sort, &mut next_nid, &mut appended)?;
+
+    // bad = !(compound); the final NOT carries BAD_COND_SYMBOL.
+    let bad_cond = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{bad_cond} not {bool_sort} {inv_expr} {BAD_COND_SYMBOL}"
+    ));
+    let bad_line = next_nid;
+    appended.push(format!("{bad_line} bad {bad_cond}"));
+
+    Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

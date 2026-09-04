@@ -204,6 +204,20 @@ trial-and-error.
 
 > Source of truth: [`bitblast_oom_skip_note`](../crates/mununu-core/src/planner/mod.rs) — surface: (CLI+API+UI)
 
+### Compound-atom safety escalation + `bottom-reason` diagnostic (mununu#492)
+
+> Source of truth: [`reduce_ag_boolean_body`](../crates/mununu-core/src/adapter/reach_rescue.rs) + [`emit_ag_boolean_invariant_monitor`](../crates/mununu-core/src/adapter/btor2/bad_monitor.rs) — surface: (CLI+API+UI)
+
+**Compound-safety rescue.** A residual ⊥ on a safety property of the shape `AG(compound)` — where `compound` is a boolean tree over `And`/`Or`/`Not`/`True`/`False`/`Predicate` nodes and each `Predicate` leaf is a single `REG op VALUE` comparison — is now decided by the reachability portfolio. Widens the existing single-atom escalation to accept exclusion (`!a || !b`), implication (`!a || b`), and conjunctive (`a && b`) shapes, and — critically — resolves each leaf via state cell → output net → **primary input**, so a zero-state model (a purely combinational block like `mem_router`) can have its properties decided at k=0 without a state cone to walk. Preserves byte-for-byte behavior on the shipped single-atom path (single-atom shapes route through the original emitter; the compound emitter is a fallback).
+
+**`bottom-reason` note.** For any property that stays ⊥ after the escalation pass, a new `bottom-reason` verification note classifies WHY the ⊥ stands:
+
+- **`safety-shape-not-reducible`** — the property is Safety-class but neither reducer accepts its shape (a compound with a register-vs-register `CmpReg` leaf, a non-standard AG outer shape, etc.). NOT the same as a resource abstain — this needs a property reshape or a new rescue reducer, not a bigger budget.
+- **`no-state-model-non-safety`** — the design has zero state registers AND this property is non-Safety (liveness / recoverability). On a stateless model, `AG EF good` is vacuously true and `AG(a → AF b)`'s l2s reduction has no lasso to close. The ⊥ is a modelling issue (compose with a stateful context or restrict to tier-1 safety), not an engine cap.
+- **`unclassified`** — the classifier did not narrow further; most commonly a resource abstain the engine already flagged with a `bit-cap` / `abstained on the …` sibling note.
+
+Consumers keying on `verification_notes[i].kind` can distinguish "the engine gave up" from "the property shape doesn't fit this rescue lane," and act accordingly. Prior to mununu#492, the two cases were indistinguishable — a critical distinction for contrast pairs where a stateless block's supposed-to-fail twin was returning ⊥ instead of VIOLATED (the ticket's `mem_router_faulty` case).
+
 ### Process-wide memory ceiling: `MUNUNU_MAX_PROCESS_MEMORY_BYTES` (mununu#490)
 
 > Source of truth: [`adapter::memory_budget::check_process_memory_budget`](../crates/mununu-core/src/adapter/memory_budget.rs) — surface: (CLI+API+UI, env var — process-global)
