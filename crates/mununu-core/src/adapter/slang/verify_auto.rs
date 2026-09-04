@@ -3310,7 +3310,142 @@ pub(crate) fn escalate_bottom(
             _ => {}
         }
     }
+    // mununu#492 Part B — classify residual ⊥s so a downstream gate can distinguish
+    // "resource-abstain" (the engine gave up) from "shape-not-reducible-here" (the
+    // rescue couldn't reduce this shape) from "no-state-model" (the property class
+    // is degenerate on a stateless model). Prevents ⊥ from a fundamental modelling
+    // issue (which calls for a fix) from being confused with ⊥ from a resource cap
+    // (which calls for a raise).
+    let stateless_model = design_stateless(design_btor2);
+    for prop in report.properties.iter() {
+        if !matches!(prop.outcome, VerifyOutcome::Unknown { .. }) {
+            continue;
+        }
+        let reason = classify_bottom_reason(prop, stateless_model);
+        notes.push(bottom_reason_note(&prop.name, reason));
+    }
     notes
+}
+
+/// mununu#492 Part B — reason a residual ⊥ can be classified as, distinguishing
+/// the three mechanically-detectable cases from "unknown (no signal)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomReason {
+    /// The property is Safety-class but neither the single-atom nor the compound
+    /// reducer could reduce it — its shape is out of what the rescue lane
+    /// currently supports (e.g. a compound with a `CmpReg` register-vs-register
+    /// leaf, or a non-standard AG outer shape).
+    SafetyShapeNotReducible,
+    /// A recoverability (`AG EF good`) or liveness (`AG(a → AF b)`) property on
+    /// a design with zero state registers. Recoverability is vacuously true on
+    /// a stateless model; response-liveness's l2s reduction needs state to
+    /// lasso. Either case is a modelling issue, not an engine cap.
+    NoStateModelNonSafety,
+    /// None of the above — the ⊥ is unexplained by this classifier (probably a
+    /// resource abstain on the cube / exact engine, or a shape the residual
+    /// doesn't cover here). A downstream gate should NOT treat this as
+    /// distinct-from-abstain without more evidence.
+    UnclassifiedBottom,
+}
+
+/// True when the design has no state registers (`state ...` lines).
+fn design_stateless(design_btor2: &str) -> bool {
+    match crate::adapter::btor2::parser::parse(design_btor2) {
+        Ok(file) => !file
+            .lines
+            .iter()
+            .any(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. })),
+        Err(_) => false,
+    }
+}
+
+/// Classify a residual ⊥ property. Called ONLY on properties whose outcome is
+/// still `Unknown` after the escalation pass.
+fn classify_bottom_reason(prop: &PropertyVerdict, stateless_model: bool) -> BottomReason {
+    use crate::mu_calculus::{PropertyClass, parser as mu_parser};
+    let Ok(formula) = mu_parser::parse(&prop.formula) else {
+        return BottomReason::UnclassifiedBottom;
+    };
+    match formula.property_class() {
+        PropertyClass::Safety => {
+            let single_atom = crate::adapter::reach_rescue::reduce_ag_invariant(&formula).is_some();
+            let compound = crate::adapter::reach_rescue::reduce_ag_boolean_body(&formula).is_some();
+            if !single_atom && !compound {
+                BottomReason::SafetyShapeNotReducible
+            } else {
+                BottomReason::UnclassifiedBottom
+            }
+        }
+        PropertyClass::Liveness | PropertyClass::Reachability | PropertyClass::Mixed => {
+            if stateless_model {
+                BottomReason::NoStateModelNonSafety
+            } else {
+                BottomReason::UnclassifiedBottom
+            }
+        }
+        PropertyClass::Propositional => BottomReason::UnclassifiedBottom,
+    }
+}
+
+/// mununu#492 Part B — the per-property provenance note that names a residual
+/// ⊥'s classification so a consumer's gate can act on the distinction.
+fn bottom_reason_note(name: &str, reason: BottomReason) -> VerificationNote {
+    let (summary, detail) = match reason {
+        BottomReason::SafetyShapeNotReducible => (
+            format!(
+                "`{name}`: residual ⊥ classified as `safety-shape-not-reducible` — the \
+                 rescue lane could not reduce this AG-safety shape (compound-of-relational, \
+                 non-standard AG outer shape, or a leaf the compiler rejects). NOT the same \
+                 as an engine resource abstain — this is a modelling / property-shape gap."
+            ),
+            "The safety-rescue lane (mununu#492) accepts `AG(single_atom)` and \
+             `AG(compound_boolean_of_single_atoms)` where each leaf is a `REG op VALUE` \
+             comparison. Shapes outside that — a compound-of-relational (`AG(reg_a == reg_b \
+             && …)`), a `CmpRegAddend` leaf, an `AG(a → AX b)` implication-with-next, or a \
+             non-standard AG outer shape — are rejected here. A downstream gate should NOT \
+             treat this ⊥ as interchangeable with an engine's resource abstain: this needs \
+             a property reshape or a new rescue reducer, not a bigger budget."
+                .into(),
+        ),
+        BottomReason::NoStateModelNonSafety => (
+            format!(
+                "`{name}`: residual ⊥ classified as `no-state-model-non-safety` — the design \
+                 has zero state registers AND this property is non-Safety (liveness / \
+                 recoverability). On a stateless model, `AG EF good` is vacuously true (rule \
+                 4) and `AG(a → AF b)` has no lasso to reduce; the ⊥ is a modelling issue, \
+                 not an engine cap."
+            ),
+            "A purely combinational block has no reachable state trajectory beyond the \
+             initial (empty-state) point, so non-Safety property classes are either \
+             vacuously true (recoverability) or unfulfillable-by-shape (response-liveness's \
+             l2s needs state to close a lasso). Either compose the block with an enclosing \
+             stateful context (its scheduler / driver), or restrict the property set to \
+             tier-1 safety invariants — which the compound-safety rescue (mununu#492) does \
+             decide on stateless models."
+                .into(),
+        ),
+        BottomReason::UnclassifiedBottom => (
+            format!(
+                "`{name}`: residual ⊥ was not classified by the mununu#492 diagnostic. Most \
+                 commonly this is a resource abstain (bit-cap / node-budget / iteration / \
+                 wall-clock) on the exact-symbolic or cube engine — check for a sibling \
+                 `bit-cap` / `abstained on the …` note on the same property."
+            ),
+            "The bottom-reason classifier recognises three shapes (safety-shape-not-reducible, \
+             no-state-model-non-safety, unclassified). Anything outside those falls back to \
+             this note. It is NOT a claim about resource vs shape — just an honest 'this \
+             classifier did not narrow it further', so the consumer looks at the engine-side \
+             notes for the actionable answer."
+                .into(),
+        ),
+    };
+    VerificationNote {
+        kind: "bottom-reason".into(),
+        level: NoteLevel::ScopeCaveat,
+        summary,
+        detail,
+        items: Vec::new(),
+    }
 }
 
 /// Lever (b) — exact-symbolic rescue for cube-SKIPPED properties.
@@ -3975,9 +4110,18 @@ mod tests {
             "a νμ ⊥ must be left untouched by the safety arm (2-valued reachability can't \
              soundly decide it)"
         );
+        // No rescue note fires, but the mununu#492 Part B classifier attaches a
+        // `bottom-reason` note explaining WHY the ⊥ stands.
         assert!(
-            notes.is_empty(),
-            "no rescue note for an un-reducible property"
+            !notes.iter().any(|n| n.kind == "safety-rescue"
+                || n.kind == "liveness-rescue"
+                || n.kind == "recoverability-rescue"),
+            "no rescue note fires for a non-safety-reducible ⊥"
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "bottom-reason"),
+            "the Part B classifier must attach a bottom-reason note; got kinds: {:?}",
+            notes.iter().map(|n| &n.kind).collect::<Vec<_>>()
         );
     }
 
@@ -4199,7 +4343,17 @@ mod tests {
             matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
             "a diamond-EF νμ ⊥ must be left untouched (l2s does not decide it)"
         );
-        assert!(notes.is_empty(), "no rescue note for a non-box-AF property");
+        // mununu#492 Part B — the residual ⊥ gets a `bottom-reason` note, but no
+        // rescue-arm note fires.
+        assert!(
+            !notes.iter().any(|n| n.kind == "liveness-rescue"),
+            "no liveness-rescue note for a non-box-AF property"
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "bottom-reason"),
+            "the Part B classifier must attach a bottom-reason note; got kinds: {:?}",
+            notes.iter().map(|n| &n.kind).collect::<Vec<_>>()
+        );
     }
 
     // A νμ recoverability property `AG EF (st == 0)` the cube left ⊥ is routed by
@@ -4278,6 +4432,132 @@ mod tests {
         assert!(
             notes.iter().any(|n| n.kind == "recoverability-rescue"),
             "a recoverability-rescue provenance note should be recorded"
+        );
+    }
+
+    // ---- mununu#492 Part B: bottom-reason classifier tests ----
+
+    // A zero-state design — 3 primary inputs, no state cells.
+    const BOTTOM_REASON_ZERO_STATE: &str = "\
+1 sort bitvec 1
+2 input 1 a
+3 input 1 b
+4 input 1 c
+";
+
+    /// mununu#492 — on the zero-state exclusion property, escalate_bottom's Safety
+    /// arm now DECIDES it VIOLATED via the compound-atom rescue (Part A). No
+    /// bottom-reason note is attached because the outcome is no longer Unknown.
+    #[test]
+    fn bottom_reason_zero_state_compound_safety_gets_decided_no_bottom_reason() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "mem_router_exclusion".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X. (((!(a == 1)) || (!(b == 1))) && [] X)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 2 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom(
+            &mut report,
+            BOTTOM_REASON_ZERO_STATE,
+            false,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Violated { .. }),
+            "the compound-atom rescue decides the exclusion VIOLATED on the zero-state model; \
+             got {:?}",
+            report.properties[0].outcome
+        );
+        // No bottom-reason note — the outcome is definite.
+        assert!(
+            !notes.iter().any(|n| n.kind == "bottom-reason"),
+            "no bottom-reason note when the outcome is decided"
+        );
+    }
+
+    /// mununu#492 — a safety property whose shape the rescue lane cannot reduce
+    /// (a compound with a `CmpReg` register-vs-register leaf) stays ⊥ and gets
+    /// a `bottom-reason` note classifying it as `safety-shape-not-reducible`.
+    #[test]
+    fn bottom_reason_safety_shape_not_reducible_gets_classified() {
+        // `AG(a == 1 && b == c)` — the b==c leaf is CmpReg, out of the compilable
+        // set for the compound emitter.
+        let design = "\
+1 sort bitvec 1
+2 input 1 a
+3 input 1 b
+4 input 1 c
+";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "compound_with_relational_leaf".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X. (((a == 1) && (b == c)) && [] X)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom(
+            &mut report,
+            design,
+            false,
+            &VerifyAutoOptions::default(),
+            &[],
+        );
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
+            "the CmpReg leaf must stay ⊥ (out of the compilable set)"
+        );
+        let br = notes
+            .iter()
+            .find(|n| n.kind == "bottom-reason")
+            .expect("bottom-reason note must be attached to a residual ⊥");
+        assert!(
+            br.summary.contains("safety-shape-not-reducible"),
+            "classifier must name `safety-shape-not-reducible`; got summary: {}",
+            br.summary
+        );
+    }
+
+    /// mununu#492 — a non-Safety property (νμ recoverability) on a stateless
+    /// model is classified `no-state-model-non-safety`.
+    #[test]
+    fn bottom_reason_no_state_model_non_safety_gets_classified() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "vacuous_recoverability".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                // AG EF (a == 1) — recoverability on a stateless model.
+                formula: "nu Y. ((mu X. ((a == 1) || <> X)) && [] Y)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let opts = VerifyAutoOptions {
+            // Isolate the classifier from the recoverability rescue path so the
+            // residual ⊥ is what the classifier sees.
+            rescue_bottom_recoverability: false,
+            ..VerifyAutoOptions::default()
+        };
+        let notes = escalate_bottom(&mut report, BOTTOM_REASON_ZERO_STATE, false, &opts, &[]);
+        let br = notes
+            .iter()
+            .find(|n| n.kind == "bottom-reason")
+            .expect("bottom-reason note must be attached to a residual ⊥");
+        assert!(
+            br.summary.contains("no-state-model-non-safety"),
+            "classifier must name `no-state-model-non-safety`; got summary: {}",
+            br.summary
         );
     }
 

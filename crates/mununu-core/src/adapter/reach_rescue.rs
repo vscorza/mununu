@@ -54,7 +54,9 @@
 //! validated end-to-end by the `#[ignore]`d `e2e_rescue_*` tests below (both verdict
 //! directions + the beyond-40-bit-cap case, with live btormc/Pono).
 
-use crate::adapter::btor2::bad_monitor::emit_ag_state_atom_monitor;
+use crate::adapter::btor2::bad_monitor::{
+    emit_ag_boolean_invariant_monitor, emit_ag_state_atom_monitor,
+};
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
 use crate::adapter::reach_portfolio::{ReachOutcome, ReachVerdict, decide_reach_portfolio};
@@ -139,6 +141,70 @@ pub fn reduce_ag_invariant(formula: &Formula) -> Option<AgInvariant> {
     }
 }
 
+/// mununu#492 — reduce `nu X. (COMPOUND && [] X)` to the [`NodeId`] of `COMPOUND`
+/// when `COMPOUND` is a boolean tree over `And`/`Or`/`Not`/`True`/`False`/`Predicate`
+/// nodes, with each `Predicate` leaf parseable as a single register-comparison
+/// (`PredicateExpr::Cmp`) — widening [`reduce_ag_invariant`] which accepts only a
+/// single atomic body. Non-boolean leaves (`CmpReg`, `CmpRegAddend`, `Select`) are
+/// rejected here so the compound emitter never receives a leaf it cannot compile;
+/// modal / fixpoint nodes inside `COMPOUND` are rejected — the outer `AG` is the only
+/// modality allowed.
+///
+/// **Soundness rationale.** The compound body compiles to a pure boolean expression
+/// over the (state × input) universe; the emitted `bad` is its negation, so a
+/// reachable `bad` is a genuine reachable state × input assignment falsifying the
+/// invariant. `AG(COMPOUND)` is universally-quantified over ALL trajectories AND
+/// input schedules, so the counterexample transfers unchanged. Same soundness
+/// argument as [`emit_ag_state_atom_monitor`], generalised from a single leaf.
+pub fn reduce_ag_boolean_body(formula: &Formula) -> Option<NodeId> {
+    // Outer shape must be `nu X. (BODY && [] X)` — same as reduce_ag_invariant.
+    let Node::Nu { var, body } = formula.node(formula.root()) else {
+        return None;
+    };
+    let Node::And(l, r) = formula.node(*body) else {
+        return None;
+    };
+    let (compound_id, modal_id) = classify_and(formula, *l, *r, *var)?;
+    let Node::Modal {
+        kind: ModalKind::Box,
+        guard,
+        target,
+    } = formula.node(modal_id)
+    else {
+        return None;
+    };
+    if *guard != Guard::default() {
+        return None;
+    }
+    match formula.node(*target) {
+        Node::Variable(v) if *v == *var => {}
+        _ => return None,
+    }
+    // The compound subtree must be pure boolean-of-single-atom-leaves — no
+    // modals / fixpoints / variables, and every Predicate leaf parses as Cmp.
+    if !is_compilable_boolean_body(formula, compound_id) {
+        return None;
+    }
+    Some(compound_id)
+}
+
+/// Walk the subtree; verify it is only And/Or/Not/True/False/Predicate and every
+/// Predicate leaf parses as `PredicateExpr::Cmp`. A single modal / fixpoint /
+/// variable / CmpReg / CmpRegAddend / Select rejects the whole tree.
+fn is_compilable_boolean_body(formula: &Formula, id: NodeId) -> bool {
+    match formula.node(id) {
+        Node::True | Node::False => true,
+        Node::Not(inner) => is_compilable_boolean_body(formula, *inner),
+        Node::And(l, r) | Node::Or(l, r) => {
+            is_compilable_boolean_body(formula, *l) && is_compilable_boolean_body(formula, *r)
+        }
+        Node::Predicate(atom) => {
+            matches!(parse_predicate_expr(atom), Ok(PredicateExpr::Cmp { .. }))
+        }
+        _ => false,
+    }
+}
+
 /// Return `(atom_node, modal_node)` iff exactly one of `l` / `r` is a box-to-`var`
 /// and the other is not. `None` if neither or both look like the box recursion,
 /// keeping the shape match unambiguous.
@@ -186,12 +252,30 @@ pub fn reach_portfolio_rescue(
     formula: &Formula,
     reset_pinned: bool,
 ) -> Option<(RescueVerdict, ReachOutcome)> {
-    let inv = reduce_ag_invariant(formula)?;
-    // bad = !(signal ⋈ value); the emitter validates `signal` resolves to a state
-    // cell (a non-state signal ⇒ Err ⇒ abstain).
-    let monitored =
-        emit_ag_state_atom_monitor(design_btor2, &inv.signal, inv.op, inv.value, reset_pinned)
-            .ok()?;
+    // Try the existing single-atom reducer first — preserves byte-for-byte
+    // emission on the shipped case. Fall back to the compound-atom reducer
+    // (mununu#492) for `AG(compound_boolean_expression)` and for atoms bound
+    // to primary inputs (essential for zero-state models).
+    let monitored = if let Some(inv) = reduce_ag_invariant(formula) {
+        // bad = !(signal ⋈ value); the emitter validates `signal` resolves to a
+        // state cell / output net (a non-state / non-output signal ⇒ Err ⇒
+        // fall through to the compound path below).
+        match emit_ag_state_atom_monitor(design_btor2, &inv.signal, inv.op, inv.value, reset_pinned)
+        {
+            Ok(s) => s,
+            Err(_) => {
+                // The single-atom emitter refused the signal (zero-state atom
+                // on a primary input, say). Try the compound path — its leaf
+                // resolution includes primary inputs.
+                let root = reduce_ag_boolean_body(formula)?;
+                emit_ag_boolean_invariant_monitor(design_btor2, formula, root, reset_pinned).ok()?
+            }
+        }
+    } else {
+        // Non-single-atom shape — try compound.
+        let root = reduce_ag_boolean_body(formula)?;
+        emit_ag_boolean_invariant_monitor(design_btor2, formula, root, reset_pinned).ok()?
+    };
     let file = parser::parse(&monitored).ok()?;
     let outcome = decide_reach_portfolio(&file);
     let verdict = match outcome.verdict {
@@ -311,6 +395,133 @@ mod tests {
         // not reducible — the design text is never even parsed.
         let f = parse("mu X. ((b != 0) || <> X)");
         assert!(reach_portfolio_rescue("1 sort bitvec 1\n", &f, false).is_none());
+    }
+
+    // ---- mununu#492 Part A: compound-atom safety reducer + integration ----
+
+    #[test]
+    fn compound_reducer_accepts_exclusion_shape() {
+        // `AG(!a || !b)` — the exclusion safety `!(a && b)`, a compound Or-of-Nots.
+        let f = parse("nu X. (((!(a == 1)) || (!(b == 1))) && [] X)");
+        assert!(
+            reduce_ag_boolean_body(&f).is_some(),
+            "the exclusion safety must reduce under the compound reducer"
+        );
+        // And the single-atom reducer must still reject it — the widening is
+        // strictly additive on the single-atom lane.
+        assert!(
+            reduce_ag_invariant(&f).is_none(),
+            "the single-atom reducer must stay strict on compound shapes"
+        );
+    }
+
+    #[test]
+    fn compound_reducer_accepts_implication_shape() {
+        // `AG(!a || b)` — the classical implication safety `AG(a -> b)`.
+        let f = parse("nu X. (((!(a == 1)) || (b == 1)) && [] X)");
+        assert!(reduce_ag_boolean_body(&f).is_some());
+    }
+
+    #[test]
+    fn compound_reducer_accepts_conjunctive_body() {
+        // `AG(a && b)` — a conjunctive safety.
+        let f = parse("nu X. (((a == 1) && (b == 1)) && [] X)");
+        assert!(reduce_ag_boolean_body(&f).is_some());
+    }
+
+    #[test]
+    fn compound_reducer_rejects_modal_inside_body() {
+        // A modal (box / diamond) inside the compound is rejected — the compound
+        // emitter compiles a pure boolean expression, not a modal one.
+        let f = parse("nu X. (((a == 1) && [] (b == 1)) && [] X)");
+        assert!(
+            reduce_ag_boolean_body(&f).is_none(),
+            "a compound with an embedded modal must not reduce"
+        );
+    }
+
+    #[test]
+    fn compound_reducer_rejects_relational_leaf() {
+        // A `CmpReg` leaf (register-vs-register) is out of the compilable set;
+        // the compound emitter would reject it, so the reducer must too.
+        let f = parse("nu X. (((a == 1) && (b == c)) && [] X)");
+        assert!(reduce_ag_boolean_body(&f).is_none());
+    }
+
+    #[test]
+    fn compound_reducer_rejects_guarded_box() {
+        // Same guard-box refusal as reduce_ag_invariant.
+        let f = parse("nu X. (((a == 1) && (b == 1)) && [(labels = {step})] X)");
+        assert!(reduce_ag_boolean_body(&f).is_none());
+    }
+
+    // A zero-state model — 3 primary inputs, no registers. `AG(!a || !b)` is
+    // violated when a=b=1; `AG(!a || b)` is violated when a=1,b=0; `AG(a || !a)`
+    // is trivially true. These are exactly the ticket-#492 shapes on the
+    // stateless `mem_router` contrast pair.
+    const ZERO_STATE_MODEL: &str = "\
+1 sort bitvec 1
+2 input 1 a
+3 input 1 b
+4 input 1 c
+";
+
+    #[test]
+    fn zero_state_exclusion_safety_gets_violated_via_compound_rescue() {
+        // `AG(!(a == 1) || !(b == 1))` — a=1,b=1 falsifies. Expected: VIOLATED.
+        let f = parse("nu X. (((!(a == 1)) || (!(b == 1))) && [] X)");
+        let (verdict, _) = reach_portfolio_rescue(ZERO_STATE_MODEL, &f, false)
+            .expect("rescue must fire on the compound path");
+        assert_eq!(
+            verdict,
+            RescueVerdict::Violated,
+            "a=1 && b=1 falsifies AG(!a || !b); expected VIOLATED, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn zero_state_implication_safety_gets_violated_via_compound_rescue() {
+        // `AG(!(a == 1) || (b == 1))` — a=1,b=0 falsifies. Expected: VIOLATED.
+        let f = parse("nu X. (((!(a == 1)) || (b == 1)) && [] X)");
+        let (verdict, _) = reach_portfolio_rescue(ZERO_STATE_MODEL, &f, false)
+            .expect("rescue must fire on the compound path");
+        assert_eq!(verdict, RescueVerdict::Violated);
+    }
+
+    #[test]
+    fn zero_state_tautology_gets_holds_via_compound_rescue() {
+        // `AG((a == 1) || (a != 1))` — trivially true. Expected: HOLDS.
+        let f = parse("nu X. (((a == 1) || (a != 1)) && [] X)");
+        let (verdict, _) = reach_portfolio_rescue(ZERO_STATE_MODEL, &f, false)
+            .expect("rescue must fire on the compound path");
+        assert_eq!(
+            verdict,
+            RescueVerdict::Holds,
+            "AG(a || !a) is trivially true; expected HOLDS, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn zero_state_conjunctive_safety_gets_violated_via_compound_rescue() {
+        // `AG(a==1 && b==1)` — a=0 falsifies. Expected: VIOLATED.
+        let f = parse("nu X. (((a == 1) && (b == 1)) && [] X)");
+        let (verdict, _) = reach_portfolio_rescue(ZERO_STATE_MODEL, &f, false)
+            .expect("rescue must fire on the compound path");
+        assert_eq!(verdict, RescueVerdict::Violated);
+    }
+
+    // The single-atom regression: the widened `reach_portfolio_rescue` must still
+    // route a `AG(cnt != 3)` on the WIDE_INPUT_FSM through the existing
+    // single-atom emitter (byte-equivalent). We can't assert on emitted bytes
+    // here (the file text isn't returned), but we can assert the verdict is the
+    // same as it was before the widening — VIOLATED on `AG(cnt != 3)` at k=2.
+    #[test]
+    fn single_atom_regression_still_decides_via_the_original_lane() {
+        let f = parse("nu X. ((cnt == 0) && [] X)");
+        // cnt starts at 0, then transitions to 1 → clearly violated at k=1.
+        let (verdict, _) = reach_portfolio_rescue(WIDE_INPUT_FSM, &f, false)
+            .expect("single-atom lane must still rescue");
+        assert_eq!(verdict, RescueVerdict::Violated);
     }
 
     // ---- docker-validated (`mununu-sva`): full rescue path with live btormc/Pono ----
