@@ -21,12 +21,16 @@ So `reachable(BothReadZero)` is the discriminating verdict:
   TSO ⇒ true   (the relaxation is observable),
   SC  ⇒ false  (SC / the fence forbids it).
 
-**Why explicit states, not variables.** mununu's `verify` + mu-calculus
-path binds predicates to **state names**, not to CTXDSL variable *values*
-(`r0 == 0` atoms do not bind through the verify composition path — verified
-2026-06-23). So the model encodes memory / store-buffer / read-result
-configuration in the state name, and the both-zero outcome is a dedicated
-absorbing state `BothReadZero` checked by the `reachable` template.
+**Why explicit states, not variables.** State-name atoms bind on every
+mununu path; variable atoms do not. `r0 == 0` returns `false` across a
+multi-source `verify` composition, and a `reachable` template's `TARGET` must
+be a bare identifier in any case, so an `r0 == 0` target is rejected outright.
+So the model encodes memory / store-buffer / read-result configuration in the
+state name, and the both-zero outcome is a dedicated absorbing state
+`BothReadZero` checked by the `reachable` template. (Re-verified 2026-09-04;
+variable atoms DO bind on `context eval` and on a single-source `verify`
+project via the raw `formula = "..."` field. Full matrix:
+docs/ctxdsl-modelling-guide.md §9.)
 
 The model is a generated design-pattern demonstration of the memory-
 consistency domain (cross-checked against the textbook SB result), NOT a

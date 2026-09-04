@@ -118,33 +118,53 @@ predicate, not a state hint.
 
 ### CLI
 
+> **Drift notice (verified 2026-09-04).** The `mununu templates` subcommand and
+> `mununu context eval --template` / `--template-arg` flags described in earlier
+> revisions of this page **do not exist** in the shipped CLI. `mununu --help`
+> lists `context`, `extraction`, `contract`, `codesign`, `verify`, `library`;
+> `mununu context eval --help` accepts `--formula`, not `--template`. Templates
+> are reachable from `verify.toml` and from extraction specs (below). Use
+> `--formula` with the instantiated body from the catalogue above when you want
+> a template's property on the `context eval` CLI.
+
 ```bash
-# Zero-parameter template
-mununu context eval model.espec.json --template no_deadlock --automaton FSM
-
-# Template with arguments
-mununu context eval model.espec.json \
-    --template reachable --template-arg TARGET=GoalState --automaton FSM
-
-# Multiple arguments
-mununu context eval model.espec.json \
-    --template mutual_exclusion --template-arg A=P1_Active --template-arg B=P2_Active \
-    --automaton System
-
-# List all templates
-mununu templates
-
-# Filter by domain
-mununu templates --domain rtl
-
-# Show template details
-mununu templates --id reachable
-
-# JSON output
-mununu templates --json
+# Templates on the CLI: instantiate the catalogue body yourself and pass it
+# with --formula. `reachable` is `mu X. (${TARGET} || <> X)`.
+mununu context eval model.ctxdsl \
+    --formula reach_goal --automaton FSM
 ```
 
-`--template` and `--formula` are mutually exclusive. When `--template` is provided, the template is instantiated and injected as an ad-hoc formula.
+### In `verify.toml`
+
+> Source of truth: [`PropertySpec`](../crates/mununu-core/src/verify/config.rs#L307) — surface: CLI+API.
+
+```toml
+[[properties]]
+name = "goal_reachable"
+template = "reachable"
+args = { TARGET = "GoalState" }
+over = "System"
+```
+
+**`TARGET` and other `Predicate`/`State` parameters must be bare identifiers**
+(alphanumeric plus `_`) — see
+[`validate_param_value`](../crates/mununu-core/src/adapter/templates/mod.rs#L305).
+An expression is rejected:
+
+```
+template instantiation failed: parameter 'TARGET':
+  expected identifier (alphanumeric + underscore), got 'n == 2'
+```
+
+For an expression target, use the raw `formula` field instead, which takes the
+full mu-calculus expression language:
+
+```toml
+[[properties]]
+name = "counter_reaches_two"
+formula = "mu X . ((n == 2) || (<> X))"
+over = "System"
+```
 
 ### In Extraction Specs (`.espec.json`)
 

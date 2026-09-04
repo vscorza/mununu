@@ -48,11 +48,16 @@ are `w0 d0 r0 w1 d1 r1` (TSO; `d*` = store-buffer drain) or `w0 r0 w1 r1`
 `commit` edge routes to the absorbing state `BothReadZero` or `OtherOutcome`
 by the read results; `reachable(BothReadZero)` is the litmus check.
 
-**Why explicit states (not CTXDSL variables).** mununu's `verify` +
-mu-calculus path binds predicates to **state names**, not to CTXDSL variable
-*values* — `r0 == 0` atoms do not bind through the verify composition path
-(verified 2026-06-23). So the read result is encoded in the state name and
-the outcome is a dedicated state, checked by the `reachable` template.
+**Why explicit states (not CTXDSL variables).** The outcome is encoded in the
+state name and checked as a dedicated state by the `reachable` template,
+because **state-name atoms bind on every path while variable atoms do not**:
+`r0 == 0` returns `false` across a multi-source `verify` composition, and a
+`reachable` template's `TARGET` must be a bare identifier in any case, so an
+`r0 == 0` target is rejected outright. (Re-verified 2026-09-04. Variable atoms
+*do* bind on `context eval` and on a single-source `verify` project via the
+raw `formula = "…"` field — the 2026-06-23 note was correct for the composition
+path but read as though it covered all of them. Full matrix:
+[`docs/ctxdsl-modelling-guide.md`](../../../docs/ctxdsl-modelling-guide.md) §9.)
 
 ```
 v2_tso_storebuffer/

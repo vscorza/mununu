@@ -261,6 +261,7 @@ Each example ships a `verify.toml`, source files, a `validate.sh` script, and a 
 | [`uart_codesign_protocol_spec/`](https://github.com/vscorza/mununu/tree/main/examples/verify/uart_codesign_protocol_spec/) | C firmware + hand-authored CTXDSL protocol-spec peripheral |
 | [`crewai_handoff/`](https://github.com/vscorza/mununu/tree/main/examples/verify/crewai_handoff/) | Sequential 2-agent CrewAI crew |
 | [`langgraph_workflow/`](https://github.com/vscorza/mununu/tree/main/examples/verify/langgraph_workflow/) | Conditional-branching LangGraph StateGraph |
+| [`v10_mem_fabric_client_mux/`](https://github.com/vscorza/mununu/tree/main/examples/verify/v10_mem_fabric_client_mux/) | Four generated variants of one RTL design decision, with a contrast pair and a mechanism control |
 
 Reproduce any of them:
 
@@ -273,3 +274,4 @@ bash examples/verify/<example>/validate.sh
 - [Agentic Adapters](Agentic-Adapters) — CrewAI + LangGraph adapter details
 - [Adapter Formats](Adapter-Formats) — every adapter, its detection rules, and emitted CTXDSL shape
 - [Property Templates](Property-Templates) — the template catalog used by the `template = "..."` form
+- [`docs/ctxdsl-modelling-guide.md`](https://github.com/vscorza/mununu/blob/main/docs/ctxdsl-modelling-guide.md) — what binds and what silently doesn't when you hand-author a CTXDSL source: the one-comparison guard fragment, pre-state `effects`, and where `var == value` atoms bind (**they do not across a multi-source composition**)
