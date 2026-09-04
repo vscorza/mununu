@@ -454,6 +454,7 @@ Reference and how-to material — read when the task calls for it, not on every 
 - [`docs/build-recipes.md`](docs/build-recipes.md) — finer-grained `cargo` invocations beyond `make ci`.
 - [`docs/toolchain.md`](docs/toolchain.md) — Rust version pinning and clippy compatibility notes.
 - [`docs/cli-cookbook.md`](docs/cli-cookbook.md) — common `mununu` CLI invocations.
+- [`docs/ctxdsl-modelling-guide.md`](docs/ctxdsl-modelling-guide.md) — hand-authoring CTXDSL: the one-comparison `guard` fragment (`&&` silently disables the transition), pre-state `effects`, where `var == value` atoms bind vs silently evaluate *true*, and the checklist for trusting a hand-authored model. Read before writing a model with `variables`.
 - [`docs/verifying-rtl.md`](docs/verifying-rtl.md) — the property verbs (`btor2 verify` / `verify-liveness` / `verify-recoverability`), no-sidecar `sv verify-auto`, and the agent-over-HTTP integration path (with the toolchain / embedded-SVA / fragment caveats).
 - [`docs/synthesis.md`](docs/synthesis.md) — `ControllerMode`, signature-based extraction, lasso traces, Skolem-paradigm rules.
 - [`docs/abstraction.md`](docs/abstraction.md) — Per-subsystem abstraction recipe: which mununu primitive to reach for, when, what each preserves, and where automated extraction is viable vs where parameterised templates are the right pattern.

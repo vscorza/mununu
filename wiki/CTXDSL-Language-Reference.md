@@ -225,16 +225,26 @@ Groups and wildcards are expanded into individual transitions at realization tim
 
 ### Variables
 
-Automata can declare typed state variables. Supported types are `i64`, `bool`, and enum types (see [Enums](#enums)).
+Automata can declare typed state variables. Supported types are `i64`, `bool`, and enum types (see [Enums](#enums)). Each declaration starts with the `var` keyword.
 
 ```
 variables {
-    count: i64 = 0;
-    ready: bool = false;
+    var count : i64 = 0;
+    var ready : bool = false;
 }
 ```
 
 Variables are used in guard expressions and updated via effects on transitions.
+
+Three behaviours are load-bearing and easy to get wrong:
+
+- **`effects` are simultaneous and read the pre-state** -- non-blocking-assignment semantics. `effects { a = b; b = a; }` swaps; effects in one transition never see each other's writes.
+- **A `guard` accepts exactly one comparison.** `&&`, `||` and `!` inside a guard are parsed lossily and *silently disable the transition*. Conjunctions belong in mu-calculus formulas, which support the full Boolean language.
+- **Only `i64` variables bind in formula atoms.** An atom naming a `bool` variable -- or a misspelled name -- evaluates to *true* at every state, with no warning, which makes the property vacuous.
+
+Bound every variable with a guard on the transition that increments it; an unbounded variable enumerates until it hits the state cap.
+
+See [`docs/ctxdsl-modelling-guide.md`](../docs/ctxdsl-modelling-guide.md) for the full list, each entry verified against the shipped binary, plus the checklist for trusting a hand-authored model.
 
 ### Transitions
 
