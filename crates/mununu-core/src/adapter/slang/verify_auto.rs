@@ -2483,13 +2483,32 @@ pub(crate) fn verify_auto_impl(
         .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. }))
         .filter_map(|l| symbols.get(&l.nid).cloned())
         .collect();
-    // Total `state` register lines (incl. any unnamed) — a zero/low count is
-    // the headline signal that state was cut or optimized away.
-    report.diagnostics.state_register_count = file
-        .lines
-        .iter()
-        .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. }))
-        .count();
+    // Total REGISTER lines — a `state` that carries a `next` function. A zero/low
+    // count is the headline signal that state was cut or optimized away.
+    //
+    // mununu#498: a `state` with NO `next` is a free variable, not a register
+    // (Yosys emits that for `$anyseq`, i.e. every `--cutpoint`), and the engine
+    // now classifies it as an input. Counting those here would report a cut point
+    // as a register in the very diagnostic whose job is to reveal that state was
+    // cut — the count would go UP as more nets were freed. Designs without
+    // `$anyseq` are unaffected: every state has a `next`, so the number is
+    // unchanged.
+    {
+        use crate::adapter::btor2::ast::Node;
+        let with_next: std::collections::HashSet<_> = file
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Next { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        report.diagnostics.state_register_count = file
+            .lines
+            .iter()
+            .filter(|l| matches!(l.node, Node::State { .. }) && with_next.contains(&l.nid))
+            .count();
+    }
     // Init value of each state cell — pins the cube lift's initial cube to the
     // design's reset state (else it defaults to cube_0 = all-predicates-false).
     let init_values = state_cell_init_values(&file);
@@ -6290,6 +6309,102 @@ module uart_tx(); endmodule"#;
                 .iter()
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// mununu#498 REGRESSION — a `--cutpoint` must be an OVER-approximation, so no
+    /// property may flip in the unsound direction when the cut is applied.
+    ///
+    /// `cutpoint` frees a net to a Yosys `$anyseq`, which BTOR2 encodes as a `state`
+    /// with NO `next` line. Reading that as a *held register* pinned it to its
+    /// absent-therefore-zero init, so the freed net was nailed to 0: `fits` could
+    /// never be 1, the FSM never left idle, and the cut model was an
+    /// UNDER-approximation. Reported from monono's `sprite_fetch`, reduced to this
+    /// 30-line FSM, and it flipped BOTH directions at once:
+    ///
+    ///   EF (st_q == 2)  HOLDS unabstracted -> VIOLATED under the cut
+    ///   AG (st_q == 0)  VIOLATED           -> HOLDS    under the cut
+    ///
+    /// Both are asserted: an implementation that special-cased safety would pass the
+    /// `AG` half and still fail the `EF` half. The `EF 3` row is the control — a
+    /// value the FSM never assigns, VIOLATED in both models, which also confirms the
+    /// cut is not merely freeing the initial states.
+    #[test]
+    #[ignore = "requires yosys-slang (mununu-sva docker image); run with --ignored"]
+    fn e2e_cutpoint_stays_an_over_approximation_no_verdict_flips() {
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        let src = r#"// @mununu_guarantee mu Z.((st_q == 2) || <> Z)
+// @mununu_guarantee nu Y.((st_q == 0) && [] Y)
+// @mununu_guarantee mu Z.((st_q == 3) || <> Z)
+module mini_fetch (
+    input  logic clk, rst_n, req, acc, valid,
+    output logic busy
+);
+    logic [1:0]  st_q;
+    logic [10:0] left_q, spent_q;
+    logic fits;
+    assign fits = (spent_q + 11'd64) <= 11'd1024;
+    assign busy = (st_q != 2'd0);
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            st_q <= 2'd0; left_q <= 11'd0; spent_q <= 11'd0;
+        end else begin
+            case (st_q)
+                2'd0: if (req && fits) begin
+                          left_q <= 11'd64; spent_q <= spent_q + 11'd64; st_q <= 2'd1;
+                      end
+                2'd1: if (acc) st_q <= 2'd2;
+                2'd2: if (valid) begin
+                          if (left_q <= 11'd2) begin left_q <= 11'd0;          st_q <= 2'd0; end
+                          else                 begin left_q <= left_q - 11'd2; st_q <= 2'd1; end
+                      end
+                default: st_q <= 2'd0;
+            endcase
+        end
+    end
+endmodule
+"#;
+        let sources = vec![("mini_fetch.sv".to_string(), src.to_string())];
+        let opts = |cuts: Vec<String>| YosysOptions {
+            top: Some("mini_fetch".to_string()),
+            cutpoint_signals: cuts,
+            ..Default::default()
+        };
+        let vopts = || VerifyAutoOptions {
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            exact_symbolic: true,
+            config_values: std::collections::HashMap::from([("rst_n".to_string(), 1u64)]),
+            ..Default::default()
+        };
+
+        let outcomes = |r: &AutoVerifyReport| -> Vec<(String, String)> {
+            r.properties
+                .iter()
+                .filter(|p| p.name.contains("guarantee"))
+                .map(|p| (p.name.clone(), format!("{:?}", p.outcome)))
+                .collect()
+        };
+
+        let plain = verify_auto(&sources, &opts(vec![]), &vopts()).expect("verify_auto (no cut)");
+        let cut = verify_auto(
+            &sources,
+            &opts(vec!["fits".to_string(), "left_q".to_string()]),
+            &vopts(),
+        )
+        .expect("verify_auto (cut)");
+
+        let (p, c) = (outcomes(&plain), outcomes(&cut));
+        eprintln!("no-cut: {p:?}\ncut:    {c:?}");
+        assert_eq!(
+            p.len(),
+            3,
+            "all three guarantees must translate un-cut; got {p:?}"
+        );
+        assert_eq!(
+            p, c,
+            "a cut point is an OVER-approximation: no property may change verdict \
+             when it is applied. Un-cut {p:?} vs cut {c:?} — a difference here is the \
+             mununu#498 under-approximation returning."
         );
     }
 

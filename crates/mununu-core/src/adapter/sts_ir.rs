@@ -429,15 +429,45 @@ impl<'a> BtorSts<'a> {
         })
     }
 
+    /// NIDs of `state` lines that carry a `next` function.
+    ///
+    /// SOUNDNESS (mununu#498): a BTOR2 `state` with **no** `next` line is
+    /// unconstrained at every step — the format's free variable. Yosys emits
+    /// exactly that for `$anyseq`, which is what a `cutpoint` leaves behind.
+    /// Modelling it as a *held register* instead pins it to its (absent, hence
+    /// zero) init and freezes it, turning the abstraction into an
+    /// UNDER-approximation precisely where a cut point documents an
+    /// over-approximation — a freed net that can never be 1 removes behaviours
+    /// rather than adding them. So such a state is classified as an INPUT here,
+    /// which is free-each-step and quantifiable, and every consumer of this seam
+    /// inherits the correct semantics.
+    ///
+    /// `$anyconst` is a different cell and is already right: Yosys emits it as
+    /// `next(s) = s`, so it has a `next` line and stays a state (held, as
+    /// intended).
+    fn states_with_next(&self) -> std::collections::HashSet<Nid> {
+        self.file
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Next { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn vars_of(&self, want_state: bool) -> Vec<StsVar> {
         let symbols = parser::collect_symbols(self.file);
+        let with_next = self.states_with_next();
         let mut out: Vec<StsVar> = self
             .file
             .lines
             .iter()
             .filter_map(|line| {
                 let (sort, is_state) = match &line.node {
-                    Node::State { sort, .. } => (*sort, true),
+                    // A `state` with no `next` is a free variable, not a
+                    // register — see `states_with_next`.
+                    Node::State { sort, .. } => (*sort, with_next.contains(&line.nid)),
                     Node::Input { sort, .. } => (*sort, false),
                     _ => return None,
                 };
@@ -473,10 +503,16 @@ impl<'a> BtorSts<'a> {
     /// [`BddBitBlaster::build_with_keep`]: crate::adapter::btor2::symbolic_bitblast::BddBitBlaster::build_with_keep
     pub fn leaf_cells(&self) -> Result<Vec<LeafCell>, String> {
         let symbols = parser::collect_symbols(self.file);
+        let with_next = self.states_with_next();
         let mut out = Vec::new();
         for line in &self.file.lines {
             let (sort, raw, is_state, tag) = match &line.node {
-                Node::State { sort, symbol } => (*sort, symbol, true, "state"),
+                // A `state` with no `next` is a free variable, not a register —
+                // see `states_with_next`. It keeps the "state" naming tag so its
+                // symbol resolution is unchanged; only its CLASSIFICATION moves.
+                Node::State { sort, symbol } => {
+                    (*sort, symbol, with_next.contains(&line.nid), "state")
+                }
                 Node::Input { sort, symbol } => (*sort, symbol, false, "input"),
                 _ => continue,
             };

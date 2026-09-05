@@ -7462,6 +7462,124 @@ mod tests {
     /// arena during `eval_op`. The engine must degrade to a clean `Err` (→ Skipped), NEVER
     /// OoM-panic. Asserts only that a `Result` comes back — the value (Err on overflow, or Ok
     /// if it happens to fit) is immaterial; the point is no panic escapes. No env mutation.
+    /// mununu#498 — a BTOR2 `state` with NO `next` line is a FREE variable at
+    /// every step (the format's free variable; Yosys emits exactly this for
+    /// `$anyseq`, which is what `cutpoint` leaves behind). It must NOT be modelled
+    /// as a held register: doing so pins it to its absent-therefore-zero init and
+    /// freezes it, turning a cut point's documented OVER-approximation into an
+    /// UNDER-approximation.
+    ///
+    /// FSM: `st` leaves 0 only when the freed net `f` is 1.
+    ///   - `f` free  ⇒ `EF (st == 1)` HOLDS and `AG (st == 0)` VIOLATED.
+    ///   - `f` frozen at 0 (the bug) ⇒ exactly the opposite, both wrong.
+    ///
+    /// Both directions are asserted: the safety direction alone would pass an
+    /// implementation that special-cased `AG` (mununu#498 discussion).
+    const ANYSEQ_GATE: &str = r#"
+1 sort bitvec 1
+2 state 1 f
+3 state 1 st
+4 zero 1
+5 one 1
+6 ite 1 2 5 3
+7 next 1 3 6
+8 init 1 3 4
+"#;
+
+    #[test]
+    fn state_without_next_is_free_each_step_not_a_held_register() {
+        // `f` has no `next` line ⇒ free. `st` starts 0 and becomes 1 whenever f=1.
+        let reach = crate::mu_calculus::parser::parse("mu Z.((st == 1) || <> Z)").expect("parse");
+        assert_eq!(
+            exact_symbolic_verdict(ANYSEQ_GATE, &reach).expect("verdict"),
+            ExactVerdict::Holds,
+            "a state with no `next` is FREE, so the gated transition is reachable; \
+             modelling it as a register frozen at its zero init makes this VIOLATED \
+             — the mununu#498 under-approximation"
+        );
+    }
+
+    #[test]
+    fn state_without_next_does_not_freeze_a_safety_property_into_holding() {
+        // The same bug seen from the safety side: with `f` frozen at 0 the FSM never
+        // leaves 0 and `AG (st == 0)` wrongly HOLDS.
+        let ag = crate::mu_calculus::parser::parse("nu Y.((st == 0) && [] Y)").expect("parse");
+        assert_eq!(
+            exact_symbolic_verdict(ANYSEQ_GATE, &ag).expect("verdict"),
+            ExactVerdict::Violated,
+            "`st` can leave 0 because the no-`next` state is free; a HOLDS here is the \
+             mununu#498 unsound direction — a safety property passing on a model that \
+             cannot move"
+        );
+    }
+
+    #[test]
+    fn anyconst_shaped_state_with_self_next_stays_classified_as_a_register() {
+        // `$anyconst` is a DIFFERENT cell from `$anyseq` and must NOT be swept up by
+        // the mununu#498 fix: Yosys emits it as `next(k) = k`, so it HAS a next line
+        // and stays a state (held). Guards against the fix over-reaching into "every
+        // uninitialised state is free".
+        //
+        // Asserted at the CLASSIFICATION seam rather than through a verdict, on
+        // purpose: a verdict here would also depend on the SEPARATE `no init ⇒ pinned
+        // to zero` rule, which makes an `$anyconst` a constant ZERO rather than an
+        // arbitrary constant. That is its own soundness question with its own blast
+        // radius (RTL registers are legitimately pinned to their reset value), it is
+        // NOT fixed here, and entangling it would make this test assert something the
+        // fix does not claim.
+        const ANYCONST_GATE: &str = r#"
+1 sort bitvec 1
+2 state 1 k
+3 next 1 2 2
+4 state 1 st
+5 zero 1
+6 one 1
+7 ite 1 2 6 4
+8 next 1 4 7
+9 init 1 4 5
+"#;
+        let file = crate::adapter::btor2::parser::parse(ANYCONST_GATE).expect("parse");
+        let sts = crate::adapter::sts_ir::BtorSts::new(&file);
+        let cells = sts.leaf_cells().expect("leaf cells");
+        let by_name = |n: &str| cells.iter().find(|c| c.name == n).expect("cell").is_state;
+        assert!(
+            by_name("k"),
+            "an `$anyconst`-shaped state (next = itself) stays a REGISTER"
+        );
+        assert!(by_name("st"), "a normal register stays a register");
+    }
+
+    #[test]
+    fn anyseq_shaped_state_without_next_is_classified_as_an_input() {
+        // The other side of the same seam: `f` has no `next`, so it must classify as
+        // an INPUT (free each step, quantifiable) rather than a register.
+        let file = crate::adapter::btor2::parser::parse(ANYSEQ_GATE).expect("parse");
+        let sts = crate::adapter::sts_ir::BtorSts::new(&file);
+        let cells = sts.leaf_cells().expect("leaf cells");
+        let by_name = |n: &str| cells.iter().find(|c| c.name == n).expect("cell").is_state;
+        assert!(
+            !by_name("f"),
+            "a state with no `next` is a FREE variable and must classify as an input"
+        );
+        assert!(by_name("st"), "the real register is unaffected");
+        // And the seam's two views agree with the classification.
+        use crate::adapter::sts_ir::SymbolicTransitionSystem;
+        let inputs: Vec<String> = sts.input_vars().into_iter().map(|v| v.name).collect();
+        let states: Vec<String> = sts.state_vars().into_iter().map(|v| v.name).collect();
+        assert!(
+            inputs.contains(&"f".to_string()),
+            "f in input_vars: {inputs:?}"
+        );
+        assert!(
+            states.contains(&"st".to_string()),
+            "st in state_vars: {states:?}"
+        );
+        assert!(
+            !states.contains(&"f".to_string()),
+            "f must NOT be in state_vars"
+        );
+    }
+
     #[test]
     fn wide_multiplier_bails_gracefully_never_panics() {
         const MUL40: &str = r#"
