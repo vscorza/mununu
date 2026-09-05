@@ -1594,7 +1594,10 @@ mod tests {
     #[test]
     #[ignore]
     fn spcr_applicability_probe_over_dir() {
-        let dir = std::env::var("MUNUNU_SPCR_PROBE_DIR").expect("set MUNUNU_SPCR_PROBE_DIR");
+        let Ok(dir) = std::env::var("MUNUNU_SPCR_PROBE_DIR") else {
+            eprintln!("SKIPPED: opt-in probe — set MUNUNU_SPCR_PROBE_DIR to run it.");
+            return;
+        };
         let mut total = 0usize;
         let mut no_array = 0usize;
         let mut applied: Vec<(String, usize)> = Vec::new();

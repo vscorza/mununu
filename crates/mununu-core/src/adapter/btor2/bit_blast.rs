@@ -6451,7 +6451,13 @@ mod tests {
         use crate::adapter::btor2::dep_graph::cone_leaf_nids;
         use std::collections::{BTreeMap, HashMap, HashSet};
 
-        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let Ok(path) = std::env::var("MUNUNU_PROBE_BTOR2") else {
+            eprintln!(
+                "SKIPPED: this is an opt-in measurement probe, not an assertion — set \
+                 MUNUNU_PROBE_BTOR2=<design.btor2> to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read btor2");
         let file = parser::parse(&content).expect("parse btor2");
         let atoms: Vec<String> = std::env::var("MUNUNU_PROBE_ATOMS")
@@ -6736,7 +6742,13 @@ mod tests {
         use crate::adapter::btor2::dep_graph::cone_leaf_nids;
         use std::collections::{HashMap, HashSet};
 
-        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let Ok(path) = std::env::var("MUNUNU_PROBE_BTOR2") else {
+            eprintln!(
+                "SKIPPED: this is an opt-in measurement probe, not an assertion — set \
+                 MUNUNU_PROBE_BTOR2=<design.btor2> to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read btor2");
         let file = parser::parse(&content).expect("parse btor2");
         let atoms: Vec<String> = std::env::var("MUNUNU_PROBE_ATOMS")
@@ -7004,7 +7016,13 @@ mod tests {
     #[test]
     #[ignore = "MK.0 cross-check — set MUNUNU_PROBE_BTOR2 + MUNUNU_PROBE_GOOD"]
     fn probe_recoverability_bot_diagnosis() {
-        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let Ok(path) = std::env::var("MUNUNU_PROBE_BTOR2") else {
+            eprintln!(
+                "SKIPPED: this is an opt-in measurement probe, not an assertion — set \
+                 MUNUNU_PROBE_BTOR2=<design.btor2> to run it."
+            );
+            return;
+        };
         let good = std::env::var("MUNUNU_PROBE_GOOD").expect("set MUNUNU_PROBE_GOOD");
         let content = std::fs::read_to_string(&path).expect("read btor2");
         let verdict =
@@ -7210,7 +7228,13 @@ mod tests {
     #[ignore = "measurement — real-design structural automaton size"]
     fn measure_structural_automaton_size() {
         use crate::adapter::btor2::ast::{Node, Op};
-        let path = std::env::var("MUNUNU_PROBE_BTOR2").expect("set MUNUNU_PROBE_BTOR2");
+        let Ok(path) = std::env::var("MUNUNU_PROBE_BTOR2") else {
+            eprintln!(
+                "SKIPPED: this is an opt-in measurement probe, not an assertion — set \
+                 MUNUNU_PROBE_BTOR2=<design.btor2> to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read btor2");
         let file = parser::parse(&content).expect("parse btor2");
 

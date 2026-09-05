@@ -898,7 +898,10 @@ mod tests {
     #[test]
     #[ignore = "owned-only HWMCC ceiling sweep; set MUNUNU_HWMCC_FLAT (+ optional MUNUNU_HWMCC_GT), MUNUNU_OWNED_TIMEOUT_MS default 240000"]
     fn owned_only_hwmcc_ceiling() {
-        let flat = std::env::var("MUNUNU_HWMCC_FLAT").expect("set MUNUNU_HWMCC_FLAT");
+        let Ok(flat) = std::env::var("MUNUNU_HWMCC_FLAT") else {
+            eprintln!("SKIPPED: external-corpus sweep — set MUNUNU_HWMCC_FLAT to run it.");
+            return;
+        };
         let to_ms: u32 = std::env::var("MUNUNU_OWNED_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())

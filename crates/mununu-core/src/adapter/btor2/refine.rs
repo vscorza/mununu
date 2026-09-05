@@ -1066,6 +1066,16 @@ mod tests {
     #[test]
     #[ignore = "requires MathSAT (mununu-sva image); run with --ignored + MUNUNU_MATHSAT_PATH"]
     fn must_precondition_resolves_combinational_good() {
+        // MathSAT is not in the `mununu-sva` image (it ships in `mununu-sva-pono`).
+        // Skip rather than fail: an absent optional tool is not a regression, and a
+        // red result here masks the genuine failures in the `--ignored` sweep.
+        if crate::adapter::btor2::native_interp::mathsat_available().is_err() {
+            eprintln!(
+                "SKIPPED: MathSAT unavailable — run in `mununu-sva-pono` or set \
+                 MUNUNU_MATHSAT_PATH."
+            );
+            return;
+        }
         use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
         const D: &str = "1 sort bitvec 1\n2 sort bitvec 3\n3 state 1 busy\n4 state 2 data\n\
 5 state 2 target\n6 one 1\n7 zero 1\n8 zero 2\n9 one 2\n10 init 1 3 6\n11 init 2 4 8\n\
@@ -1104,7 +1114,10 @@ mod tests {
     #[test]
     #[ignore = "sweeps an external BTOR2 dir named by MUNUNU_DISCOVER_DIR"]
     fn sweep_discovery_on_external_designs() {
-        let dir = std::env::var("MUNUNU_DISCOVER_DIR").expect("set MUNUNU_DISCOVER_DIR");
+        let Ok(dir) = std::env::var("MUNUNU_DISCOVER_DIR") else {
+            eprintln!("SKIPPED: opt-in sweep — set MUNUNU_DISCOVER_DIR to run it.");
+            return;
+        };
         let max_bytes: u64 = std::env::var("MUNUNU_DISCOVER_MAXBYTES")
             .ok()
             .and_then(|s| s.parse().ok())

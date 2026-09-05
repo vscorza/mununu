@@ -801,6 +801,16 @@ pub(crate) fn run_cvc5_raw(query: &str, timeout_ms: u32) -> Result<String, Strin
 /// `locate_tool` (which invokes `--version`), MathSAT uses `-version` (single dash), so this does
 /// a light `-version` probe purely to confirm the binary is invokable; the actual interpolation
 /// query surfaces any real problem as an `Err`.
+/// Is MathSAT invokable? The optional-tool gate for tests that need it: MathSAT
+/// ships in the `mununu-sva-pono` image, not `mununu-sva`, so a test that requires
+/// it must SKIP rather than fail when it is absent — an absent optional tool is not
+/// a regression, and a red result masks the genuine failures in the `--ignored`
+/// sweep (mununu#498 follow-up).
+#[cfg(test)]
+pub(crate) fn mathsat_available() -> Result<(), String> {
+    locate_mathsat().map(|_| ())
+}
+
 fn locate_mathsat() -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
     let path = std::env::var("MUNUNU_MATHSAT_PATH")
@@ -1053,8 +1063,16 @@ mod tests {
     #[test]
     #[ignore = "sweeps the external HWMCC corpus named by MUNUNU_HWMCC_GT/FLAT"]
     fn differential_soundness_hwmcc() {
-        let gt_path = std::env::var("MUNUNU_HWMCC_GT").expect("set MUNUNU_HWMCC_GT");
-        let flat = std::env::var("MUNUNU_HWMCC_FLAT").expect("set MUNUNU_HWMCC_FLAT");
+        let (Ok(gt_path), Ok(flat)) = (
+            std::env::var("MUNUNU_HWMCC_GT"),
+            std::env::var("MUNUNU_HWMCC_FLAT"),
+        ) else {
+            eprintln!(
+                "SKIPPED: external-corpus differential sweep — set MUNUNU_HWMCC_GT and \
+                 MUNUNU_HWMCC_FLAT to run it."
+            );
+            return;
+        };
         let max_bytes: u64 = std::env::var("MUNUNU_HWMCC_MAXBYTES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1123,8 +1141,12 @@ mod tests {
     #[test]
     #[ignore = "reads an external BTOR2 file named by MUNUNU_INTERP_PROBE"]
     fn probe_safety_verdict_on_external_design() {
-        let path = std::env::var("MUNUNU_INTERP_PROBE")
-            .expect("set MUNUNU_INTERP_PROBE=/path/to/design.btor2");
+        let Ok(path) = std::env::var("MUNUNU_INTERP_PROBE") else {
+            eprintln!(
+                "SKIPPED: opt-in probe — set MUNUNU_INTERP_PROBE=/path/to/design.btor2 to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read design");
         let file = parser::parse(&content).expect("parse btor2");
         let env_u = |k: &str, d: u32| {
@@ -1160,8 +1182,12 @@ mod tests {
     #[test]
     #[ignore = "reads an external BTOR2 file named by MUNUNU_INTERP_PROBE"]
     fn probe_one_step_interpolant_on_external_design() {
-        let path = std::env::var("MUNUNU_INTERP_PROBE")
-            .expect("set MUNUNU_INTERP_PROBE=/path/to/design.btor2");
+        let Ok(path) = std::env::var("MUNUNU_INTERP_PROBE") else {
+            eprintln!(
+                "SKIPPED: opt-in probe — set MUNUNU_INTERP_PROBE=/path/to/design.btor2 to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read design");
         let file = parser::parse(&content).expect("parse btor2");
         match one_step_interpolant(&file) {

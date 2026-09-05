@@ -1177,8 +1177,12 @@ mod tests {
     #[test]
     #[ignore = "reads an external BTOR2 file named by MUNUNU_INTERP_PROBE"]
     fn probe_ic3_on_external_design() {
-        let path = std::env::var("MUNUNU_INTERP_PROBE")
-            .expect("set MUNUNU_INTERP_PROBE=/path/to/design.btor2");
+        let Ok(path) = std::env::var("MUNUNU_INTERP_PROBE") else {
+            eprintln!(
+                "SKIPPED: opt-in probe — set MUNUNU_INTERP_PROBE=/path/to/design.btor2 to run it."
+            );
+            return;
+        };
         let content = std::fs::read_to_string(&path).expect("read design");
         let file = parser::parse(&content).expect("parse btor2");
         let eu = |k: &str, d: u32| {
