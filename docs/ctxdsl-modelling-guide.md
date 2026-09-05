@@ -352,6 +352,121 @@ the CLI answer looked conclusive. A `--help` that lacks a subcommand is
 evidence about **your binary**, not about the tool. Rebuild before you file
 drift.
 
+---
+
+# Part II — modelling traps: what your abstraction asserts
+
+Everything above is about what the **tool** does silently. These two are about
+what your **model** claims. Neither is a language feature or a bug; both are
+choices that look like ordinary abstraction and are not, and each one cost a
+real design real time (mununu#496, mununu#497).
+
+They share a shape with the composition gotcha in
+[Composition](../wiki/Composition.md#key-gotchas) — *a shared label the component
+cannot take is a label the environment cannot emit, silently.* In all three
+cases the model does not **miss** the bug. It **assumes it away**, and then
+reports a clean verdict about a system that is not yours.
+
+## A. The atomic-action trap
+
+**An action modelled as one transition asserts that every resource it uses is
+held, unchanged, for exactly that step.**
+
+A `fill` label meaning *"the fetcher lands this line's row into the stage"* is a
+single transition. Nothing can happen "during" it, because there is no during —
+so a payload that changes mid-fill is not a behaviour the model failed to
+explore. It is a behaviour the model declared impossible.
+
+> **The rule: if the RTL can do anything between the start and the end of your
+> label, your label is wrong.**
+
+The remedy is a pattern, not a feature. Any resource with a handshake wants
+**`acquire → use* → release`** as separate labels, with the payload's identity
+carried in the automaton's *state* across the `use*`:
+
+```
+// WRONG — one transition, so "during the fill" does not exist.
+automaton Atomic {
+    states { state Idle initial; state Done; }
+    transitions {
+        transition Idle -> Done on label fill;
+        transition Done -> Done on label sink;
+    }
+}
+
+// RIGHT — the fill is open across the writes, and `src` records WHICH payload
+// the line was acquired for, so a mid-fill change is expressible.
+automaton Handshake {
+    controllable { }
+    variables { var src : i64 = 0; var live : i64 = 0; }
+    states { state Reset initial; state Free; state Held; }
+    transitions {
+        transition Reset -> Free  on label boot;
+        transition Free  -> Held  on label acquire effects { src = live; };
+        transition Held  -> Held  on label write;
+        transition Held  -> Free  on label release;
+        // The environment may re-point the payload mid-fill.
+        transition Held  -> Held  on label payload_change effects { live = 1; };
+        transition Free  -> Free  on label payload_change effects { live = 1; };
+    }
+}
+```
+
+The torn fill is now a reachable state rather than an inexpressible one:
+
+```
+formula torn_fill { over Handshake; body = mu X . ((Held && (src != live)) || (<> X)); }
+formula ctl_neg   { over Handshake; body = mu X . ((src == 9)             || (<> X)); }
+```
+
+```
+torn_fill   Initial states satisfying: 1/1     <- the bug is expressible, and reachable
+ctl_neg     Initial states satisfying: 0/1     <- and the atom channel is live (§3)
+```
+
+In the `Atomic` automaton there is no formula that states this property at all —
+which is the tell. **If you cannot write the negative, you have not abstracted
+the bug away, you have defined it out of the language.**
+
+## B. `N = 1` is not an abstraction of `N` — it is a different system
+
+**Collapsing a multiplicity to one deletes the entire class of "two parties
+disagree about which one".**
+
+A model with one implicit slot cannot state *two words disagreeing about which
+slot they belong to*, because stating it needs at least two slots. Reducing `N`
+to 1 feels like ordinary abstraction — the same move as dropping a data width —
+and it is not the same move at all: it removes most of what a shared-resource
+model is **for**.
+
+> **`N = 2` is the smallest honest number wherever identity matters.** One
+> slot models a resource; two model a resource people can disagree about.
+
+The cost is usually small — a second slot squares a small state space, not a
+large one — and the payoff is the whole mis-routing / mis-pairing / mis-arbitration
+class. If you genuinely only ever have one, say so as a *comment declaring the
+assumption*, so a later reader knows the model is silent on identity rather than
+clean about it.
+
+This is why the worked example in
+[`v10_mem_fabric_client_mux`](../examples/verify/v10_mem_fabric_client_mux/README.md)
+carries a four-word stream rather than a one-word one: a duplicate needs two
+words to state, and a skip needs a dropped word *and its successor*.
+
+## What CTXDSL correctly does not do
+
+Recorded so the technique is not oversold. **CTXDSL models carry no data**, so a
+data-placement fault — a bank shifted by one halfword, a byte lane swapped, an
+endianness flip — is out of scope, and no amount of modelling discipline will
+catch it here. That is not a gap to close: dropping data is exactly what makes
+these models cheap enough to write *before* the RTL, which is where their value
+is. Data-placement faults want a different instrument — rebuilding the image
+from the design's own returns and diffing it against the source, or the
+structural `sv lint` rules in
+[`verifying-rtl.md`](verifying-rtl.md#preflight-sv-lint--structural-faults-refused-at-write-time).
+
+---
+
 ## Checklist before trusting a hand-authored model
 
 1. No `&&` / `||` / `!` inside any `guard`. (§1)
@@ -365,3 +480,5 @@ drift.
 8. A control that *removes* the mechanism you believe causes the bug, and
    makes the verdict flip. (see
    [`v10`'s strict-schedule control](../examples/verify/v10_mem_fabric_client_mux/README.md))
+9. No label spans an interval in which the RTL can act. (Part II §A)
+10. Any multiplicity where identity matters is at least 2. (Part II §B)
