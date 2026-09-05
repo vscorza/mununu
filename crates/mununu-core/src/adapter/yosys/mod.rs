@@ -255,7 +255,22 @@ pub struct YosysOptions {
     /// **SOUNDNESS — this is an OVER-APPROXIMATION.** A freed net becomes
     /// nondeterministic, which only *adds* transitions. A definite HOLDS
     /// therefore transfers to the concrete RTL (safety + over-approx =
-    /// sound). A definite VIOLATED is sound only when the counterexample
+    /// sound).
+    ///
+    /// That claim was **false in practice until mununu#498**: `cutpoint`
+    /// emits the freed net as a Yosys `$anyseq`, which BTOR2 encodes as a
+    /// `state` with no `next` line, and the engines read such a state as a
+    /// *held register* pinned to its (absent, therefore zero) init. The
+    /// freed net was nailed to 0 — an UNDER-approximation, the exact
+    /// opposite of what this paragraph promises, so a cut could turn a
+    /// concretely-false safety property into `HOLDS`. A `state` with no
+    /// `next` is now classified as a free input at the STS-IR seam
+    /// (`BtorSts::states_with_next`), and
+    /// `e2e_cutpoint_stays_an_over_approximation_no_verdict_flips` pins the
+    /// guarantee end-to-end: no property may change verdict when a cut is
+    /// applied to the reduced `mini_fetch` FSM.
+    ///
+    /// A definite VIOLATED is sound only when the counterexample
     /// is guard-independent — the canonical case being an *orphaned* FSM
     /// state (in-degree 0), which no freed guard can make reachable, so
     /// `AG EF <orphaned-state>` stays soundly VIOLATED. A general VIOLATED
