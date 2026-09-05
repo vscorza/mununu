@@ -2633,6 +2633,16 @@ mod tests {
     #[test]
     #[ignore = "requires MathSAT (mununu-sva image); run with --ignored + MUNUNU_MATHSAT_PATH"]
     fn e2e_craig_must_precondition_decides_emergent_recoverability() {
+        // MathSAT is not in the `mununu-sva` image (it ships in `mununu-sva-pono`).
+        // Skip rather than fail: an absent optional tool is not a regression, and a
+        // red result here masks the genuine failures in the `--ignored` sweep.
+        if crate::adapter::btor2::native_interp::mathsat_available().is_err() {
+            eprintln!(
+                "SKIPPED: MathSAT unavailable — run in `mununu-sva-pono` or set \
+                 MUNUNU_MATHSAT_PATH."
+            );
+            return;
+        }
         use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference};
         use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
         const D: &str = "1 sort bitvec 1\n2 sort bitvec 3\n3 state 1 busy\n4 state 2 data\n\
