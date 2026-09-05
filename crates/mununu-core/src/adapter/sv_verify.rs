@@ -194,16 +194,53 @@ impl SvLintSignalKind {
     }
 }
 
-/// One `sv lint` finding — a named signal whose lift the engine cannot keep
-/// faithfully (monono#partsel): its cone reaches an ANONYMOUS free input, so a
-/// state predicate over it would be *refused* (skipped) by the verifier rather
-/// than mis-decided. See [`sv_lint_registers`].
+/// Which structural check produced a finding. Serialised as a stable
+/// lowercase-kebab tag on the CLI JSON / API / UI surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SvLintRule {
+    /// monono#partsel — the register's lift reaches an anonymous free input, so
+    /// a state predicate over it is *refused* by the verifier.
+    UndrivenPartialWrite,
+    /// mununu#496 — a registered array read (`q <= mem[a_q];`) whose address
+    /// register can change in the same cycle `q` is consumed, with no register
+    /// recording which address the current `q` corresponds to.
+    RegisteredArrayReadMovingAddress,
+}
+
+impl SvLintRule {
+    /// The stable tag used across the CLI JSON / API / UI surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SvLintRule::UndrivenPartialWrite => "undriven-partial-write",
+            SvLintRule::RegisteredArrayReadMovingAddress => "registered-array-read-moving-address",
+        }
+    }
+}
+
+/// One `sv lint` finding — a named signal a structural check flagged. See
+/// [`SvLintRule`] for what each check means and [`sv_lint_registers`] for the
+/// entry point.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SvLintFinding {
     /// The offending signal's symbol (register name or the combinational output).
     pub signal: String,
     /// Whether `signal` is the register itself or a downstream output.
     pub kind: SvLintSignalKind,
+    /// Which check fired. Defaults to the partial-write rule so an older
+    /// consumer deserialising a finding without the field keeps working.
+    #[serde(default = "SvLintFinding::default_rule")]
+    pub rule: SvLintRule,
+    /// Human-readable specifics — for the array-read rule, the address register
+    /// and why it is unsafe. Empty for rules that need no elaboration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl SvLintFinding {
+    fn default_rule() -> SvLintRule {
+        SvLintRule::UndrivenPartialWrite
+    }
 }
 
 /// `sv lint` — lift SV and report, at CI time (~lift cost, no bit-blast / no
@@ -227,7 +264,10 @@ pub struct SvLintFinding {
 /// a register alias and an output is reported once, as a `Register`.
 pub fn sv_lint_registers(lift: &SvLift) -> Result<Vec<SvLintFinding>, String> {
     let btor2 = lift.lift()?;
-    lint_undriven_partial_writes(&btor2)
+    let mut findings = lint_undriven_partial_writes(&btor2)?;
+    findings.extend(lint_registered_array_read_moving_address(&btor2)?);
+    findings.sort_by(|a, b| (a.rule.as_str(), &a.signal).cmp(&(b.rule.as_str(), &b.signal)));
+    Ok(findings)
 }
 
 /// The pure BTOR2 core of [`sv_lint_registers`] — parse the flattened design and
@@ -289,8 +329,169 @@ fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, Strin
     Ok(kinds
         .into_iter()
         .filter(|(name, _)| signal_reaches_anonymous_input(&file, name))
-        .map(|(signal, kind)| SvLintFinding { signal, kind })
+        .map(|(signal, kind)| SvLintFinding {
+            signal,
+            kind,
+            rule: SvLintRule::UndrivenPartialWrite,
+            detail: String::new(),
+        })
         .collect())
+}
+
+/// mununu#496 — flag a **registered array read whose address register can change
+/// in the same cycle its data is consumed**, with nothing recording which address
+/// the current data corresponds to.
+///
+/// The shape, in RTL:
+///
+/// ```systemverilog
+/// always_ff @(posedge clk) begin
+///     if (advance) a_q <= a_q + 1;   // the address register moves
+///     q <= mem[a_q];                 // registered read against it
+/// end
+/// ```
+///
+/// `q` holds the word at the address `a_q` held *last* cycle, but a consumer
+/// reading `q` alongside the live `a_q` sees a pair that never coexisted. monono
+/// hit this twice in the same block — the second time with a prose rule against
+/// it in force — shipping a 2 KB sprite bank shifted by one halfword. Prose did
+/// not prevent the recurrence; this check is the structural refusal.
+///
+/// In BTOR2 the fault is three facts about one `next`:
+///
+/// ```text
+/// 8  state 7 a_q          the address register
+/// 11 read 4 10 8          read(mem, a_q)
+/// 12 next 4 5 11          q <= read(...)        <- registered array read
+/// 17 next 7 8 16          a_q <= (moving)       <- and the address moves
+/// ```
+///
+/// **The satisfying form** registers the address alongside the data, so some
+/// register captures `a_q` in the very cycle the read is issued:
+///
+/// ```text
+/// 11 next 4 5 10          a_d <= a_q            <- the tracking signal
+/// ```
+///
+/// So the check is: a registered read whose address is a *mutable* register and
+/// for which **no** register's `next` is that address register. Like the existing
+/// lift-form checks, it is satisfiable by writing the supported form — here, by
+/// naming the tracking signal. Purely structural: no bit-blast, no properties, no
+/// environment.
+fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFinding>, String> {
+    use crate::adapter::btor2::ast::{Node, Op};
+
+    let file = parser::parse(btor2).map_err(|e| format!("BTOR2 parse: {e}"))?;
+
+    // `next` edges, indexed by the state they drive, plus the set of state nids
+    // that some OTHER register captures verbatim (`t <= a`) — the tracking
+    // signals that satisfy the rule.
+    let mut next_of: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut tracked: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Next { state, value, .. } = &line.node {
+            next_of.insert(*state, value.nid());
+            // `t <= a` where a is a *different* state: a records which `a` the
+            // current cycle used. A register's own hold (`a <= a`) is not tracking.
+            if *state != value.nid()
+                && matches!(node_of(&file, value.nid()), Some(Node::State { .. }))
+            {
+                tracked.insert(value.nid());
+            }
+        }
+    }
+
+    // A state's display name: its own symbol, else a `uext … 0 NAME` alias, else
+    // an `output` that names it. Mirrors how the partial-write lint recovers names.
+    let name_of = |nid: i64| -> Option<String> {
+        if let Some(Node::State {
+            symbol: Some(s), ..
+        }) = node_of(&file, nid)
+        {
+            return Some(s.clone());
+        }
+        for line in &file.lines {
+            match &line.node {
+                Node::Output {
+                    signal,
+                    symbol: Some(s),
+                } if signal.nid() == nid => {
+                    return Some(s.clone());
+                }
+                Node::Op {
+                    symbol: Some(s),
+                    args,
+                    ..
+                } if args.first().map(|a| a.nid()) == Some(nid) => {
+                    return Some(s.clone());
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+
+    let mut findings = Vec::new();
+    for line in &file.lines {
+        let Node::Next { state, value, .. } = &line.node else {
+            continue;
+        };
+        // Is this register's next value an array read?
+        let Some(Node::Op {
+            op: Op::Read, args, ..
+        }) = node_of(&file, value.nid())
+        else {
+            continue;
+        };
+        // `read <sort> <array> <index>` — the address is the second operand.
+        let Some(addr) = args.get(1).map(|a| a.nid()) else {
+            continue;
+        };
+        // The address must itself be a register. An address that is a pure input
+        // or a combinational function of inputs has no "moving register" to
+        // mis-pair with, so it is out of scope for this rule.
+        if !matches!(node_of(&file, addr), Some(Node::State { .. })) {
+            continue;
+        }
+        // Does the address actually move? A register held constant (`a <= a`, or
+        // no `next` at all) can never be mis-paired.
+        let moves = next_of.get(&addr).is_some_and(|v| *v != addr);
+        if !moves {
+            continue;
+        }
+        // Satisfied if some register captures the address in the same cycle.
+        if tracked.contains(&addr) {
+            continue;
+        }
+
+        let data = name_of(*state).unwrap_or_else(|| format!("<nid {state}>"));
+        let address = name_of(addr).unwrap_or_else(|| format!("<nid {addr}>"));
+        findings.push(SvLintFinding {
+            signal: data.clone(),
+            kind: SvLintSignalKind::Register,
+            rule: SvLintRule::RegisteredArrayReadMovingAddress,
+            detail: format!(
+                "`{data}` is a registered array read addressed by `{address}`, which can change \
+                 in the same cycle `{data}` is consumed, and no register captures `{address}` \
+                 alongside it — so `{data}` and the live `{address}` are a pair that never \
+                 coexisted. Register the address alongside the data — add a register that \
+                 captures `{address}` in the same cycle as the read — and consume that instead \
+                 of the live `{address}`."
+            ),
+        });
+    }
+
+    findings.sort_by(|a, b| a.signal.cmp(&b.signal));
+    findings.dedup_by(|a, b| a.signal == b.signal);
+    Ok(findings)
+}
+
+/// Borrow the `Node` at `nid`, if the file declares it.
+fn node_of(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    nid: i64,
+) -> Option<&crate::adapter::btor2::ast::Node> {
+    file.lookup(nid).map(|l| &l.node)
 }
 
 #[cfg(test)]
@@ -323,6 +524,118 @@ mod tests {
     fn recoverability_rejects_malformed_target_before_lift() {
         let e = sv_verify_recoverability(&lift_of("module m; endmodule"), "not an atom !!");
         assert!(e.is_err(), "a malformed target must be rejected pre-lift");
+    }
+
+    // mununu#496 lint core — the yosys-slang lift (Yosys 0.60+70, slang plugin, in
+    // the pinned `mununu-sva` image) of a registered array read, captured verbatim
+    // so the regression runs in make-ci without slang.
+    //
+    //     always_ff @(posedge clk) begin
+    //         if (advance) a_q <= a_q + 8'd1;   // the address register moves
+    //         q <= mem[a_q];                    // registered read against it
+    //     end
+    //
+    // `12 next 4 5 11` is the registered read (`11 read 4 10 8` = mem[a_q]) and
+    // `17 next 7 8 16` is `a_q` moving. Nothing captures `a_q` alongside `q`, so
+    // `q` and the live `a_q` are a pair that never coexisted.
+    const SLANG_REGISTERED_READ_MOVING_ADDR: &str = r#"1 sort bitvec 1
+2 input 1 advance
+3 input 1 clk
+4 sort bitvec 16
+5 state 4
+6 output 5 q
+7 sort bitvec 8
+8 state 7 a_q
+9 sort array 7 4
+10 state 9 mem
+11 read 4 10 8
+12 next 4 5 11
+13 const 1 1
+14 uext 7 13 7
+15 add 7 8 14
+16 ite 7 2 15 8
+17 next 7 8 16
+18 next 9 10 10 mem
+"#;
+
+    // The SATISFYING form, same lift path: the address is registered ALONGSIDE the
+    // data (`a_d <= a_q`, nid `11 next 4 5 10`), so a consumer can tell which
+    // address the current `q` corresponds to. Same read, same moving address — the
+    // only difference is the tracking register, which is exactly what the rule asks
+    // for. This is the contrast twin: a check that flags this too is useless.
+    const SLANG_REGISTERED_READ_TRACKED: &str = r#"1 sort bitvec 1
+2 input 1 advance
+3 input 1 clk
+4 sort bitvec 8
+5 state 4
+6 output 5 a_d
+7 sort bitvec 16
+8 state 7
+9 output 8 q
+10 state 4 a_q
+11 next 4 5 10
+12 sort array 4 7
+13 state 12 mem
+14 read 7 13 10
+15 next 7 8 14
+16 const 1 1
+17 uext 4 16 7
+18 add 4 10 17
+19 ite 4 2 18 10
+20 next 4 10 19
+21 next 12 13 13 mem
+"#;
+
+    #[test]
+    fn flags_registered_array_read_against_a_moving_address() {
+        let f = lint_registered_array_read_moving_address(SLANG_REGISTERED_READ_MOVING_ADDR)
+            .expect("lint");
+        assert_eq!(f.len(), 1, "expected exactly one finding, got {f:?}");
+        assert_eq!(f[0].signal, "q");
+        assert_eq!(f[0].rule, SvLintRule::RegisteredArrayReadMovingAddress);
+        assert!(
+            f[0].detail.contains("a_q"),
+            "the finding must name the address register: {}",
+            f[0].detail
+        );
+    }
+
+    #[test]
+    fn registering_the_address_alongside_the_data_satisfies_the_rule() {
+        let f =
+            lint_registered_array_read_moving_address(SLANG_REGISTERED_READ_TRACKED).expect("lint");
+        assert!(
+            f.is_empty(),
+            "the tracked form must NOT be flagged — the rule is satisfiable by naming \
+             the tracking signal; got {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_address_register_is_not_flagged() {
+        // Same registered read, but `a_q` never changes (`next` is itself), so `q`
+        // and the live `a_q` can never disagree. No finding.
+        let held = SLANG_REGISTERED_READ_MOVING_ADDR.replace("17 next 7 8 16", "17 next 7 8 8");
+        let f = lint_registered_array_read_moving_address(&held).expect("lint");
+        assert!(
+            f.is_empty(),
+            "a register whose address is held constant cannot be mis-paired; got {f:?}"
+        );
+    }
+
+    #[test]
+    fn the_partial_write_rule_is_unaffected_by_the_array_read_rule() {
+        // The two checks are independent: neither fixture trips the other rule.
+        let a = lint_undriven_partial_writes(SLANG_REGISTERED_READ_MOVING_ADDR).expect("lint");
+        assert!(
+            a.is_empty(),
+            "array-read fixture must not trip partsel: {a:?}"
+        );
+        let b = lint_registered_array_read_moving_address(SLANG_PARTSEL_LIFT).expect("lint");
+        assert!(
+            b.is_empty(),
+            "partsel fixture must not trip array-read: {b:?}"
+        );
     }
 
     // monono#partsel lint core — the yosys-slang lift of a plain-vector partial
@@ -559,6 +872,80 @@ endmodule
         assert!(
             !names.contains(&"b_q"),
             "the fully-written register b_q is faithful and must NOT be flagged; got {names:?}"
+        );
+    }
+
+    /// mununu#496 end-to-end, through the REAL slang lift: the faulty form is
+    /// flagged and its satisfying twin is not. The unit tests above pin the
+    /// structural query against captured BTOR2; this pins the *lift* — that
+    /// yosys-slang really does emit `next(q) = read(mem, a_q)` with `a_q` carrying
+    /// its own moving `next`, which is the shape the query depends on.
+    ///
+    /// Run in the pinned image (host has no slang):
+    ///   docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target -w /work \
+    ///     mununu-sva cargo test -p mununu-core --lib e2e_sv_lint_registered_array -- --ignored
+    #[test]
+    #[ignore = "requires yosys-slang (mununu-sva docker image); run with --ignored"]
+    fn e2e_sv_lint_registered_array_read_moving_address() {
+        const BAD: &str = r#"module rom_bad (
+  input  logic        clk,
+  input  logic        advance,
+  output logic [15:0] q
+);
+  logic [15:0] mem [0:255];
+  logic [7:0]  a_q;
+  always_ff @(posedge clk) begin
+    if (advance) a_q <= a_q + 8'd1;
+    q <= mem[a_q];
+  end
+endmodule
+"#;
+        // Identical, plus the tracking register the rule asks for.
+        const OK: &str = r#"module rom_ok (
+  input  logic        clk,
+  input  logic        advance,
+  output logic [15:0] q,
+  output logic [7:0]  a_d
+);
+  logic [15:0] mem [0:255];
+  logic [7:0]  a_q;
+  always_ff @(posedge clk) begin
+    if (advance) a_q <= a_q + 8'd1;
+    q   <= mem[a_q];
+    a_d <= a_q;
+  end
+endmodule
+"#;
+        let lift_of = |src: &str, top: &str| SvLift {
+            source: src.to_string(),
+            additional_sources: Vec::new(),
+            top: Some(top.into()),
+            use_sv2v: false,
+            include_dirs: Vec::new(),
+            frontend: SvFrontend::Slang,
+        };
+
+        let bad = sv_lint_registers(&lift_of(BAD, "rom_bad")).expect("lint lifts rom_bad");
+        let hit: Vec<_> = bad
+            .iter()
+            .filter(|f| f.rule == SvLintRule::RegisteredArrayReadMovingAddress)
+            .collect();
+        assert_eq!(
+            hit.len(),
+            1,
+            "the registered read against a moving address must be flagged; got {bad:?}"
+        );
+        assert!(
+            hit[0].detail.contains("a_q"),
+            "the finding must name the address register; got {}",
+            hit[0].detail
+        );
+
+        let ok = sv_lint_registers(&lift_of(OK, "rom_ok")).expect("lint lifts rom_ok");
+        assert!(
+            ok.iter()
+                .all(|f| f.rule != SvLintRule::RegisteredArrayReadMovingAddress),
+            "registering the address alongside the data satisfies the rule; got {ok:?}"
         );
     }
 

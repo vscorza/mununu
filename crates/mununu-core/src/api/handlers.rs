@@ -1452,6 +1452,8 @@ fn sv_lint_handler_impl(request: SvLintRequest) -> ApiResult<Json<SvLintResponse
         .map(|f| SvLintFinding {
             signal: f.signal,
             kind: f.kind.as_str().to_string(),
+            rule: f.rule.as_str().to_string(),
+            detail: f.detail,
         })
         .collect::<Vec<_>>();
 

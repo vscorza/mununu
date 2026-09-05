@@ -102,7 +102,12 @@ When `--predicate-source craig` is selected but CVC5 isn't found at runtime, mun
 
 > Source of truth: [`sv_lint_registers`](../crates/mununu-core/src/adapter/sv_verify.rs#L228) — surface: (CLI+API+UI)
 
-`mununu sv lint` lifts a SystemVerilog design and reports — at CI time (~lift cost, **no** model checking, ~0.1 s) — every register whose partial-write lift the verifier cannot keep faithfully (a plain-vector `q[hi:lo] <= d` whose unwritten bits the front end models as free inputs). These are exactly the registers a state predicate would be *refused* on by the formal gate, surfaced *before* the minutes-long verify. It changes no verdict.
+`mununu sv lint` lifts a SystemVerilog design and runs purely structural checks — at CI time (~lift cost, **no** model checking, ~0.1 s). Each finding carries a `rule` tag:
+
+- `undriven-partial-write` — a plain-vector `q[hi:lo] <= d` whose unwritten bits the front end models as free inputs. These are exactly the registers a state predicate would be *refused* on by the formal gate, surfaced *before* the minutes-long verify.
+- `registered-array-read-moving-address` (mununu#496) — `q <= mem[a_q];` where `a_q` can change in the same cycle `q` is consumed and no register records the correspondence. Satisfied by registering the address alongside the data (`a_d <= a_q;`).
+
+It changes no verdict.
 
 ```bash
 # Report the unfaithful partial-write registers; exit 2 if any (a CI gate).
