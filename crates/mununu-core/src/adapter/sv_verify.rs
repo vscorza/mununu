@@ -474,8 +474,9 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
                 "`{data}` is a registered array read addressed by `{address}`, which can change \
                  in the same cycle `{data}` is consumed, and no register captures `{address}` \
                  alongside it — so `{data}` and the live `{address}` are a pair that never \
-                 coexisted. Register the address alongside the data (`{address}_q <= {address};`) \
-                 and consume that."
+                 coexisted. Register the address alongside the data — add a register that \
+                 captures `{address}` in the same cycle as the read — and consume that instead \
+                 of the live `{address}`."
             ),
         });
     }

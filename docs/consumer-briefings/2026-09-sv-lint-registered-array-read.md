@@ -43,7 +43,7 @@ no `next` at all — it can never disagree with `q`).
   "findings": [ { "signal": "q",
                   "kind": "register",
                   "rule": "registered-array-read-moving-address",   // NEW
-                  "detail": "`q` is a registered array read addressed by ..." } ] }  // NEW, optional
+                  "detail": "`q` is a registered array read addressed by `a_q`, which can change in the same cycle ..." } ] }  // NEW, optional
 ```
 
 - **`rule`** — `"undriven-partial-write"` | `"registered-array-read-moving-address"`. Always present on the API and CLI JSON. On the Rust type it carries `#[serde(default)]` to `undriven-partial-write`, so deserialising an older payload still works.
