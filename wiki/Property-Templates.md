@@ -118,21 +118,33 @@ predicate, not a state hint.
 
 ### CLI
 
-> **Drift notice (verified 2026-09-04).** The `mununu templates` subcommand and
-> `mununu context eval --template` / `--template-arg` flags described in earlier
-> revisions of this page **do not exist** in the shipped CLI. `mununu --help`
-> lists `context`, `extraction`, `contract`, `codesign`, `verify`, `library`;
-> `mununu context eval --help` accepts `--formula`, not `--template`. Templates
-> are reachable from `verify.toml` and from extraction specs (below). Use
-> `--formula` with the instantiated body from the catalogue above when you want
-> a template's property on the `context eval` CLI.
-
 ```bash
-# Templates on the CLI: instantiate the catalogue body yourself and pass it
-# with --formula. `reachable` is `mu X. (${TARGET} || <> X)`.
-mununu context eval model.ctxdsl \
-    --formula reach_goal --automaton FSM
+# Zero-parameter template
+mununu context eval model.espec.json --template no_deadlock --automaton FSM
+
+# Template with arguments
+mununu context eval model.espec.json \
+    --template reachable --template-arg TARGET=GoalState --automaton FSM
+
+# Multiple arguments
+mununu context eval model.espec.json \
+    --template mutual_exclusion --template-arg A=P1_Active --template-arg B=P2_Active \
+    --automaton System
+
+# List all templates
+mununu templates
+
+# Filter by domain
+mununu templates --domain rtl
+
+# Show template details
+mununu templates --id reachable
+
+# JSON output
+mununu templates --json
 ```
+
+`--template` and `--formula` are mutually exclusive. When `--template` is provided, the template is instantiated and injected as an ad-hoc formula.
 
 ### In `verify.toml`
 
@@ -149,7 +161,8 @@ over = "System"
 **`TARGET` and other `Predicate`/`State` parameters must be bare identifiers**
 (alphanumeric plus `_`) — see
 [`validate_param_value`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/templates/mod.rs#L305).
-An expression is rejected:
+This applies to **both** template surfaces: `verify.toml` `args` and
+`context eval --template-arg`. An expression is rejected on either:
 
 ```
 template instantiation failed: parameter 'TARGET':

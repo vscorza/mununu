@@ -340,9 +340,17 @@ Verified 2026-09-04 against the shipped binary. Fixed where noted.
 | Claim | Status |
 |---|---|
 | `wiki/CTXDSL-Language-Reference.md` "Variables" showed `count: i64 = 0;` | **wrong syntax** — the `var` keyword is required. Fixed. |
-| `wiki/Property-Templates.md` documents `mununu templates` (four invocations) | **no such subcommand** — flagged inline. |
-| `wiki/Property-Templates.md` documents `context eval --template` / `--template-arg` | **no such flags** — flagged inline. |
+| `wiki/Property-Templates.md` documents `mununu templates` and `context eval --template` / `--template-arg` | **NOT drift — these all exist.** A 2026-09-04 revision of this page wrongly called them missing; that was read off a stale local binary and is retracted. Corrected 2026-09-05. |
 | `examples/verify/v2_tso_storebuffer` README/generator: "`r0 == 0` atoms do not bind through the verify composition path" | **correct for multi-source `verify`, over-broad as written** — atoms bind on `context eval` and on single-source `verify` (which is that example's own shape). Scoped. |
+
+**A note on how this page is verified, added after getting one wrong.** Every
+claim here is checked two ways: run against a **freshly built** binary, and
+confirmed in the source with a `Source of truth:` anchor. The retracted row
+above failed the first check — it was run against a month-old `target/debug`
+build that predated the subcommand, and the source was never consulted because
+the CLI answer looked conclusive. A `--help` that lacks a subcommand is
+evidence about **your binary**, not about the tool. Rebuild before you file
+drift.
 
 ## Checklist before trusting a hand-authored model
 
