@@ -61,7 +61,7 @@ cause removed and the verdict must flip. Reusable as a template for any
 | Page | Was | Now |
 |---|---|---|
 | `wiki/CTXDSL-Language-Reference.md` | `variables { count: i64 = 0; }` | **does not parse** — the `var` keyword is required. Corrected, plus the three traps above called out inline. |
-| `wiki/Property-Templates.md` | documented `mununu templates` (4 invocations) and `context eval --template` / `--template-arg` | **none of these exist** in the shipped CLI. Replaced with a drift notice, the `verify.toml` form that does work, and the identifier-only `TARGET` restriction with its `formula = "…"` escape hatch. |
+| `wiki/Property-Templates.md` | *(the 2026-09-04 claim that `mununu templates` and `context eval --template` do not exist)* | **RETRACTED 2026-09-05 — they all exist.** That claim was read off a stale local binary; the page's original CLI documentation was correct and has been restored. What survives is a genuine addition: `Predicate`/`State` template parameters must be bare identifiers on **both** surfaces, with `formula = "…"` as the escape hatch for an expression target. |
 | `examples/verify/v2_tso_storebuffer` README + generator | "`r0 == 0` atoms do not bind through the verify composition path" | **correct for multi-source, over-broad as written** — atoms do bind on `context eval` and on single-source `verify` (that example's own shape). Scoped rather than removed. |
 
 Also: `wiki/Verify-Project-Flow.md` and `CLAUDE.md`'s reference index now point
@@ -71,9 +71,7 @@ at the guide.
 
 - **No Rust source.** `git diff --stat` touches zero `.rs` files.
 - Wire format, response shapes, verdict values, verdict semantics — unchanged.
-- CLI surface — no flags added, removed or renamed. (The `mununu templates`
-  subcommand documented in the wiki never existed; documenting its absence is
-  not a removal.)
+- CLI surface — no flags added, removed or renamed.
 - HTTP routes, sidecar schemas, `docs/api-schemas/` — unchanged.
 - Engine behaviour, soundness posture, subprocess tool versions — unchanged.
 
