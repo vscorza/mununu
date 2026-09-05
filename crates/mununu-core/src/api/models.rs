@@ -1348,9 +1348,8 @@ pub struct SvLintRequest {
     pub use_slang: bool,
 }
 
-/// One `sv lint` finding — a named signal whose partial-write lift reaches an
-/// undriven (free-input) register bit, so a state predicate over it would be
-/// *refused* (skipped) by the verifier. Element of [`SvLintResponse`].
+/// One `sv lint` finding — a named signal a structural check flagged. Element of
+/// [`SvLintResponse`].
 #[derive(Debug, Serialize)]
 pub struct SvLintFinding {
     /// The offending signal's symbol (register name or a combinational output of one).
@@ -1358,6 +1357,17 @@ pub struct SvLintFinding {
     /// `"register"` (the root — the register itself) | `"output"` (a downstream
     /// combinational output that reads it).
     pub kind: String,
+    /// Which check fired:
+    /// `"undriven-partial-write"` — the partial-write lift reaches a free input,
+    /// so a state predicate over the signal would be *refused* by the verifier;
+    /// `"registered-array-read-moving-address"` (mununu#496) — a registered array
+    /// read whose address register can change in the same cycle its data is
+    /// consumed, with nothing recording the correspondence.
+    pub rule: String,
+    /// Human-readable specifics (the address register and the fix, for the
+    /// array-read rule). Absent when the rule needs no elaboration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 /// Response for `POST /api/v1/sv/lint`.
@@ -1367,7 +1377,7 @@ pub struct SvLintResponse {
     pub signals_flagged: usize,
     /// Number of the flagged signals that are state registers (the root findings).
     pub registers_flagged: usize,
-    /// Per-signal findings (sorted by name).
+    /// Per-signal findings (sorted by rule, then by name).
     pub findings: Vec<SvLintFinding>,
 }
 

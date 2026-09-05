@@ -5953,10 +5953,15 @@ fn sv_lint(args: SvLintArgs) -> Result<(), String> {
     let signals: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
-            serde_json::json!({
+            let mut o = serde_json::json!({
                 "signal": f.signal,
                 "kind": f.kind.as_str(),
-            })
+                "rule": f.rule.as_str(),
+            });
+            if !f.detail.is_empty() {
+                o["detail"] = serde_json::Value::String(f.detail.clone());
+            }
+            o
         })
         .collect();
     let registers_flagged = findings

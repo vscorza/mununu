@@ -486,9 +486,18 @@ portfolio engines) — an agent can trust a definite verdict and treat `unknown`
 
 ---
 
-## Preflight: `sv lint` — the partial-write registers the lift can't keep
+## Preflight: `sv lint` — structural faults refused at write time
 
 > Source of truth: [`sv_lint_registers`](../crates/mununu-core/src/adapter/sv_verify.rs#L228) — surface: (CLI+API+UI)
+
+`sv lint` runs a set of **purely structural** checks over the lifted netlist — no
+bit-blast, no properties, no environment, ~lift cost. Each finding carries a
+`rule` tag:
+
+| `rule` | Catches |
+|---|---|
+| `undriven-partial-write` | a register whose partial-write lift reaches a free input, so a state predicate over it would be *refused* by the verifier |
+| `registered-array-read-moving-address` | a registered array read whose address register can change in the same cycle its data is consumed ([below](#registered-array-reads-against-a-moving-address)) |
 
 Some SystemVerilog is **not lifted faithfully**, and the verifier is honest about
 it: a plain-vector partial register assignment (`q[hi:lo] <= d`) leaves `q`'s other
@@ -512,8 +521,8 @@ mununu --quiet sv lint rtl/mod.sv --frontend slang        # exit 2 ⇒ a registe
 ```jsonc
 // POST /api/v1/sv/lint  →
 { "signals_flagged": 2, "registers_flagged": 1,
-  "findings": [ { "signal": "a_q", "kind": "register" },     // the root
-                { "signal": "o_partsel", "kind": "output" } ] }   // a downstream output of it
+  "findings": [ { "signal": "a_q", "kind": "register", "rule": "undriven-partial-write" },
+                { "signal": "o_partsel", "kind": "output", "rule": "undriven-partial-write" } ] }
 ```
 
 `kind` is `"register"` (the root — the register whose bits are undriven) or
@@ -521,6 +530,57 @@ mununu --quiet sv lint rtl/mod.sv --frontend slang        # exit 2 ⇒ a registe
 the same reason). A finding maps to the shared CI gate's `violated` verdict, so the
 default `--fail-on violated` fails the build; `--fail-on none` makes it advisory. A
 clean design reports zero findings and exits `0`.
+
+### Registered array reads against a moving address
+
+> Source of truth: [`lint_registered_array_read_moving_address`](../crates/mununu-core/src/adapter/sv_verify.rs) — surface: (CLI+API+UI)
+
+```systemverilog
+always_ff @(posedge clk) begin
+    if (advance) a_q <= a_q + 1;   // the address register moves
+    q <= mem[a_q];                 // registered read against it
+end
+```
+
+`q` holds the word at the address `a_q` held **last** cycle, but a consumer that
+reads `q` alongside the live `a_q` sees a pair that never coexisted. Nothing in
+the design records the correspondence, so the mismatch is silent and survives
+every property that compares the design to itself.
+
+This is not hypothetical: monono hit it **twice in the same block**, the second
+time with a prose rule against it in force, shipping a 2 KB sprite bank shifted
+by one halfword. Eleven properties, a contrast twin, a CTXDSL model and a frame
+CRC all passed; what found it was rebuilding the memory image from the fetcher's
+own returns and diffing against the source. Prose did not prevent the
+recurrence, which is why the rule is now structural and refused at write time
+(mununu#496).
+
+**The satisfying form** registers the address alongside the data, so some
+register captures `a_q` in the very cycle the read is issued:
+
+```systemverilog
+always_ff @(posedge clk) begin
+    if (advance) a_q <= a_q + 1;
+    q   <= mem[a_q];
+    a_d <= a_q;        // <-- records which address `q` corresponds to
+end
+```
+
+Like the other lift-form checks, the rule is **satisfiable by writing the
+supported form** — here, by naming the tracking signal. Two shapes are never
+flagged: an address that is not a register (no moving register to mis-pair
+with), and a register held constant (`a_q <= a_q`, or no `next` at all — it can
+never disagree with `q`).
+
+```jsonc
+// POST /api/v1/sv/lint  →
+{ "signals_flagged": 1, "registers_flagged": 1,
+  "findings": [ { "signal": "q", "kind": "register",
+                  "rule": "registered-array-read-moving-address",
+                  "detail": "`q` is a registered array read addressed by `a_q`, which can \
+                             change in the same cycle `q` is consumed, and no register \
+                             captures `a_q` alongside it ..." } ] }
+```
 
 **Exit codes** (2026-08, mununu#475 item 5). `sv lint --fail-on violated` (the
 default) exits `0` on a clean design, `2` when a bad register is found — a
