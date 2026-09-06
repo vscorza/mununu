@@ -738,8 +738,12 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
             .iter()
             .copied()
             .filter(|st| match next_of.get(st) {
-                None => false,                  // no `next` — held/free, cannot move
-                Some(Some(src)) => *src != *st, // resolves to another register
+                // SOUNDNESS: a BTOR2 `state` with NO `next` is HAVOC — the format
+                // leaves it unconstrained at every step (the same reading as the
+                // mununu#498 fix, and as `array_prophecy`'s registerized-index
+                // guard). It therefore moves MAXIMALLY, not "not at all".
+                None => true,
+                Some(Some(src)) => *src != *st, // resolves to itself ⇒ genuinely held
                 Some(None) => true,             // real logic ⇒ it moves
             })
             .collect();
@@ -1097,6 +1101,27 @@ mod tests {
             f.is_empty(),
             "the tracked form must NOT be flagged — the rule is satisfiable by naming \
              the tracking signal; got {f:?}"
+        );
+    }
+
+    /// SOUNDNESS — a BTOR2 `state` with NO `next` is HAVOC, not held. The format
+    /// leaves it unconstrained at every step (the mununu#498 reading, and the same
+    /// rule `array_prophecy` applies to a registerized index), so such an address
+    /// moves MAXIMALLY and must be flagged.
+    ///
+    /// This is the direction that is easy to get backwards: "no next-state function"
+    /// reads like "never changes", and treating it that way silently drops the
+    /// worst case.
+    #[test]
+    fn a_havoc_address_register_with_no_next_is_flagged() {
+        // Drop `a_q`'s `next` line entirely — it becomes a free variable.
+        let havoc = SLANG_REGISTERED_READ_MOVING_ADDR.replace("17 next 7 8 16\n", "");
+        let f = lint_registered_array_read_moving_address(&havoc).expect("lint");
+        assert_eq!(
+            f.len(),
+            1,
+            "a state with no `next` is havoc every cycle, so the read can never be \
+             paired with it; treating no-next as 'held' would drop the worst case: {f:?}"
         );
     }
 
