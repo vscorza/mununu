@@ -451,9 +451,16 @@ Only the initial cycles need care, because a history variable has no value befor
 the first transition. A state cell's stages mirror its `init`, so before the chain
 fills (cycles `< j` for stage `j`) `$past(b, j)` reads `b`'s reset value. An input
 has no `init` to mirror, so **every stage is pinned to an explicit zero** rather
-than left free: an init-less BTOR2 cell reads as 0 to the cube and exact engines
-but stays free for the reachability portfolio, and that split is a verdict
-disagreement, not a nuance.
+than left free — an emitted `init` line, not an implicit convention, which is why
+every engine reads the same value for it.
+
+That explicitness became load-bearing in 2026-09 (mununu#498 sibling). An
+init-*less* BTOR2 cell used to read as 0 to the cube and exact engines while
+staying free for the reachability portfolio, and that split was a verdict
+disagreement rather than a nuance. The exact engine now follows the BTOR2 format —
+no `init` line means the initial value is unconstrained — so it agrees with the
+portfolio, and only the cube path still applies the zero default. A `$past` stage
+is unaffected either way precisely because its `init` is written down.
 
 That invented value is read only in the first few cycles after reset. The lift
 settles it structurally: `|=>` places the atom under a `[]`, so it is evaluated
