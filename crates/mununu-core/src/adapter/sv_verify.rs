@@ -446,6 +446,151 @@ fn resolve_to_state_register(
     None
 }
 
+/// mununu#506 Tier 1 — strip the wrappers that do not change an expression's VALUE,
+/// for structural comparison of two address expressions.
+///
+/// Distinct from [`resolve_to_state_register`], which answers "*which register does
+/// this name*" and therefore walks `slice` too. Here the question is "*is this the
+/// same value*", so a `slice` is meaningful and is NOT stripped — only zero-width
+/// extension and the `async2sync` reset mux are.
+fn canonical_value_nid(file: &crate::adapter::btor2::ast::Btor2File, nid: i64) -> i64 {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let mut nid = nid;
+    for _ in 0..64 {
+        let Some(line) = file.lookup(nid) else {
+            return nid;
+        };
+        match &line.node {
+            Node::Op {
+                op: Op::Uext | Op::Sext,
+                args,
+                ..
+            } if line.immediates.first().copied() == Some(0) => match args.first() {
+                Some(a) => nid = a.nid(),
+                None => return nid,
+            },
+            Node::Op {
+                op: Op::Ite, args, ..
+            } => {
+                let (Some(t), Some(e)) = (args.get(1), args.get(2)) else {
+                    return nid;
+                };
+                let is_const = |n| matches!(node_of(file, n), Some(Node::Const { .. }));
+                match (is_const(t.nid()), is_const(e.nid())) {
+                    (false, true) => nid = t.nid(),
+                    (true, false) => nid = e.nid(),
+                    _ => return nid,
+                }
+            }
+            _ => return nid,
+        }
+    }
+    nid
+}
+
+/// mununu#506 Tier 1 — the state + input leaves an expression depends on.
+///
+/// Generalises the address analysis from "*is this a bare register*" to "*what can
+/// make this value change*", which is what the rule actually needs. Covers
+/// `mem[base + 1]`, `mem[{tag, a_q}]`, `mem[a_q[hi:lo]]`, `mem[a_q ^ mask]` — the
+/// shape class, not a list of cases. Mirrors `dep_graph::cone_leaf_nids`, but
+/// rooted at a NID rather than at a symbol.
+fn expr_leaves(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    root: i64,
+) -> (std::collections::HashSet<i64>, bool) {
+    use crate::adapter::btor2::ast::Node;
+    let mut states = std::collections::HashSet::new();
+    let mut has_input = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut work = vec![root];
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        match node_of(file, nid) {
+            Some(Node::State { .. }) => {
+                states.insert(nid);
+            }
+            Some(Node::Input { .. }) => has_input = true,
+            Some(Node::Op { args, .. }) => {
+                for a in args {
+                    work.push(a.nid());
+                }
+            }
+            Some(Node::Output { signal, .. }) => work.push(signal.nid()),
+            _ => {}
+        }
+    }
+    (states, has_input)
+}
+
+/// Tier 2 (mununu#506) — the SEMANTIC tracking check.
+///
+/// Tier 1 recognises a tracking register by STRUCTURAL equality of the address
+/// expression. That is right whenever yosys `opt`'s CSE has merged the design's two
+/// occurrences of `a_q + 1` into one node — usually, but not guaranteed. When it
+/// misses, the rule reports a design that DOES record the correspondence: a **false
+/// positive on correct RTL**, the direction that matters most here (strictly worse
+/// than the under-firing the #506 fix removed).
+///
+/// So before emitting, ask the solver whether ANY register's next value is
+/// *provably* equal to the address expression: `next(t) != addr` UNSAT ⇒ equal.
+///
+/// **Runs only on the reporting path.** A clean design never reaches it, so
+/// `sv lint`'s "no model checking, ~0.1 s" profile is unchanged on the common path.
+/// And it can only WITHDRAW a finding, never create one: an encode failure, an
+/// unsupported operator, a width mismatch or a solver `Unknown` all leave the
+/// structural verdict standing — the solver stays on the sound side of the decision.
+fn smt_confirms_tracking(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    addr: i64,
+    data_state: i64,
+) -> bool {
+    use crate::adapter::btor2::ast::Node;
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || -> bool {
+        let Ok(view) = crate::adapter::btor2::kmts_lift::encode_design_for_lift(file) else {
+            return false; // cannot encode ⇒ cannot withdraw
+        };
+        let Some(addr_bv) = view.curr_signal(addr) else {
+            return false;
+        };
+        // Width from the BV itself: `width_of` only covers DECLARED signals, and an
+        // address expression is usually a combinational node with no entry — using it
+        // here silently skipped every candidate.
+        let addr_w = addr_bv.get_size();
+        for line in &file.lines {
+            if !matches!(line.node, Node::State { .. }) || line.nid == data_state {
+                continue;
+            }
+            // Compare the EXPRESSION the register will latch against the address
+            // expression, both evaluated in the SAME step. `next_state()` is the
+            // next-step VARIABLE — unconstrained unless the transition relation is
+            // asserted, so `t' != addr` is trivially Sat and nothing is ever
+            // withdrawn.
+            let Some(next_val) =
+                crate::adapter::btor2::parser::find_next_value_operand(file, line.nid)
+            else {
+                continue;
+            };
+            let Some(next_bv) = view.curr_signal(next_val.nid()) else {
+                continue;
+            };
+            if next_bv.get_size() != addr_w {
+                continue; // different widths cannot hold the same value (and z3 would
+                // reject the equality as a sort error)
+            }
+            let solver = z3::Solver::new();
+            solver.assert(next_bv.eq(addr_bv).not());
+            if matches!(solver.check(), z3::SatResult::Unsat) {
+                return true; // `next(t) == addr` is valid — the correspondence IS recorded
+            }
+        }
+        false
+    })
+}
+
 /// mununu#496 — flag a **registered array read whose address register can change
 /// in the same cycle its data is consumed**, with nothing recording which address
 /// the current data corresponds to.
@@ -496,6 +641,7 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
     // signals that satisfy the rule.
     let mut next_of: std::collections::HashMap<i64, Option<i64>> = std::collections::HashMap::new();
     let mut tracked: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut tracked_values: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for line in &file.lines {
         if let Node::Next { state, value, .. } = &line.node {
             // mununu#506: resolve the next-value through the same identity-preserving
@@ -506,6 +652,14 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
             // on exactly the designs that already do the right thing.
             let resolved = resolve_to_state_register(&file, value.nid());
             next_of.insert(*state, resolved);
+            // Tier 1 (mununu#506): also index each register's next value by its
+            // CANONICAL VALUE, so a register that captures a whole address
+            // EXPRESSION (`a_d <= a_q + 1`) counts as tracking it — not only one
+            // that captures a bare register. Post-`opt` CSE means the design's two
+            // occurrences of `a_q + 1` share a node, so nid equality is the right
+            // structural test; Tier 2 replaces it with an SMT validity query for
+            // the cases CSE misses.
+            tracked_values.insert(canonical_value_nid(&file, value.nid()));
             // `t <= a` where `a` is a DIFFERENT register: `t` records which `a` the
             // current cycle used. A register's own hold (`a <= a`) is not tracking.
             if let Some(src) = resolved
@@ -570,32 +724,54 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
         let Some(addr) = args.get(1).map(|a| a.nid()) else {
             continue;
         };
-        // The address must resolve to a register. mununu#506: it is almost never a
-        // bare `state` — `async2sync` puts a reset mux in front of it and the name
-        // lands on a `uext` alias — so resolve through the identity-preserving
-        // wrappers. An address that is a pure input, or a genuine arithmetic
-        // function, resolves to nothing and stays out of scope.
-        let Some(addr) = resolve_to_state_register(&file, addr) else {
-            continue;
-        };
-        // Does the address actually move? A register held constant (`a <= a`, or
-        // no `next` at all) can never be mis-paired.
-        // A register that HOLDS (`a <= a`, which lifts to
-        // `next(a) = ite(rst, <alias of a>, RESET)`) or has no `next` at all can
-        // never be mis-paired with its own data. Resolving the next-value is what
-        // distinguishes a genuine hold from the reset mux wrapped around it.
-        let moves = match next_of.get(&addr) {
-            None => false,                   // no `next` — free/held, cannot move
-            Some(Some(src)) => *src != addr, // resolves to another register
-            Some(None) => true,              // real logic ⇒ it moves
-        };
-        if !moves {
+        // Tier 1 (mununu#506): analyse the address's CONE rather than demanding a
+        // bare register. The question the rule needs answered is "what can make this
+        // value change", which generalises over the whole shape class —
+        // `mem[base + 1]`, `mem[{tag, a_q}]`, `mem[a_q[hi:lo]]`, `mem[a_q ^ mask]` —
+        // instead of a list of special cases.
+        let (cone_states, cone_has_input) = expr_leaves(&file, addr);
+
+        // A register in the cone MOVES when its next value does not resolve back to
+        // itself. `a <= a` lifts to `next(a) = ite(rst, <alias of a>, RESET)`, so
+        // resolving is what distinguishes a genuine hold from the reset mux.
+        let moving: Vec<i64> = cone_states
+            .iter()
+            .copied()
+            .filter(|st| match next_of.get(st) {
+                None => false,                  // no `next` — held/free, cannot move
+                Some(Some(src)) => *src != *st, // resolves to another register
+                Some(None) => true,             // real logic ⇒ it moves
+            })
+            .collect();
+
+        // SCOPE: the fault needs a moving REGISTER to mis-pair with. An address
+        // driven only by inputs (`sprite_bank`'s `addr` port — how every block-RAM
+        // wrapper is written) is the CALLER's obligation, not this module's, and
+        // flagging it would fire on every memory wrapper in a design. Inputs alone
+        // are therefore out of scope; inputs ALONGSIDE a moving register still flag,
+        // because the register half can mis-pair.
+        if moving.is_empty() {
+            let _ = cone_has_input;
             continue;
         }
-        // Satisfied if some register captures the address in the same cycle.
-        if tracked.contains(&addr) {
+
+        // Satisfied when some register captures the address in the same cycle —
+        // either the whole EXPRESSION (Tier 1: `a_d <= a_q + 1`) or, for a bare
+        // register address, the register itself.
+        let addr_value = canonical_value_nid(&file, addr);
+        if tracked_values.contains(&addr_value) || moving.iter().all(|st| tracked.contains(st)) {
             continue;
         }
+        // Tier 2 — the structural check says "report". Ask the solver whether some
+        // register nevertheless records this exact address, and withdraw if it does.
+        // Only reached when a finding is about to be emitted, so a clean design never
+        // pays for it (see `smt_confirms_tracking`).
+        if smt_confirms_tracking(&file, addr, *state) {
+            continue;
+        }
+        // Report the moving register deterministically (lowest nid) — for a bare
+        // address this is the register itself, unchanged from before.
+        let addr = *moving.iter().min().expect("non-empty");
 
         let data = name_of(*state).unwrap_or_else(|| format!("<nid {state}>"));
         let address = name_of(addr).unwrap_or_else(|| format!("<nid {addr}>"));
@@ -815,17 +991,87 @@ mod tests {
         );
     }
 
+    /// Tier 1 (mununu#506) — an ARITHMETIC address is now in scope. `mem[a_q + 1]`
+    /// can mis-pair exactly as `mem[a_q]` can; what matters is whether anything in
+    /// the address's cone MOVES, not whether the address is a bare register.
+    /// (This test previously asserted the opposite — it encoded the limitation the
+    /// cone analysis removes.)
     #[test]
-    fn an_arithmetic_address_is_still_out_of_scope() {
-        // `mem[a_q + 1]` — the resolver walks identity-preserving wrappers only, so
-        // an address that is a genuine FUNCTION of a register stays out of scope, as
-        // the briefing's known-limits list states. Guards against the resolver
-        // quietly widening the rule.
+    fn an_arithmetic_address_is_in_scope_when_its_cone_moves() {
+        // nid 19 is `add 8 11 18` — `a_q + 1`. Read at that instead of at `a_q`.
         let arith = SLANG_RESET_GATED_MOVING_ADDR.replace("15 read 5 14 11", "15 read 5 14 19");
         let f = lint_registered_array_read_moving_address(&arith).expect("lint");
+        assert_eq!(
+            f.len(),
+            1,
+            "`mem[a_q + 1]` mis-pairs exactly as `mem[a_q]` does; the cone contains a \
+             moving register: {f:?}"
+        );
+        assert!(
+            f[0].detail.contains("a_q"),
+            "the moving register in the cone must still be named: {}",
+            f[0].detail
+        );
+    }
+
+    /// Tier 2 (mununu#506) — the tracking register holds a STRUCTURALLY DIFFERENT
+    /// but SEMANTICALLY EQUAL address, so Tier 1's nid comparison misses it and only
+    /// the solver can withdraw the finding.
+    ///
+    /// The read indexes `add(a_q, 1)`; the tracking register captures `add(1, a_q)`
+    /// — a distinct node that CSE did not merge (operand order differs), computing
+    /// the same value. Flagging this would be a false positive on correct RTL, which
+    /// is exactly what Tier 2 exists to prevent.
+    #[test]
+    fn smt_withdraws_a_finding_when_tracking_is_semantically_equal_but_not_structural() {
+        // 19 = add(11, 18) = a_q + 1  (the read index)
+        // 24 = add(18, 11) = 1 + a_q  (same value, different node)
+        // 25/26: `a_d` whose next value is node 24.
+        let tracked = SLANG_RESET_GATED_MOVING_ADDR
+            .replace("15 read 5 14 11", "15 read 5 14 19")
+            .replace(
+                "23 next 13 14 14 mem\n",
+                "23 next 13 14 14 mem\n24 add 8 18 11\n25 state 8 a_d\n26 next 8 25 24\n",
+            );
+
+        // Sanity: Tier 1 alone cannot see it — the two nodes are not the same nid.
+        let a = canonical_value_nid(&parser::parse(&tracked).expect("parse"), 19);
+        let b = canonical_value_nid(&parser::parse(&tracked).expect("parse"), 24);
+        assert_ne!(
+            a, b,
+            "the fixture must be structurally distinct, else it tests nothing"
+        );
+
+        let f = lint_registered_array_read_moving_address(&tracked).expect("lint");
         assert!(
             f.is_empty(),
-            "an arithmetic address is documented as out of scope; got {f:?}"
+            "`a_d <= 1 + a_q` records the same address the read uses; the solver must \
+             withdraw the finding even though the expressions are structurally \
+             different: {f:?}"
+        );
+    }
+
+    /// The false-positive guard for Tier 1, and the one that governs the design: a
+    /// register capturing the whole address EXPRESSION satisfies the rule just as a
+    /// register capturing a bare address does. Widening what counts as a moving
+    /// address without widening what counts as tracking it would fire on correct
+    /// code — strictly worse than the under-firing it replaces.
+    #[test]
+    fn a_register_capturing_the_whole_address_expression_satisfies_the_rule() {
+        // Add `a_d` whose next value IS `a_q + 1` (nid 19) — the same node the read
+        // indexes, which is what post-`opt` CSE produces for a design that registers
+        // the address it reads at.
+        let tracked = SLANG_RESET_GATED_MOVING_ADDR
+            .replace("15 read 5 14 11", "15 read 5 14 19")
+            .replace(
+                "23 next 13 14 14 mem\n",
+                "23 next 13 14 14 mem\n24 state 8 a_d\n25 next 8 24 19\n",
+            );
+        let f = lint_registered_array_read_moving_address(&tracked).expect("lint");
+        assert!(
+            f.is_empty(),
+            "`a_d <= a_q + 1` alongside `q <= mem[a_q + 1]` records the correspondence; \
+             flagging it would be a false positive on correct RTL: {f:?}"
         );
     }
 
