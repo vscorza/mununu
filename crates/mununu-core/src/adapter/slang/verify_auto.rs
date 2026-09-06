@@ -946,6 +946,95 @@ struct Seeded {
 /// Bare atoms are admitted (`parse_predicate_atom_bool` reads `o_partsel` as
 /// `o_partsel != 0`), so a combinational-output property is caught as well as a
 /// register-comparison one.
+/// mununu#507 — is the anonymous free input in `name`'s cone reached through a
+/// `concat`, the shape the slang partial-write lift produces?
+///
+/// `q[hi:lo] <= d` makes slang model `q`'s UNWRITTEN bits as free inputs and alias
+/// the register name to the `concat` that mixes them. So a `concat` with an
+/// anonymous-input operand in the cone is positive evidence for that specific
+/// cause. Anything else — a blackboxed submodule's freed outputs, an undriven net,
+/// an unconnected port — reaches an anonymous input WITHOUT that shape, and the
+/// refusal must not claim a partial write it cannot see.
+fn undriven_via_partial_write_concat(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    name: &str,
+) -> bool {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let starts: Vec<crate::adapter::btor2::ast::Nid> = file
+        .lines
+        .iter()
+        .filter(|l| match &l.node {
+            Node::State { .. } => symbols.get(&l.nid).map(String::as_str) == Some(name),
+            Node::Op {
+                symbol: Some(s), ..
+            } => s == name,
+            Node::Output {
+                symbol: Some(s), ..
+            } => s == name,
+            _ => false,
+        })
+        .map(|l| l.nid)
+        .collect();
+
+    let is_anon_input = |nid| {
+        matches!(
+            file.lookup(nid).map(|l| &l.node),
+            Some(Node::Input { symbol: None, .. })
+        )
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut work = starts;
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::Op {
+                op: Op::Concat,
+                args,
+                ..
+            } => {
+                if args.iter().any(|a| is_anon_input(a.nid())) {
+                    return true;
+                }
+                for a in args {
+                    work.push(a.nid());
+                }
+            }
+            Node::Op { args, .. } => {
+                for a in args {
+                    work.push(a.nid());
+                }
+            }
+            Node::Output { signal, .. } => work.push(signal.nid()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// mununu#507 — does any staged source carry a module-scope `bind`?
+///
+/// Assertions live in a bound `*_sva.sv` file BECAUSE THEY MUST: `read_verilog -sv`
+/// cannot parse `assert property`, and verify-auto has no `--define`, so an `ifdef`
+/// guard would hide them from the verifier too. And sv2v 0.0.13 cannot parse `bind`
+/// at all (verified 2026-09-06: `Parse error: unexpected token 'bind'`). So the
+/// `--frontend verilog --preprocess-sv2v` remedy is not merely awkward for such a
+/// design — it cannot run, and recommending it sends the reader into a parse error.
+fn sources_use_bind(sources: &[(String, String)]) -> bool {
+    sources.iter().any(|(_, body)| {
+        body.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("bind ") && !t.starts_with("bind_") && !l.trim_start().starts_with("//")
+        })
+    })
+}
+
 fn formula_atom_over_undriven_register(
     formula: &Formula,
     file: &crate::adapter::btor2::ast::Btor2File,
@@ -2696,19 +2785,69 @@ pub(crate) fn verify_auto_impl(
         // sub-*registers*, no free inputs — is NOT refused: the NID-indexed
         // cone-of-influence keeps those cells, so that case now decides.)
         if let Some(reg) = formula_atom_over_undriven_register(&formula, &file) {
+            // mununu#507 — report the CONDITION, and the cause only when it is
+            // actually derivable. The condition this guard tests is "`reg`'s cone
+            // reaches an unnamed free input"; a partial register write is only ONE
+            // of the ways that happens (a blackboxed submodule's freed outputs, an
+            // undriven net and an unconnected port are others, and on an integrator
+            // blackboxing is far likelier). Asserting the partial-write cause
+            // unconditionally pointed consumers at correct RTL — `f_slot_q <= 7'd0
+            // / f_slot[6:0]` is a part-select of the SOURCE, written whole, with no
+            // `f_slot_q[hi:lo] <= …` anywhere.
+            let partial_write = undriven_via_partial_write_concat(&file, &reg);
+            let cause = if partial_write {
+                format!(
+                    " The lift shows the partial-write shape: `{reg}`'s name aliases a \
+                     `concat` mixing a free input, which is how the slang front-end models \
+                     the UNWRITTEN bits of a plain-vector partial assignment \
+                     (`{reg}[hi:lo] <= …`)."
+                )
+            } else {
+                let bb = &report.diagnostics.blackboxed_modules;
+                let bb_hint = if bb.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " This run black-boxed {} module(s) ({}), whose outputs ARE freed to \
+                         unnamed inputs — the most likely source here; provide their source to \
+                         model them.",
+                        bb.len(),
+                        bb.join(", ")
+                    )
+                };
+                format!(
+                    " The cause is NOT attributed: this lift shows no partial-write shape for \
+                     `{reg}`, so do not assume a `{reg}[hi:lo] <= …` in the RTL. An unnamed \
+                     free input also comes from a black-boxed submodule, an undriven net or an \
+                     unconnected port.{bb_hint}"
+                )
+            };
+            // The sv2v remedy only exists for a design sv2v can parse. It cannot
+            // parse `bind` (0.0.13), and bound SVA is not optional for these
+            // designs — `read_verilog -sv` cannot parse `assert property`, and there
+            // is no `--define` to guard an `ifdef` with.
+            let remedy = if partial_write && !sources_use_bind(sources) {
+                " Re-lift with the read_verilog / sv2v front-end \
+                 (`--frontend verilog --preprocess-sv2v`), which models the register faithfully."
+                    .to_string()
+            } else if partial_write {
+                " The usual remedy (`--frontend verilog --preprocess-sv2v`) is NOT available \
+                 here: these sources use `bind`, which sv2v cannot parse. Rewriting the \
+                 assignment to write the register whole is the route that works."
+                    .to_string()
+            } else {
+                String::new()
+            };
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
                 formula: formula_str.clone(),
                 outcome: VerifyOutcome::Skipped {
                     reason: format!(
-                        "property references `{reg}`, whose unwritten bits the RTL front-end \
-                         left undriven (modelled as free inputs) while lifting a partial \
-                         register assignment (`{reg}[hi:lo] <= …`) — a verdict over it would \
-                         read those havoc inputs and be unsound, so it is refused rather than \
-                         silently decided. Re-lift with the read_verilog / sv2v front-end \
-                         (`--frontend verilog --preprocess-sv2v`), which models `{reg}` \
-                         faithfully."
+                        "property references `{reg}`, whose cone reaches a free input the lift \
+                         could not attribute to a driver — a verdict over it would read that \
+                         havoc value and be unsound, so it is refused rather than silently \
+                         decided.{cause}{remedy}"
                     ),
                 },
                 seeded_predicates: Vec::new(),
@@ -5368,6 +5507,76 @@ module uart_tx(); endmodule"#;
 
         // No front end recorded (a non-lift path) → no note.
         assert!(note_of(&base(None, None)).is_none());
+    }
+
+    /// mununu#507 — the refusal must attribute a partial write ONLY when the lift
+    /// shows that shape, because an unnamed free input has several other sources.
+    #[test]
+    fn partial_write_shape_is_distinguished_from_other_undriven_sources() {
+        use crate::adapter::btor2::parser;
+
+        // (a) THE PARTSEL SHAPE: `q`'s name aliases a `concat` mixing an anonymous
+        // input — how slang models the unwritten bits of `q[hi:lo] <= d`.
+        const PARTSEL: &str = r#"1 sort bitvec 4
+2 sort bitvec 8
+3 input 1
+4 state 1 lo
+5 concat 2 3 4
+6 uext 2 5 0 q
+"#;
+        let f = parser::parse(PARTSEL).expect("parse");
+        assert!(
+            undriven_via_partial_write_concat(&f, "q"),
+            "the concat-over-anonymous-input shape IS the partial-write evidence"
+        );
+
+        // (b) A BLACKBOXED SUBMODULE's freed output: `q` reads an anonymous input
+        // through ordinary logic, with no concat. Same guard condition, different
+        // cause — and the message must not claim a partial write.
+        const BLACKBOX: &str = r#"1 sort bitvec 1
+2 input 1
+3 state 1 r
+4 and 1 2 3
+5 uext 1 4 0 q
+"#;
+        let f = parser::parse(BLACKBOX).expect("parse");
+        assert!(
+            parser::signal_reaches_anonymous_input(&f, "q"),
+            "the guard still fires — the property is still refused"
+        );
+        assert!(
+            !undriven_via_partial_write_concat(&f, "q"),
+            "but there is NO partial-write shape, so the refusal must not name one \
+             (mununu#507: the old message pointed at correct, whole-written RTL)"
+        );
+    }
+
+    /// mununu#507 — the sv2v remedy must not be offered to a design that uses
+    /// `bind`, because sv2v 0.0.13 cannot parse it (`Parse error: unexpected token
+    /// 'bind'`). Bound SVA is not optional for these designs: `read_verilog -sv`
+    /// cannot parse `assert property` and there is no `--define` for an `ifdef`.
+    #[test]
+    fn bound_sva_sources_are_detected_so_the_sv2v_remedy_is_withheld() {
+        let bound = vec![
+            ("dut.sv".to_string(), "module dut; endmodule\n".to_string()),
+            (
+                "dut_sva.sv".to_string(),
+                "module dut_sva; endmodule\nbind dut dut_sva u_sva();\n".to_string(),
+            ),
+        ];
+        assert!(
+            sources_use_bind(&bound),
+            "a module-scope `bind` is detected"
+        );
+
+        let plain = vec![(
+            "dut.sv".to_string(),
+            "module dut;\n  // no bind here\n  logic bind_addr;\n endmodule\n".to_string(),
+        )];
+        assert!(
+            !sources_use_bind(&plain),
+            "a commented mention and an identifier PREFIXED `bind_` are not a bind"
+        );
     }
 
     #[test]

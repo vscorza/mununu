@@ -579,6 +579,21 @@ flagged: an address that is not a register (no moving register to mis-pair
 with), and a register held constant (`a_q <= a_q`, or no `next` at all — it can
 never disagree with `q`).
 
+**Aliases are resolved** (mununu#506). A register's identity rarely survives on
+its raw `state` line: `async2sync` lifts an async reset into a mux, so what the
+read actually indexes is `ite(rst_n, state, RESET)`, and the register's *name*
+lands on a `uext` alias of that mux. The rule resolves the address — and the
+tracking register, and the reported name — back through the identity-preserving
+wrappers (`uext` / `sext` / `slice` / a reset-shaped `ite`). Before that it
+required a bare `state`, which meant it fired **only on registers with no
+reset** — close to none in real RTL, and the reason it reported nothing on the
+design that motivated it. It does **not** walk arithmetic, so an address that is
+a genuine function of a register (`mem[a_q + 1]`) remains out of scope.
+
+Because the lift **flattens**, this also covers the cross-module form — the array
+and destination register in a child, the address register in the parent — which
+no per-module reading of the RTL would catch.
+
 ```jsonc
 // POST /api/v1/sv/lint  →
 { "signals_flagged": 1, "registers_flagged": 1,
