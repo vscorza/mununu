@@ -2198,14 +2198,28 @@ impl BddBitBlaster {
         }
     }
 
-    /// D1.3/D1.5 — the BDD of the design's **initial state**: EVERY state register
-    /// is pinned to its reset value — its BTOR2 `init <state> <value>` bits, or **0
-    /// when it has no `init` line** (the `setundef -zero` model convention Yosys +
-    /// verify-auto's `state_cell_init_values` use). Pinning the undefined-reset
-    /// registers to 0 (rather than leaving them free) is what keeps `AG …` from
-    /// seeing unreachable stuck states: the verdict is checked from the *actual*
-    /// modelled reset state, not an over-broad free-init set. `Holds` iff that
-    /// initial state satisfies the property.
+    /// D1.3/D1.5 — the BDD of the design's **initial states**, per the BTOR2 format:
+    /// a state with an `init <state> <value>` line is pinned to that value; a state
+    /// with **no `init` line is left FREE**, because the format leaves its initial
+    /// value unconstrained.
+    ///
+    /// **mununu#498 (sibling).** This used to pin an un-`init`ed state to all-zero
+    /// (the `setundef -zero` convention). That made the modelled initial set a strict
+    /// SUBSET of the design's, which is an UNDER-approximation: `Violated` stayed
+    /// sound (the pinned state is a genuine initial state) but `Holds` did not — φ
+    /// holding at one initial state says nothing about the others. mununu therefore
+    /// disagreed with `btormc` / Pono, which follow the format (the btor2tools
+    /// `noninitstate.btor2` case), and `exact_bad_reachable` had to *abstain* to stay
+    /// honest. Modelling the initial set exactly removes the approximation, so BOTH
+    /// directions are sound and no guard is needed.
+    ///
+    /// The SV path is unaffected: `reset_init::inject_reset_init` injects an `init`
+    /// line for EVERY state cell of a reset-gated design before the model is built
+    /// (all-or-nothing), so a lifted RTL design has no free-init state. Under
+    /// `--no-gate-reset` the design is *documented* to choose its own power-up, which
+    /// is what this now models.
+    ///
+    /// `Holds` iff EVERY initial state satisfies the property.
     pub fn initial_state_bdd(&self, file: &Btor2File) -> Result<BDDFunction, String> {
         // State-line nid → the value operand of its `init` line (if any).
         let mut init_value_nid: HashMap<Nid, Nid> = HashMap::new();
@@ -2248,13 +2262,17 @@ impl BddBitBlaster {
             let Some(cell) = cell_of_sym.get(sym.as_str()) else {
                 continue;
             };
-            // Reset-value bits: the `init` line's value BDD, or all-`⊥` (every bit
-            // 0) for a register with no `init` line.
-            let value_bits: Vec<BDDFunction> = init_value_nid
+            // No `init` line ⇒ the format leaves this state's initial value
+            // unconstrained, so contribute NO conjunct and leave its bits free.
+            // (Pinning them to all-zero here was the mununu#498 sibling
+            // under-approximation — see this method's doc comment.)
+            let Some(value_bits) = init_value_nid
                 .get(&line.nid)
                 .and_then(|vn| self.env.get(vn))
                 .cloned()
-                .unwrap_or_else(|| vec![self.ff.clone(); cell.vars.len()]);
+            else {
+                continue;
+            };
             for (var, val) in cell.vars.iter().zip(value_bits.iter()) {
                 // state_bit ⟺ value_bit  =  ¬(state_bit XOR value_bit)
                 let iff = oom(self.xor(var, val)?.not())?;
@@ -2845,38 +2863,14 @@ pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
     let init = bb.initial_state_bdd(&file)?;
     let reachable = init.and(&reach).unwrap() != bb.ff;
 
-    // A REACHABLE verdict is always sound: the modelled reset (uninitialised
-    // registers pinned to 0) is ONE of the initial states btormc explores, so a
-    // path found from it is a real path. An UNREACHABLE verdict, however, is sound
-    // only when every state cell is initialised — an uninitialised (free-init)
-    // register could reach `bad` from a non-reset value that btormc considers but
-    // the pin-to-reset model does not (the `noninitstate` differential case). So we
-    // decide REACHABLE freely, and refuse an UNREACHABLE verdict on a design with
-    // free-init state rather than emit a possibly-unsound "safe".
-    if reachable {
-        return Ok(true);
-    }
-    let init_states: std::collections::HashSet<Nid> = file
-        .lines
-        .iter()
-        .filter_map(|l| match &l.node {
-            Node::Init { state, .. } => Some(*state),
-            _ => None,
-        })
-        .collect();
-    let has_free_init_state = file
-        .lines
-        .iter()
-        .any(|l| matches!(l.node, Node::State { .. }) && !init_states.contains(&l.nid));
-    if has_free_init_state {
-        return Err(
-            "exact bad-reachability: unreachable from the pinned reset, but the design has \
-                    uninitialised (free-init) state — btormc explores non-reset initial values the \
-                    pin-to-reset model does not; undecided rather than unsound"
-                .into(),
-        );
-    }
-    Ok(false)
+    // BOTH directions are sound since mununu#498's sibling fix: `initial_state_bdd`
+    // models the design's initial set EXACTLY (a state with no `init` line is left
+    // free, per the BTOR2 format) rather than pinning un-`init`ed registers to 0.
+    // The engine therefore no longer has to refuse an UNREACHABLE verdict on a
+    // free-init design — the case that used to abstain (btor2tools `noninitstate`,
+    // where btormc reaches `bad` from a non-zero initial value the pinned model
+    // could not see) is now DECIDED, and decided the same way btormc decides it.
+    Ok(reachable)
 }
 
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
@@ -7336,14 +7330,17 @@ mod tests {
         );
     }
 
-    /// `exact_bad_reachable` — an UNREACHABLE-from-reset verdict on a design with
-    /// UNINITIALISED (free-init) state is refused, not returned as `false`: the
-    /// register is held (`next = s`) with no `init` line, so from the pin-to-0 reset
-    /// `bad = (s == 1)` is unreachable, but btormc explores `s = 1` at cycle 0
-    /// (reachable). Returning `false` there would be unsound, so the engine is
-    /// undecided.
+    /// mununu#498 (sibling) — a design with UNINITIALISED (free-init) state is now
+    /// DECIDED, and decided the way `btormc` decides it.
+    ///
+    /// `s` is held (`next = s`) with no `init` line, so the BTOR2 format leaves its
+    /// initial value free and `s = 1` at cycle 0 is a genuine initial state: `bad`
+    /// IS reachable. The engine used to pin `s` to 0, find `bad` unreachable, and
+    /// then have to ABSTAIN to avoid emitting an unsound "safe" (this test formerly
+    /// asserted the abstention). Modelling the initial set exactly removes both the
+    /// wrong answer and the need to refuse.
     #[test]
-    fn exact_bad_reachable_refuses_unreachable_on_free_init_state() {
+    fn exact_bad_reachable_decides_free_init_design_like_btormc() {
         const FREE_INIT: &str = r#"
 1 sort bitvec 1
 2 state 1 s
@@ -7352,9 +7349,37 @@ mod tests {
 5 eq 1 2 4
 6 bad 5
 "#;
-        assert!(
-            exact_bad_reachable(FREE_INIT).is_err(),
-            "unreachable-from-reset + free-init state ⇒ undecided (btormc may reach from a non-0 init)"
+        assert_eq!(
+            exact_bad_reachable(FREE_INIT),
+            Ok(true),
+            "`s` is free at cycle 0, so `bad = (s == 1)` is reachable — the verdict btormc \
+             gives, and one the pin-to-zero model could not reach"
+        );
+    }
+
+    /// mununu#498 (sibling), against the third-party oracle case. `btor2tools`'
+    /// `noninitstate.btor2` exists precisely to test free-init semantics: `state0`
+    /// and `state1` carry no `init`, and a `constraint` forces them DIFFERENT in the
+    /// first step, so `bad = (state0 == state1)` is reachable — `btormc` returns
+    /// `sat`.
+    ///
+    /// Pinning both to 0 made them EQUAL at step 0, which contradicts that
+    /// constraint; the exact engine could not see the real initial states and had to
+    /// abstain, leaving `btormc` / Pono / SPACER to carry the portfolio. It now
+    /// decides, and agrees.
+    #[test]
+    fn exact_decides_btor2tools_noninitstate_like_btormc() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/btor2/btor2tools_suite/noninitstate.btor2"
+        );
+        let content = std::fs::read_to_string(path).expect("read noninitstate.btor2");
+        assert_eq!(
+            exact_bad_reachable(&content),
+            Ok(true),
+            "btormc reports `sat` on this design; the exact engine must now agree rather \
+             than abstain — a differential disagreement here is the mununu#498 sibling \
+             under-approximation returning"
         );
     }
 
@@ -8436,6 +8461,20 @@ mod tests {
         let btor2 = sv_to_btor2_with_blackboxes(&sv, &yopts)
             .expect("extract uart_tx")
             .btor2;
+        // Anchor the model at reset, exactly as `verify_auto` does before handing a
+        // design to this engine. `sv_to_btor2_with_blackboxes` is the raw lift: Yosys
+        // `async2sync` puts the reset in the next-state mux and emits NO `init` line,
+        // so without this step the BTOR2 does not say where the design starts — and
+        // since mununu#498's sibling fix the engine honours that and starts anywhere,
+        // which makes a bounded-counter invariant like `AG (bit_cnt_q < 12)` fail from
+        // a fabricated power-up of 12..15. Injecting the reset init is what makes this
+        // the model `sv verify-auto` actually builds, rather than one no shipped path
+        // produces. `rst_ni` is active-low, so its INACTIVE level is 1.
+        let btor2 = crate::adapter::btor2::reset_init::inject_reset_init(
+            &btor2,
+            &[("rst_ni".to_string(), 1u64)],
+        )
+        .expect("inject reset init");
         let verdict = |f: &str| -> ExactVerdict {
             let ff = crate::mu_calculus::parser::parse(f).expect("formula parses");
             exact_symbolic_verdict(&btor2, &ff).expect("definite verdict, binds")

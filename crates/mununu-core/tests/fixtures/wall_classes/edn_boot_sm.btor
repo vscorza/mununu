@@ -188,3 +188,8 @@
 187 ite 13 11 184 14
 188 next 13 15 187
 ; end of yosys output
+; mununu#498 (sibling): make the reset value EXPLICIT. `16 ite 13 11 15 14`
+; is the reset mux — `rst_ni ? state_q : 011000001` — so 011000001 (193) is the
+; FSM's reset encoding. Without this line the BTOR2 does not say where the design
+; starts, and the engine is free to begin anywhere (which is what the format means).
+189 init 13 15 14
