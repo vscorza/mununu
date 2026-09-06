@@ -611,6 +611,17 @@ error, missing file, etc.) exits `1` — distinct from "found something". A batc
 scanner that wants to distinguish "found a bad register" from "could not lift"
 should pass `--fail-on none` and inspect the JSON/text output for findings.
 
+**Flattened hierarchy is no longer suppressed** (2026-09, mununu#506/#507). The
+function-argument filter below skipped *every* dotted Op symbol — but on a
+flattened integrator every hierarchical alias is dotted (`u_ld_bank.addr`), so
+the filter suppressed the whole design. That is why `sv lint` could report zero
+findings on an integrator while `verify-auto` refused a property on the same
+file: they were not disagreeing, the lint was not looking. The filter now skips a
+dotted symbol only when **no prefix of it names an instance scope**, and the
+discriminator is self-contained — *a function has no registers*, so a prefix that
+appears on a `state` symbol names an instance. Residual: an instance containing no
+state at all is still skipped.
+
 **`function automatic` arguments are no longer false-positives** (2026-08,
 mununu#475 item 1). Yosys/slang mangle SV function arguments as
 `<function>.<arg>` (e.g. monono's `ctrl_code.c`, `ones8.v` in

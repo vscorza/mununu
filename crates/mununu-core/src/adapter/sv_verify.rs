@@ -270,6 +270,48 @@ pub fn sv_lint_registers(lift: &SvLift) -> Result<Vec<SvLintFinding>, String> {
     Ok(findings)
 }
 
+/// mununu#506/#507 — the set of dotted prefixes that name a real INSTANCE scope,
+/// evidenced by a `state` cell living under them.
+///
+/// `lint_undriven_partial_writes` skips Op symbols containing `.` because Yosys
+/// mangles a function argument as `<function>.<arg>` (`ones8.v`, `ctrl_code.c`),
+/// and those false-positived as partial-write aliases (mununu#475 item 1). But on
+/// a FLATTENED integrator every hierarchical signal is also dotted
+/// (`u_ld_bank.addr`), so the blanket filter suppressed the entire design — which
+/// is why `sv lint` reported zero findings on an integrator while `verify-auto`
+/// refused a property on the same file. They were not disagreeing; the lint was
+/// not looking.
+///
+/// The discriminator is self-contained: **a function has no registers.** A module
+/// instance almost always does, so a prefix that appears on a `state` symbol names
+/// an instance and its Op aliases must NOT be skipped. Every `.`-boundary prefix
+/// counts, so nested hierarchy (`u_a.u_b.sig`) resolves too.
+///
+/// Residual, and documented: an instance containing no state at all is still
+/// skipped. Its Op aliases can only be `Output`-kind findings downstream of a
+/// register root, and the root itself lives in a state-bearing scope — strictly
+/// better than skipping every dotted symbol.
+fn instance_scopes(
+    file: &crate::adapter::btor2::ast::Btor2File,
+) -> std::collections::HashSet<String> {
+    use crate::adapter::btor2::ast::Node;
+    let mut out = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::State {
+            symbol: Some(s), ..
+        } = &line.node
+        {
+            let mut idx = 0usize;
+            while let Some(pos) = s[idx..].find('.') {
+                let end = idx + pos;
+                out.insert(s[..end].to_string());
+                idx = end + 1;
+            }
+        }
+    }
+    out
+}
+
 /// The pure BTOR2 core of [`sv_lint_registers`] — parse the flattened design and
 /// return every named register/output whose cone reaches an anonymous free input.
 /// Split out so the regression suite can exercise it on a captured BTOR2 fixture
@@ -295,6 +337,7 @@ fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, Strin
     // dotted names, so the heuristic is targeted. State-node names may
     // contain dots (hierarchical `top.sub.reg_q`) and are not filtered here —
     // real registers should still be reported.
+    let scopes = instance_scopes(&file);
     let mut kinds: std::collections::BTreeMap<String, SvLintSignalKind> =
         std::collections::BTreeMap::new();
     for line in &file.lines {
@@ -305,7 +348,10 @@ fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, Strin
             Node::Op {
                 symbol: Some(s), ..
             } => {
-                if s.contains('.') {
+                // Skip a dotted symbol ONLY when no prefix of it names an instance
+                // scope — i.e. it is a `<function>.<arg>` mangling (mununu#475) and
+                // not flattened hierarchy (mununu#506). See `instance_scopes`.
+                if s.contains('.') && !s.match_indices('.').any(|(i, _)| scopes.contains(&s[..i])) {
                     continue;
                 }
                 (s, SvLintSignalKind::Register)
@@ -958,6 +1004,40 @@ mod tests {
     /// filters these out. Fixture: two Op-symbol nodes — one dotted (a
     /// function-arg alias, must NOT be flagged) and one plain (a legitimate
     /// partsel alias, MUST be flagged).
+    /// mununu#506/#507 — a FLATTENED HIERARCHY symbol is dotted too, and must NOT
+    /// be swept up by the function-argument filter.
+    ///
+    /// This is why `sv lint` reported zero findings on monono's integrator while
+    /// `verify-auto` refused a property on the same file: every hierarchical alias
+    /// is `u_inst.sig`, so the blanket dotted-skip suppressed the whole design. They
+    /// were not disagreeing — the lint was not looking.
+    ///
+    /// The discriminator is that a function has no registers: `u_inst` prefixes a
+    /// `state`, so it is an instance scope; `ones8` does not, so it is a function.
+    #[test]
+    fn lint_does_not_skip_flattened_hierarchy_symbols() {
+        const HIER_LIFT: &str = r#"1 sort bitvec 1
+2 input 1
+3 state 1 u_inst.r
+4 and 1 2 3 u_inst.a_q
+5 output 4 u_inst.a_q_out
+6 and 1 2 2 ones8.v
+7 output 6 ones8_out
+"#;
+        let findings = lint_undriven_partial_writes(HIER_LIFT).expect("lint parses the BTOR2");
+        let names: Vec<&str> = findings.iter().map(|f| f.signal.as_str()).collect();
+        assert!(
+            names.contains(&"u_inst.a_q"),
+            "a hierarchical alias must be visible — `u_inst` prefixes a `state`, so it \
+             names an INSTANCE, not a function scope: {findings:?}"
+        );
+        assert!(
+            !names.contains(&"ones8.v"),
+            "the function-arg case stays suppressed — nothing under `ones8.` is a \
+             `state` (mununu#475 item 1): {findings:?}"
+        );
+    }
+
     #[test]
     fn lint_skips_function_arg_dotted_op_symbols() {
         // - Anonymous input (nid 2) — the "havoc" that both Op signals read.
