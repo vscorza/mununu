@@ -338,6 +338,68 @@ fn lint_undriven_partial_writes(btor2: &str) -> Result<Vec<SvLintFinding>, Strin
         .collect())
 }
 
+/// mununu#506 — resolve `nid` back to the state register it names, through the
+/// IDENTITY-PRESERVING wrappers Yosys leaves after `flatten` / `async2sync` /
+/// `dffunmap`.
+///
+/// A register's identity rarely survives on its raw `state` line. `async2sync`
+/// lifts an async reset into a mux, so the value everything downstream reads is
+/// `ite(rst_n, state, RESET_VALUE)`, and the register's NAME lands on a `uext`
+/// alias of that mux:
+///
+/// ```text
+/// 10 state 8                 <- the register (unnamed)
+/// 11 ite 8 4 10 9            <- rst_n ? state : 0     (the reset mux)
+/// 12 uext 8 11 0 ld_q        <- the NAME is here
+/// 17 read 5 16 11            <- and the read indexes the MUX, not the state
+/// ```
+///
+/// Requiring a bare `state` therefore made the rule fire only on registers with
+/// NO reset — close to none in real RTL, which is why it reported nothing on the
+/// design that motivated it (mununu#506). Same class as the 2026-07-05
+/// `next_funcs` alias-keying fix.
+///
+/// Walks ONLY through wrappers that preserve identity:
+/// * `uext` / `sext` — width padding.
+/// * `slice` — a part-select still names the same register (`.addr(ld_q[10:0])`).
+/// * `ite` where one arm is a constant — the reset-mux shape; follow the other arm.
+///
+/// It deliberately does NOT walk arithmetic or multi-register logic, so
+/// `mem[a_q + 1]` and `mem[a ^ b]` stay out of scope (documented as such).
+fn resolve_to_state_register(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    nid: i64,
+) -> Option<i64> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let mut nid = nid;
+    for _ in 0..64 {
+        match node_of(file, nid)? {
+            Node::State { .. } => return Some(nid),
+            Node::Op {
+                op: Op::Uext | Op::Sext | Op::Slice,
+                args,
+                ..
+            } => {
+                nid = args.first()?.nid();
+            }
+            Node::Op {
+                op: Op::Ite, args, ..
+            } => {
+                // Reset-mux shape: exactly one arm is a constant.
+                let (t, e) = (args.get(1)?.nid(), args.get(2)?.nid());
+                let is_const = |n| matches!(node_of(file, n), Some(Node::Const { .. }));
+                match (is_const(t), is_const(e)) {
+                    (false, true) => nid = t,
+                    (true, false) => nid = e,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// mununu#496 — flag a **registered array read whose address register can change
 /// in the same cycle its data is consumed**, with nothing recording which address
 /// the current data corresponds to.
@@ -386,17 +448,24 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
     // `next` edges, indexed by the state they drive, plus the set of state nids
     // that some OTHER register captures verbatim (`t <= a`) — the tracking
     // signals that satisfy the rule.
-    let mut next_of: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut next_of: std::collections::HashMap<i64, Option<i64>> = std::collections::HashMap::new();
     let mut tracked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for line in &file.lines {
         if let Node::Next { state, value, .. } = &line.node {
-            next_of.insert(*state, value.nid());
-            // `t <= a` where a is a *different* state: a records which `a` the
+            // mununu#506: resolve the next-value through the same identity-preserving
+            // wrappers as the address. BOTH sides must resolve, or the rule breaks in
+            // the WORSE direction — `a_d <= a_q` lifts to
+            // `next(a_d) = ite(rst, <alias of a_q>, 0)`, so a resolver applied only to
+            // the address would stop recognising the SATISFYING form and start firing
+            // on exactly the designs that already do the right thing.
+            let resolved = resolve_to_state_register(&file, value.nid());
+            next_of.insert(*state, resolved);
+            // `t <= a` where `a` is a DIFFERENT register: `t` records which `a` the
             // current cycle used. A register's own hold (`a <= a`) is not tracking.
-            if *state != value.nid()
-                && matches!(node_of(&file, value.nid()), Some(Node::State { .. }))
+            if let Some(src) = resolved
+                && src != *state
             {
-                tracked.insert(value.nid());
+                tracked.insert(src);
             }
         }
     }
@@ -418,11 +487,19 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
                 } if signal.nid() == nid => {
                     return Some(s.clone());
                 }
+                // mununu#506: the alias carrying the name usually sits over the RESET
+                // MUX, not the raw state (`12 uext 8 11 0 a_q`, where nid 11 is
+                // `ite(rst_n, state, 0)`). Match on the alias operand RESOLVED to its
+                // register, else the finding degrades to `<nid 10>` and loses the name
+                // that makes it actionable.
                 Node::Op {
                     symbol: Some(s),
                     args,
                     ..
-                } if args.first().map(|a| a.nid()) == Some(nid) => {
+                } if args.first().map(|a| a.nid()).is_some_and(|n| {
+                    n == nid || resolve_to_state_register(&file, n) == Some(nid)
+                }) =>
+                {
                     return Some(s.clone());
                 }
                 _ => {}
@@ -447,15 +524,25 @@ fn lint_registered_array_read_moving_address(btor2: &str) -> Result<Vec<SvLintFi
         let Some(addr) = args.get(1).map(|a| a.nid()) else {
             continue;
         };
-        // The address must itself be a register. An address that is a pure input
-        // or a combinational function of inputs has no "moving register" to
-        // mis-pair with, so it is out of scope for this rule.
-        if !matches!(node_of(&file, addr), Some(Node::State { .. })) {
+        // The address must resolve to a register. mununu#506: it is almost never a
+        // bare `state` — `async2sync` puts a reset mux in front of it and the name
+        // lands on a `uext` alias — so resolve through the identity-preserving
+        // wrappers. An address that is a pure input, or a genuine arithmetic
+        // function, resolves to nothing and stays out of scope.
+        let Some(addr) = resolve_to_state_register(&file, addr) else {
             continue;
-        }
+        };
         // Does the address actually move? A register held constant (`a <= a`, or
         // no `next` at all) can never be mis-paired.
-        let moves = next_of.get(&addr).is_some_and(|v| *v != addr);
+        // A register that HOLDS (`a <= a`, which lifts to
+        // `next(a) = ite(rst, <alias of a>, RESET)`) or has no `next` at all can
+        // never be mis-paired with its own data. Resolving the next-value is what
+        // distinguishes a genuine hold from the reset mux wrapped around it.
+        let moves = match next_of.get(&addr) {
+            None => false,                   // no `next` — free/held, cannot move
+            Some(Some(src)) => *src != addr, // resolves to another register
+            Some(None) => true,              // real logic ⇒ it moves
+        };
         if !moves {
             continue;
         }
@@ -585,6 +672,116 @@ mod tests {
 20 next 4 10 19
 21 next 12 13 13 mem
 "#;
+
+    // mununu#506 — the SAME design as `SLANG_REGISTERED_READ_MOVING_ADDR`, except
+    // `a_q` has a reset. That one change was enough to make the shipped rule blind:
+    // `async2sync` lifts the async reset into a mux, so the read indexes the MUX
+    // (`11 ite 8 4 10 9`) rather than the bare state (`10 state 8`), and requiring a
+    // bare `state` meant the rule fired only on registers with NO reset — close to
+    // none in real RTL. Captured from the real slang lift.
+    const SLANG_RESET_GATED_MOVING_ADDR: &str = r#"1 sort bitvec 1
+2 input 1 advance
+3 input 1 clk
+4 input 1 rst_n
+5 sort bitvec 16
+6 state 5
+7 output 6 q
+8 sort bitvec 8
+9 const 8 00000000
+10 state 8
+11 ite 8 4 10 9
+12 uext 8 11 0 a_q
+13 sort array 8 5
+14 state 13 mem
+15 read 5 14 11
+16 next 5 6 15
+17 const 1 1
+18 uext 8 17 7
+19 add 8 11 18
+20 ite 8 2 19 11
+21 ite 8 4 20 9
+22 next 8 10 21
+23 next 13 14 14 mem
+"#;
+
+    // The reset-bearing SATISFYING twin: `a_d <= a_q` alongside the read. This is
+    // the false-positive guard for the #506 fix — the tracking `next` is itself
+    // wrapped in a reset mux (`16 ite 5 4 14 6` → `17 next 5 7 16`), so a resolver
+    // applied only to the ADDRESS side would stop recognising this form and start
+    // firing on exactly the designs that already do the right thing. Worse than the
+    // original silence, hence a first-class regression.
+    const SLANG_RESET_GATED_TRACKED: &str = r#"1 sort bitvec 1
+2 input 1 advance
+3 input 1 clk
+4 input 1 rst_n
+5 sort bitvec 8
+6 const 5 00000000
+7 state 5
+8 ite 5 4 7 6
+9 output 8 a_d
+10 sort bitvec 16
+11 state 10
+12 output 11 q
+13 state 5
+14 ite 5 4 13 6
+15 uext 5 14 0 a_q
+16 ite 5 4 14 6
+17 next 5 7 16
+18 sort array 5 10
+19 state 18 mem
+20 read 10 19 14
+21 next 10 11 20
+22 const 1 1
+23 uext 5 22 7
+24 add 5 14 23
+25 ite 5 2 24 14
+26 ite 5 4 25 6
+27 next 5 13 26
+28 next 18 19 19 mem
+"#;
+
+    #[test]
+    fn flags_a_reset_gated_address_register_through_the_mux_alias() {
+        let f =
+            lint_registered_array_read_moving_address(SLANG_RESET_GATED_MOVING_ADDR).expect("lint");
+        assert_eq!(
+            f.len(),
+            1,
+            "a reset on the address register must not hide the fault (mununu#506): {f:?}"
+        );
+        assert_eq!(f[0].signal, "q");
+        assert!(
+            f[0].detail.contains("a_q"),
+            "the address register's NAME lives on the uext alias of the reset mux and \
+             must still be recovered: {}",
+            f[0].detail
+        );
+    }
+
+    #[test]
+    fn a_reset_gated_tracking_register_still_satisfies_the_rule() {
+        let f = lint_registered_array_read_moving_address(SLANG_RESET_GATED_TRACKED).expect("lint");
+        assert!(
+            f.is_empty(),
+            "the tracking register is recognised THROUGH its own reset mux; flagging this \
+             would be a false positive on correctly-written RTL — strictly worse than the \
+             under-firing the #506 fix removes. Got {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_arithmetic_address_is_still_out_of_scope() {
+        // `mem[a_q + 1]` — the resolver walks identity-preserving wrappers only, so
+        // an address that is a genuine FUNCTION of a register stays out of scope, as
+        // the briefing's known-limits list states. Guards against the resolver
+        // quietly widening the rule.
+        let arith = SLANG_RESET_GATED_MOVING_ADDR.replace("15 read 5 14 11", "15 read 5 14 19");
+        let f = lint_registered_array_read_moving_address(&arith).expect("lint");
+        assert!(
+            f.is_empty(),
+            "an arithmetic address is documented as out of scope; got {f:?}"
+        );
+    }
 
     #[test]
     fn flags_registered_array_read_against_a_moving_address() {
@@ -946,6 +1143,70 @@ endmodule
             ok.iter()
                 .all(|f| f.rule != SvLintRule::RegisteredArrayReadMovingAddress),
             "registering the address alongside the data satisfies the rule; got {ok:?}"
+        );
+
+        // mununu#506 — the same pair, but with a RESET on the address register, which
+        // is what real RTL looks like. `async2sync` lifts the reset into a mux so the
+        // read indexes the mux rather than the bare state; requiring a bare state made
+        // the rule fire only on reset-less registers, i.e. almost never. Through the
+        // REAL lift, both directions must still be right.
+        const BAD_RST: &str = r#"module rom_bad_rst (
+  input  logic        clk, rst_n,
+  input  logic        advance,
+  output logic [15:0] q
+);
+  logic [15:0] mem [0:255];
+  logic [7:0]  a_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) a_q <= 8'd0;
+    else if (advance) a_q <= a_q + 8'd1;
+  end
+  always_ff @(posedge clk) q <= mem[a_q];
+endmodule
+"#;
+        const OK_RST: &str = r#"module rom_ok_rst (
+  input  logic        clk, rst_n,
+  input  logic        advance,
+  output logic [15:0] q,
+  output logic [7:0]  a_d
+);
+  logic [15:0] mem [0:255];
+  logic [7:0]  a_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin a_q <= 8'd0; a_d <= 8'd0; end
+    else begin
+      if (advance) a_q <= a_q + 8'd1;
+      a_d <= a_q;
+    end
+  end
+  always_ff @(posedge clk) q <= mem[a_q];
+endmodule
+"#;
+        let bad_rst =
+            sv_lint_registers(&lift_of(BAD_RST, "rom_bad_rst")).expect("lint lifts rom_bad_rst");
+        let hit_rst: Vec<_> = bad_rst
+            .iter()
+            .filter(|f| f.rule == SvLintRule::RegisteredArrayReadMovingAddress)
+            .collect();
+        assert_eq!(
+            hit_rst.len(),
+            1,
+            "a reset on the address register must not hide the fault; got {bad_rst:?}"
+        );
+        assert!(
+            hit_rst[0].detail.contains("a_q"),
+            "the address name must survive the reset-mux alias: {}",
+            hit_rst[0].detail
+        );
+
+        let ok_rst =
+            sv_lint_registers(&lift_of(OK_RST, "rom_ok_rst")).expect("lint lifts rom_ok_rst");
+        assert!(
+            ok_rst
+                .iter()
+                .all(|f| f.rule != SvLintRule::RegisteredArrayReadMovingAddress),
+            "the reset-gated TRACKING register still satisfies the rule — flagging it \
+             would be a false positive on correct RTL; got {ok_rst:?}"
         );
     }
 
