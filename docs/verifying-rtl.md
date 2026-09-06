@@ -587,8 +587,25 @@ tracking register, and the reported name — back through the identity-preservin
 wrappers (`uext` / `sext` / `slice` / a reset-shaped `ite`). Before that it
 required a bare `state`, which meant it fired **only on registers with no
 reset** — close to none in real RTL, and the reason it reported nothing on the
-design that motivated it. It does **not** walk arithmetic, so an address that is
-a genuine function of a register (`mem[a_q + 1]`) remains out of scope.
+design that motivated it.
+
+**Arithmetic addresses are in scope** (mununu#506 Tier 1/2). The rule analyses
+the address's **cone** rather than demanding a bare register: the address *moves*
+when any register in its cone moves, which covers `mem[base + 1]`,
+`mem[{tag, a_q}]`, `mem[a_q[hi:lo]]`, `mem[a_q ^ mask]` — the shape class, not a
+list of cases. An address driven **only by inputs** stays out of scope: that is
+how every block-RAM wrapper is written (`sprite_bank`'s `addr` port), and
+maintaining the correspondence there is the caller's obligation, not the
+module's. Inputs *alongside* a moving register still flag.
+
+The satisfying form generalises in step — a register capturing the whole address
+**expression** (`a_d <= a_q + 1`) counts as tracking it. That symmetry is
+load-bearing: widening what counts as a moving address without widening what
+counts as recording it would fire on correct RTL. When the two expressions are
+semantically equal but structurally different (CSE did not merge them), an SMT
+check confirms it. **The solver runs only on the reporting path and can only
+withdraw a finding, never create one** — so a clean design never pays for it, and
+an encode failure or a solver `Unknown` leaves the structural verdict standing.
 
 Because the lift **flattens**, this also covers the cross-module form — the array
 and destination register in a child, the address register in the parent — which
