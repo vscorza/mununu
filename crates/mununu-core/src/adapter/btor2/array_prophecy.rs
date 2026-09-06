@@ -26,11 +26,26 @@
 //!     `cond`. (A moving index under a conditional write is UNSOUND — the index could move to
 //!     `waddr` while the write is disabled, leaving `mem[waddr] ≠ pv` — so it abstains.)
 //!
+//! **(E) time-invariant EXPRESSION index (mununu#506 Tier 1).** An index that is not a bare
+//! register but whose value never changes — `mem[base + 4]` with `base` held — is registerized as
+//! one prophecy cell, exactly like a constant. The argument is the (S) argument with `idx' = idx`
+//! established structurally instead of syntactically: every state in the index's cone is GENUINELY
+//! HELD (its `next` sees through to itself), and the cone contains no input and no array read, so
+//! `E' = E` in every cycle and `mem'[E] = ite(cond ∧ waddr==E, wdata, pv)` is exact for any `cond`.
+//! The check is strict in two places on purpose — a state with NO `next` is HAVOC, not held, and a
+//! reset-mux hold (`next(s) = ite(rst, s, 0)`) is rejected because its value changes when the reset
+//! fires. Admitting a leaf wrongly here would break the equivalence below rather than merely lose
+//! precision, so the predicate errs toward abstaining. A MOVING expression index (`mem[a_q + 1]`
+//! with `a_q` moving) still abstains: reconstructing `idx'` would need the cone's next-values
+//! substituted through the expression, and the accessed-cell set stops being bounded — which is the
+//! premise the `O(#accessed-cells)` cost rests on.
+//!
 //! So SPCR is a verdict-PRESERVING reformulation (not an abstraction): the KMTS of the SPCR'd design
 //! has the same may/must edges as the original on the property-relevant projection ⇒ definite νµ
 //! verdicts transfer at every alternation depth (Bruns–Godefroid). Residual (abstain): a
 //! read-modify-write / input-indexed read (needs the array or a dead-code fold), a moving index
-//! under a conditional write, write-chains, or a non-register index.
+//! under a conditional write, write-chains, or a MOVING non-register index (a time-invariant one is
+//! handled by (E) above).
 
 use crate::adapter::btor2::ast::{Btor2File, Line, Nid, Node, Op, Operand, Sort};
 use crate::adapter::btor2::parser::find_next_value_operand;
@@ -42,6 +57,12 @@ use std::collections::{HashMap, HashSet};
 enum Cell {
     State(Nid),
     Const(u64),
+    /// mununu#506 Tier 1 — a TIME-INVARIANT index EXPRESSION (`mem[base + 4]` where
+    /// every register in `base`'s cone is genuinely held). Its value never changes,
+    /// so `E' = E` and it behaves exactly like [`Cell::Const`]: one prophecy register,
+    /// same frame. See `expr_is_time_invariant` for the discipline and the module
+    /// header for the soundness argument.
+    Expr(Nid),
 }
 
 /// P-A1d — the recursive array-elimination context for ONE array. Registerizes `pv_L = mem[L]`
@@ -124,6 +145,7 @@ impl Elim<'_> {
         let symbol = match cell {
             Cell::State(s) => format!("spcr_pv_{}_{}", self.array_nid, s),
             Cell::Const(c) => format!("spcr_pv_{}_c{}", self.array_nid, c),
+            Cell::Expr(e) => format!("spcr_pv_{}_e{}", self.array_nid, e),
         };
         let pv = self.push(Node::State {
             sort: self.elem_sort,
@@ -145,6 +167,8 @@ impl Elim<'_> {
         match cell {
             Cell::State(s) => Operand(s),
             Cell::Const(c) => Operand(self.const_node(c)),
+            // Time-invariant: the expression node itself IS its value, in every cycle.
+            Cell::Expr(e) => Operand(e),
         }
     }
 
@@ -194,6 +218,63 @@ impl Elim<'_> {
         nid
     }
 
+    /// mununu#506 Tier 1 — is `nid` a TIME-INVARIANT index expression?
+    ///
+    /// True when its cone contains no inputs, no array reads, and every state in it
+    /// is GENUINELY HELD — its `next` sees through to the state itself. Then the
+    /// expression's value is the same in every cycle, so `E' = E`.
+    ///
+    /// STRICT on purpose, in two places:
+    ///
+    /// * A state with NO `next` is HAVOC, not held (the same reading as the
+    ///   registerized-index guard in [`Elim::pv_for`] and as mununu#498) — it is
+    ///   rejected.
+    /// * A reset-mux hold (`next(s) = ite(rst, s, 0)`) is REJECTED too: its value
+    ///   changes when the reset fires, so the expression is not invariant across a
+    ///   reset. `see_through` deliberately does not walk the `ite`.
+    ///
+    /// Strictness is the safe direction here: SPCR is a verdict-PRESERVING
+    /// reformulation, so a leaf admitted wrongly would break the equivalence rather
+    /// than merely lose precision.
+    fn expr_is_time_invariant(&self, root: Nid) -> bool {
+        let mut seen: HashSet<Nid> = HashSet::new();
+        let mut work = vec![root];
+        while let Some(nid) = work.pop() {
+            let nid = self.see_through(nid);
+            if !seen.insert(nid) {
+                continue;
+            }
+            let Some(line) = self.file.lookup(nid) else {
+                return false;
+            };
+            match &line.node {
+                Node::Const { .. } => {}
+                Node::State { .. } => {
+                    // Held iff its next-value sees through to itself.
+                    match find_next_value_operand(self.file, nid) {
+                        None => return false, // havoc
+                        Some(nv) => {
+                            if self.see_through(nv.nid()) != nid {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                // An array read inside the index is a read-modify-write shape; out of
+                // scope (it is what the enclosing elimination is trying to remove).
+                Node::Op { op: Op::Read, .. } => return false,
+                Node::Op { args, .. } => {
+                    for a in args {
+                        work.push(a.nid());
+                    }
+                }
+                // Inputs and everything else: not invariant.
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// The CURRENT-cycle value read at index expression `E`, rebuilt over the `pv`s. Clears `ok`
     /// on a leaf that cannot be registerized (an input index / a complex op).
     fn read_at(&mut self, nid: Nid) -> Operand {
@@ -222,6 +303,9 @@ impl Elim<'_> {
                     symbol: None,
                 }))
             }
+            // mununu#506 Tier 1 — a TIME-INVARIANT expression index (`mem[base + 4]`
+            // with `base` held) is one prophecy cell, exactly like a constant.
+            _ if self.expr_is_time_invariant(nid) => Operand(self.pv_for(Cell::Expr(nid))),
             _ => {
                 self.ok = false;
                 Operand(0)
@@ -256,6 +340,13 @@ impl Elim<'_> {
         }
         if let Some(c) = crate::adapter::btor2::bit_blast::resolve_btor2_constant(self.file, nid) {
             return self.leaf_frame(Cell::Const(c));
+        }
+        // mununu#506 Tier 1 — a TIME-INVARIANT expression index does not move, so
+        // `mem'[E'] = mem'[E]` and the frame is the constant-leaf frame. Checked
+        // BEFORE the `ite` arm so an invariant `ite` is taken as one cell rather than
+        // split (both are correct; one cell is cheaper).
+        if self.expr_is_time_invariant(nid) {
+            return self.leaf_frame(Cell::Expr(nid));
         }
         match self.file.lookup(nid).map(|l| &l.node) {
             Some(Node::State { .. }) => self.leaf_frame(Cell::State(nid)),
@@ -481,7 +572,9 @@ fn eliminate_array(
         }
         let frame = match cell {
             // A const index never moves: pv_c' = mem'[c].
-            Cell::Const(_) => elim.leaf_frame(cell),
+            // A TIME-INVARIANT expression index (mununu#506 Tier 1) does not move
+            // either — `E' = E` by construction — so it takes the identical frame.
+            Cell::Const(_) | Cell::Expr(_) => elim.leaf_frame(cell),
             // A state index: pv_s' = mem'[s'] where s' is the state's next-value (self if none).
             Cell::State(s) => {
                 let nn = find_next_value_operand(file, s)
@@ -1260,6 +1353,86 @@ mod tests {
             exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
             ExactVerdict::Holds,
             "write-enable SPCR (guard we ∧ waddr==key) must decide AG EF(busy==0) = Holds"
+        );
+    }
+
+    /// mununu#506 Tier 1 — an ARITHMETIC index over a HELD base is now registerized
+    /// instead of abstained on. `AGR_SPCR_WE` with the read moved from `mem[key]` to
+    /// `mem[key + 1]`; `key` is held (`next(key) = key`), so `key + 1` is
+    /// time-invariant and behaves exactly like a constant index: one prophecy cell,
+    /// the constant-leaf frame.
+    ///
+    /// This is the case that previously cost a VERDICT, not just a lint finding —
+    /// SPCR abstaining means the νµ recoverability property goes ⊥.
+    const AGR_SPCR_WE_ARITH: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort array 2 2
+4 input 1 start
+5 input 2 waddr
+6 input 2 wdata
+7 input 1 we
+8 state 1 busy
+9 state 2 key
+10 state 3 mem
+11 const 1 0
+12 init 1 8 11
+13 const 2 00
+14 init 2 9 13
+15 const 2 11
+16 const 2 01
+17 add 2 9 16
+18 read 2 10 17
+19 eq 1 18 15
+20 not 1 8
+21 and 1 4 20
+22 const 1 1
+23 and 1 8 19
+24 ite 1 23 11 8
+25 ite 1 21 22 24
+26 next 1 8 25
+27 write 3 10 5 6
+28 ite 3 7 27 10
+29 next 3 10 28
+30 next 2 9 9
+";
+
+    #[test]
+    fn spcr_registerizes_an_arithmetic_index_over_a_held_base() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        use crate::mu_calculus::parser as mu_parser;
+        let file = crate::adapter::btor2::parser::parse(AGR_SPCR_WE_ARITH).expect("parse");
+        let out = super::spcr(&file)
+            .expect("SPCR must now apply to `mem[key + 1]` with `key` held (mununu#506 Tier 1)");
+        assert!(!has_array(&out), "SPCR output must be array-free");
+
+        let f = mu_parser::parse("nu Y. ((mu X. ((busy == 0) || <> X)) && [] Y)").unwrap();
+        assert!(
+            exact_symbolic_verdict(AGR_SPCR_WE_ARITH, &f).is_err(),
+            "the array-bearing design must SKIP on the exact ROBDD — that is the ⊥ this removes"
+        );
+        let src = crate::adapter::btor2::emit::emit_btor2(&out);
+        assert_eq!(
+            exact_symbolic_verdict(&src, &f).expect("array-free ⇒ exact decides"),
+            ExactVerdict::Holds,
+            "an arithmetic index over a held base must DECIDE, matching the bare-index case"
+        );
+    }
+
+    /// SOUNDNESS gate for the Tier-1 extension: the same arithmetic index over a
+    /// MOVING base must still ABSTAIN. `key + 1` is only time-invariant because
+    /// `key` is held; make `key` move and the expression moves with it, so the
+    /// constant-leaf frame would be unsound.
+    #[test]
+    fn spcr_abstains_on_an_arithmetic_index_over_a_moving_base() {
+        // `key' = ite(we, waddr, key)` — a moving base under a CONDITIONAL write.
+        let moving =
+            AGR_SPCR_WE_ARITH.replace("30 next 2 9 9\n", "30 ite 2 7 5 9\n31 next 2 9 30\n");
+        let file = crate::adapter::btor2::parser::parse(&moving).expect("parse");
+        assert!(
+            super::spcr(&file).is_none(),
+            "a moving base makes `key + 1` time-VARIANT; the constant-leaf frame would \
+             be unsound, so SPCR must abstain"
         );
     }
 
